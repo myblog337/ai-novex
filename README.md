@@ -3,7 +3,6 @@
 AI tools directory + blog. React 19 + Vite + Tailwind 4, **pre-rendered to static HTML** and hosted on Netlify.
 
 - Production: https://ai-novex.netlify.app
-- Repo: https://github.com/myblog337/ainovex (branch `main`)
 
 ## How it works
 
