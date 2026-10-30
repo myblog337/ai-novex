@@ -1,0 +1,74 @@
+[
+  {
+    "id": "ai-writing",
+    "name": "AI Writing",
+    "slug": "ai-writing",
+    "description": "Discover AI tools for generating high-quality blog posts, essays, copy, and creative writing.",
+    "icon": "PenTool",
+    "color": "blue"
+  },
+  {
+    "id": "image-generation",
+    "name": "Image Generation",
+    "slug": "image-generation",
+    "description": "Create stunning photorealistic images, digital art, vectors, and concept graphics from text prompts.",
+    "icon": "Image",
+    "color": "purple"
+  },
+  {
+    "id": "video-audio",
+    "name": "Video & Audio",
+    "slug": "video-audio",
+    "description": "Transform text into voiceovers, edit video with AI, generate music, and transcribe speech.",
+    "icon": "Video",
+    "color": "pink"
+  },
+  {
+    "id": "productivity",
+    "name": "Productivity",
+    "slug": "productivity",
+    "description": "Supercharge your daily workflow with AI task managers, notes assistants, and automated schedulers.",
+    "icon": "Zap",
+    "color": "emerald"
+  },
+  {
+    "id": "design-art",
+    "name": "Design & Art",
+    "slug": "design-art",
+    "description": "Streamline UI/UX design, graphic design, social media templates, and illustration with AI.",
+    "icon": "Palette",
+    "color": "amber"
+  },
+  {
+    "id": "code-dev",
+    "name": "Code & Dev",
+    "slug": "code-dev",
+    "description": "AI coding assistants, syntax debuggers, code explanation engines, and terminal companions.",
+    "icon": "Code",
+    "color": "cyan"
+  },
+  {
+    "id": "business",
+    "name": "Business",
+    "slug": "business",
+    "description": "Enterprise AI tools for market research, CRM, customer support bots, and business automation.",
+    "icon": "TrendingUp",
+    "color": "teal"
+  },
+  {
+    "id": "education",
+    "name": "Education",
+    "slug": "education",
+    "description": "AI study assistants, quiz creators, research summarizers, and personalized learning engines.",
+    "icon": "GraduationCap",
+    "color": "indigo"
+  },
+  {
+    "id": "others",
+    "name": "Others",
+    "slug": "others",
+    "description": "Novel AI utilities, search assistants, prompt engineering helpers, and multi-model workspaces.",
+    "icon": "LayoutGrid",
+    "color": "slate"
+  }
+]

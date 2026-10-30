@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>AINOVEX - AI Tools & Technology Platform</title>
+    <meta name="description" content="Discover the best AI tools, software reviews, and guides on AINOVEX. Boost productivity and work smarter with curated artificial intelligence." />
+    <link rel="canonical" href="https://ai-novex.netlify.app/" />
+    <meta property="og:title" content="AINOVEX - AI Tools & Technology Platform" />
+    <meta property="og:description" content="Discover the best AI tools, software reviews, and guides on AINOVEX. Boost productivity and work smarter with curated artificial intelligence." />
+    <meta property="og:type" content="website" />
+    <meta property="og:url" content="https://ai-novex.netlify.app/" />
+    <meta property="og:site_name" content="AINOVEX" />
+    <meta property="og:locale" content="en_US" />
+    <meta property="og:image" content="https://ai-novex.netlify.app/images/og-default.png" />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta property="og:image:type" content="image/png" />
+    <meta property="og:image:alt" content="AINOVEX - AI Tools &amp; Technology Platform" />
+    <meta name="theme-color" content="#0b101b" />
+    <meta name="robots" content="index, follow, max-image-preview:large, max-snippet:-1, max-video-preview:-1" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="AINOVEX - AI Tools & Technology Platform" />
+    <meta name="twitter:description" content="Discover the best AI tools, software reviews, and guides on AINOVEX. Boost productivity and work smarter with curated artificial intelligence." />
+    <meta name="twitter:image" content="https://ai-novex.netlify.app/images/og-default.png" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="alternate icon" href="/favicon.ico" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <link rel="alternate" type="application/rss+xml" title="AINOVEX RSS Feed" href="/rss.xml" />
+    <meta name="google-site-verification" content="vemExSsf6ecOpjSbgA2pJ5JlDNhpMcp_490ewkYbYrI" />
+    <script>
+      (function() {
+        try {
+          var mode = localStorage.getItem('ainovex-theme-mode') || localStorage.getItem('ainovex-theme') || 'dark';
+          var active = mode;
+          if (mode === 'system') {
+            active = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+          }
+          var root = document.documentElement;
+          root.dataset.theme = active;
+          if (active === 'light') {
+            root.classList.remove('dark');
+            root.classList.add('light');
+          } else {
+            root.classList.remove('light');
+            root.classList.add('dark');
+          }
+        } catch (e) {}
+      })();
+    </script>
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@graph": [
+        {
+          "@type": "WebSite",
+          "@id": "https://ai-novex.netlify.app/#website",
+          "url": "https://ai-novex.netlify.app/",
+          "name": "AINOVEX",
+          "description": "Discover the best AI tools, in-depth software reviews, and practical guides on AINOVEX. Boost your productivity and work smarter with curated artificial intelligence.",
+          "publisher": {
+            "@id": "https://ai-novex.netlify.app/#organization"
+          }
+        },
+        {
+          "@type": "Organization",
+          "@id": "https://ai-novex.netlify.app/#organization",
+          "name": "AINOVEX",
+          "url": "https://ai-novex.netlify.app/",
+          "logo": {
+            "@type": "ImageObject",
+            "@id": "https://ai-novex.netlify.app/#logo",
+            "url": "https://ai-novex.netlify.app/logo-512.png",
+            "width": 512,
+            "height": 512
+          }
+        }
+      ]
+    }
+    </script>
+  </head>
+  <body class="bg-white text-slate-900 dark:bg-[#0b101b] dark:text-slate-100 antialiased selection:bg-blue-500 selection:text-white min-h-screen transition-colors duration-200">
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
+

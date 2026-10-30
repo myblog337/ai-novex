@@ -1,0 +1,174 @@
+[build]
+  command = "npm run build"
+  publish = "dist"
+
+[build.environment]
+  NODE_VERSION = "22"
+
+# Canonical trailing-slash redirects for direct 1-hop normalization
+[[redirects]]
+  from = "/tools"
+  to = "/tools/"
+  status = 301
+
+[[redirects]]
+  from = "/blog"
+  to = "/blog/"
+  status = 301
+
+[[redirects]]
+  from = "/categories"
+  to = "/categories/"
+  status = 301
+
+[[redirects]]
+  from = "/about"
+  to = "/about/"
+  status = 301
+
+[[redirects]]
+  from = "/contact"
+  to = "/contact/"
+  status = 301
+
+[[redirects]]
+  from = "/privacy"
+  to = "/privacy/"
+  status = 301
+
+[[redirects]]
+  from = "/terms"
+  to = "/terms/"
+  status = 301
+
+[[redirects]]
+  from = "/editorial-policy"
+  to = "/editorial-policy/"
+  status = 301
+
+[[redirects]]
+  from = "/affiliate-disclosure"
+  to = "/affiliate-disclosure/"
+  status = 301
+
+[[redirects]]
+  from = "/author/md-shamim"
+  to = "/author/md-shamim/"
+  status = 301
+
+[[redirects]]
+  from = "/category/:slug"
+  to = "/category/:slug/"
+  status = 301
+
+[[redirects]]
+  from = "/blog/:slug"
+  to = "/blog/:slug/"
+  status = 301
+
+[[redirects]]
+  from = "/best-ai-tools-bulk-product-catalog-enrichment"
+  to = "/blog/best-ai-tools-bulk-product-catalog-enrichment/"
+  status = 301
+
+# ---- 404 Fallback (serves custom 404 page with real HTTP 404 status code) ----
+[[redirects]]
+  from = "/*"
+  to = "/404.html"
+  status = 404
+
+# Global security & SEO headers (enforces single-hop HTTPS with HSTS)
+[[headers]]
+  for = "/*"
+  [headers.values]
+    Strict-Transport-Security = "max-age=31536000; includeSubDomains"
+    X-Content-Type-Options = "nosniff"
+    X-Frame-Options = "SAMEORIGIN"
+    Referrer-Policy = "strict-origin-when-cross-origin"
+    Permissions-Policy = "camera=(), microphone=(), geolocation=(), payment=()"
+    Content-Security-Policy-Report-Only = "default-src 'self'; script-src 'self' 'unsafe-inline' https://pagead2.googlesyndication.com https://www.googletagmanager.com https://www.clarity.ms https://*.clarity.ms; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com data:; img-src 'self' data: https:; connect-src 'self' https://pagead2.googlesyndication.com https://www.google-analytics.com https://*.google-analytics.com https://analytics.google.com https://*.clarity.ms https://c.bing.com; frame-src 'self' https://googleads.g.doubleclick.net https://tpc.googlesyndication.com;"
+
+[[headers]]
+  for = "/sitemap.xml"
+  [headers.values]
+    Content-Type = "application/xml; charset=utf-8"
+    Cache-Control = "public, max-age=3600"
+    X-Robots-Tag = "noindex"
+
+[[headers]]
+  for = "/rss.xml"
+  [headers.values]
+    Content-Type = "application/rss+xml; charset=utf-8"
+    Cache-Control = "public, max-age=86400"
+    X-Robots-Tag = "noindex"
+
+[[headers]]
+  for = "/llms.txt"
+  [headers.values]
+    Content-Type = "text/plain; charset=utf-8"
+    X-Robots-Tag = "noindex"
+
+[[headers]]
+  for = "/robots.txt"
+  [headers.values]
+    Content-Type = "text/plain; charset=utf-8"
+    Cache-Control = "public, max-age=86400"
+
+[[headers]]
+  for = "/c49a629b37c0411eb31a896d8e20791d.txt"
+  [headers.values]
+    Content-Type = "text/plain; charset=utf-8"
+    Cache-Control = "public, max-age=86400"
+    X-Robots-Tag = "noindex"
+
+# ---- Caching (Vite adds content hashes to assets, images are immutable) ----
+[[headers]]
+  for = "/assets/*"
+  [headers.values]
+    Cache-Control = "public, max-age=31536000, immutable"
+
+# Image file names are NOT content-hashed: a replaced image would stay stale for a year with "immutable".
+# 30 days + background revalidation keeps them fast and still lets updates through.
+[[headers]]
+  for = "/images/articles/*"
+  [headers.values]
+    Cache-Control = "public, max-age=2592000, stale-while-revalidate=86400"
+    X-Content-Type-Options = "nosniff"
+
+[[headers]]
+  for = "/*.webp"
+  [headers.values]
+    Cache-Control = "public, max-age=2592000, stale-while-revalidate=86400"
+    X-Content-Type-Options = "nosniff"
+
+[[headers]]
+  for = "/images/*"
+  [headers.values]
+    Cache-Control = "public, max-age=2592000"
+
+[[headers]]
+  for = "/blog/*"
+  [headers.values]
+    Cache-Control = "public, max-age=0, must-revalidate"
+
+[[headers]]
+  for = "/*.png"
+  [headers.values]
+    Cache-Control = "public, max-age=2592000"
+
+[[headers]]
+  for = "/favicon.svg"
+  [headers.values]
+    Cache-Control = "public, max-age=2592000"
+
+[[headers]]
+  for = "/favicon.ico"
+  [headers.values]
+    Content-Type = "image/x-icon"
+    Cache-Control = "public, max-age=2592000"
+
+[[headers]]
+  for = "/404.html"
+  [headers.values]
+    X-Robots-Tag = "noindex, follow"
+    Cache-Control = "no-cache, no-store, must-revalidate"
