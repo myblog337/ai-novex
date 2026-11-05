@@ -10,26 +10,26 @@ AI tools directory + blog. React 19 + Vite + Tailwind 4, **pre-rendered to stati
 content/*.json + content/articles/*.md   (edit by hand, commit)
         │  git push origin main
         ▼
-Netlify:  npm run build  =  vite build  →  node scripts/postbuild.mjs   (publish: dist/)
+Netlify:  npm run build  =  vite build  →  node scripts/postbuild.mjs → node scripts/finalize-sitemap.mjs   (publish: dist/)
 ```
 
 - `src/` – React app (client-side navigation). Content is bundled at build time; article markdown is
   loaded lazily with `import.meta.glob`. There is no server and no API.
 - `scripts/postbuild.mjs` – writes real HTML for every route (title, meta, canonical, JSON-LD,
   content) plus `sitemap.xml`, `rss.xml`, `robots.txt`, `ads.txt` (only when AdSense is configured).
+- `scripts/finalize-sitemap.mjs` – writes the final sitemap using the same indexability rules as page metadata.
 - `src/utils/markdown.js` – the single markdown renderer used by both the browser and postbuild.
 - `netlify.toml` – redirects, security/cache headers, 404 handling.
 
 ## Indexing policy
 
 The rule lives in **one file**: `src/config/indexing.js`. It is imported by both the browser app
-(`src/App.tsx`) and the build script (`scripts/postbuild.mjs`), so pre-rendered HTML, client-side meta
-tags and `sitemap.xml` can never disagree.
+(`src/App.tsx`) and the build scripts, so pre-rendered HTML, client-side meta tags and `sitemap.xml` can never disagree.
 
-- `index, follow` (and listed in `sitemap.xml`): home, `/blog/`, `/tools/`, `/categories/`, `/about/`,
-  `/contact/`, `/author/md-shamim/`, `/editorial-policy/`, every published article, and every category
-  that has **at least one published article**.
-- `noindex, follow`: privacy / terms / affiliate-disclosure, categories with no article yet, 404.
+- `index, follow` (and listed in `sitemap.xml`): home, `/blog/`, `/tools/`, `/categories/`, `/privacy/`,
+  `/terms/`, `/affiliate-disclosure/`, every published article, and every category route.
+- `noindex, follow` (and excluded from `sitemap.xml`): `/about/`, `/contact/`, `/author/md-shamim/`,
+  `/editorial-policy/`, unknown URLs and 404.
 - `rss.xml`, `llms.txt`, the sitemap and the IndexNow key file are sent with `X-Robots-Tag: noindex`.
 - `robots.txt` deliberately does **not** disallow anything - crawlers must be able to fetch a page to see its `noindex`.
 
