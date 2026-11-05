@@ -112,12 +112,6 @@ export const Footer: React.FC<FooterProps> = ({ onNavigate }) => {
             </p>
             <div className="flex items-center gap-2 pt-1">
               <a
-                href="/rss.xml"
-                className="px-3 py-1 rounded-full bg-slate-200 hover:bg-blue-600 text-slate-700 hover:text-white dark:bg-slate-800 dark:text-slate-300 text-xs font-bold transition-all"
-              >
-                RSS Feed
-              </a>
-              <a
                 href="/tools/"
                 onClick={(e) => {
                   e.preventDefault();

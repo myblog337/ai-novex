@@ -21,11 +21,25 @@ if (!fs.existsSync(dist)) {
   process.exit(1);
 }
 
-const readJson = (f, fallback) => {
+const readJson = (f, { optional = false, fallback } = {}) => {
+  const filePath = path.join(contentSrc, f);
+  if (!fs.existsSync(filePath)) {
+    if (optional) {
+      return fallback;
+    }
+    console.error(`[postbuild] Critical file missing: ${f} (${filePath})`);
+    process.exit(1);
+  }
   try {
-    return JSON.parse(fs.readFileSync(path.join(contentSrc, f), 'utf-8'));
-  } catch {
-    return fallback;
+    const raw = fs.readFileSync(filePath, 'utf-8');
+    return JSON.parse(raw);
+  } catch (err) {
+    if (optional) {
+      console.warn(`[postbuild] Optional file corrupted or invalid JSON: ${f} — using fallback. Error: ${err.message}`);
+      return fallback;
+    }
+    console.error(`[postbuild] Failed to read or parse critical JSON file: ${f} (${filePath}). Error: ${err.message}`);
+    process.exit(1);
   }
 };
 
@@ -37,12 +51,22 @@ const esc = (v) =>
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#39;');
 
-const settings = readJson('settings.json', {});
-const categories = readJson('categories.json', []);
-const tools = readJson('tools.json', []);
-const ads = readJson('ads.json', {});
-const allArticles = readJson('articles.json', []);
+const settings = readJson('settings.json', { optional: false, fallback: {} });
+if (!settings.productionUrl || typeof settings.productionUrl !== 'string' || !settings.productionUrl.trim()) {
+  console.error('[postbuild] Invalid or missing productionUrl in content/settings.json');
+  process.exit(1);
+}
+
+const categories = readJson('categories.json', { optional: false, fallback: [] });
+const tools = readJson('tools.json', { optional: false, fallback: [] });
+const ads = readJson('ads.json', { optional: true, fallback: {} });
+const allArticles = readJson('articles.json', { optional: false, fallback: [] });
 const articles = allArticles.filter((a) => a.isPublished);
+
+if (articles.length === 0) {
+  console.error('[postbuild] No published articles found in content/articles.json — aborting build to prevent empty sitemap.');
+  process.exit(1);
+}
 const baseUrl = (settings.productionUrl || 'https://ai-novex.netlify.app').replace(/\/+$/, '');
 const defaultOgImage = settings.defaultOgImage || '/images/og-default.png';
 const ctx = { articles, categories };
@@ -220,7 +244,6 @@ const renderFooter = () => `
           Independent AI software reviews, benchmarks, workflows, and hands-on tutorials.
         </p>
         <div class="flex items-center gap-2 pt-1">
-          <a href="/rss.xml" class="px-3 py-1 rounded-full bg-slate-200 hover:bg-blue-600 text-slate-700 hover:text-white dark:bg-slate-800 dark:text-slate-300 text-xs font-bold transition-all">RSS Feed</a>
           <a href="/tools/" class="px-3 py-1 rounded-full bg-blue-600 text-white text-xs font-bold transition-all">Directory</a>
         </div>
       </div>
@@ -687,10 +710,11 @@ writePage('categories/index.html', categoriesPageHtml);
 // ----------------------------------------------------------------------------
 for (const a of articles) {
   const mdFile = path.resolve(root, a.contentPath || `content/articles/${a.slug}.md`);
-  let mdRaw = '';
-  if (fs.existsSync(mdFile)) {
-    mdRaw = fs.readFileSync(mdFile, 'utf-8');
+  if (!fs.existsSync(mdFile)) {
+    console.error(`[postbuild] Missing markdown file for published article "${a.slug}": ${mdFile}`);
+    process.exit(1);
   }
+  const mdRaw = fs.readFileSync(mdFile, 'utf-8');
   const bodyHtml = renderMarkdown(mdRaw);
 
   const related = articles
