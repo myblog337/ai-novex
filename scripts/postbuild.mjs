@@ -1344,3 +1344,86 @@ writePage('404.html', notFoundHtml);
 
 console.log(`[postbuild] Pre-rendered all 22+ static HTML routes with rich semantic markup, headings, links, and schema!`);
 console.log(`[postbuild] ${articles.length} articles, ${categories.length} categories, ${tools.length} tools exported.`);
+
+// ----------------------------------------------------------------------------
+// URL Consistency Guard: Validate dist/**/*.html and sitemap.xml
+// ----------------------------------------------------------------------------
+function collectHtmlFiles(dir) {
+  const entries = fs.readdirSync(dir, { withFileTypes: true });
+  const htmlFiles = [];
+  for (const entry of entries) {
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      htmlFiles.push(...collectHtmlFiles(full));
+    } else if (entry.isFile() && entry.name.endsWith('.html')) {
+      htmlFiles.push(full);
+    }
+  }
+  return htmlFiles;
+}
+
+const offending = [];
+
+// 1. Check sitemap.xml
+const sitemapFile = path.join(dist, 'sitemap.xml');
+if (fs.existsSync(sitemapFile)) {
+  const sitemapXml = fs.readFileSync(sitemapFile, 'utf-8');
+  for (const m of sitemapXml.matchAll(/<loc>([^<]+)<\/loc>/g)) {
+    const loc = m[1].trim();
+    if (!loc.endsWith('/')) {
+      offending.push(`[sitemap.xml] <loc> does not end with "/": ${loc}`);
+    }
+  }
+}
+
+// 2. Check all dist/**/*.html files
+const allHtmlFiles = collectHtmlFiles(dist);
+for (const filePath of allHtmlFiles) {
+  const relFile = path.relative(dist, filePath);
+  const html = fs.readFileSync(filePath, 'utf-8');
+  const is404 = path.basename(filePath) === '404.html';
+
+  const canonMatch = html.match(/<link\b[^>]*\brel=["']canonical["'][^>]*>/i);
+  const canonHref = canonMatch ? (canonMatch[0].match(/\bhref=["']([^"']+)["']/i) || [])[1] : null;
+
+  const ogUrlMatch = html.match(/<meta\b[^>]*\bproperty=["']og:url["'][^>]*>/i);
+  const ogUrlContent = ogUrlMatch ? (ogUrlMatch[0].match(/\bcontent=["']([^"']+)["']/i) || [])[1] : null;
+
+  if (is404) {
+    if (canonMatch) {
+      offending.push(`[${relFile}] 404.html must not contain <link rel="canonical">`);
+    }
+    if (ogUrlMatch) {
+      offending.push(`[${relFile}] 404.html must not contain <meta property="og:url">`);
+    }
+  } else {
+    if (!canonHref || !canonHref.startsWith(baseUrl) || !canonHref.endsWith('/')) {
+      offending.push(`[${relFile}] canonical href "${canonHref}" does not start with baseUrl "${baseUrl}" or does not end with "/"`);
+    }
+    if (!ogUrlContent || !ogUrlContent.startsWith(baseUrl) || !ogUrlContent.endsWith('/')) {
+      offending.push(`[${relFile}] og:url content "${ogUrlContent}" does not start with baseUrl "${baseUrl}" or does not end with "/"`);
+    }
+  }
+
+  // Scan internal hrefs
+  for (const m of html.matchAll(/\bhref=["']([^"']+)["']/gi)) {
+    const href = m[1];
+    if (href.startsWith('//')) continue;
+    if (!href.startsWith('/')) continue;
+    const cleanHref = href.split(/[?#]/)[0];
+    if (cleanHref === '/' || cleanHref.endsWith('/')) continue;
+    if (path.posix.extname(cleanHref) !== '') continue;
+    offending.push(`[${relFile}] Internal href "${href}" has no extension and does not end with "/"`);
+  }
+}
+
+if (offending.length > 0) {
+  console.error('[postbuild] URL consistency check failed:');
+  for (const err of offending) {
+    console.error(`  - ${err}`);
+  }
+  process.exit(1);
+}
+
+console.log('[postbuild] URL consistency check passed');
+

@@ -107,6 +107,7 @@ function AppContent() {
     // client-side meta tags always match the pre-rendered HTML and sitemap.xml.
     const noindex = !isIndexable(normPath, { articles, categories });
     let type: 'website' | 'article' = 'website';
+    let notFound = false;
 
     if (normPath === '/') {
       title = 'AINOVEX - AI Tools & Technology Platform';
@@ -127,6 +128,7 @@ function AppContent() {
         type = 'article';
       } else {
         title = 'Article Not Found | AINOVEX';
+        notFound = true;
       }
     } else if (normPath === '/categories') {
       title = 'Browse AI Categories & Topics | AINOVEX';
@@ -140,6 +142,7 @@ function AppContent() {
         description = `${baseCatDesc} Browse handpicked software reviews and tutorials on AINOVEX.`;
       } else {
         title = 'Category Not Found | AINOVEX';
+        notFound = true;
       }
     } else if (normPath === '/about') {
       title = 'About Us & Editorial Standards | AINOVEX';
@@ -166,10 +169,11 @@ function AppContent() {
       // Unknown route
       title = 'Page Not Found | AINOVEX';
       description = 'The page you are looking for does not exist. Browse our AI tools directory, tutorials, and category archives on AINOVEX.';
+      notFound = true;
     }
 
     const canonicalPath = normPath === '/' ? '/' : `${normPath}/`;
-    applySeo({ title, description, path: canonicalPath, baseUrl: base, image, noindex, type });
+    applySeo({ title, description, path: canonicalPath, baseUrl: base, image, noindex, type, notFound });
   }, [normPath]);
 
   // Public View Router

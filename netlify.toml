@@ -5,6 +5,9 @@
 [build.environment]
   NODE_VERSION = "22"
 
+[build.processing.html]
+  pretty_urls = true
+
 # Canonical trailing-slash redirects for direct 1-hop normalization
 [[redirects]]
   from = "/tools"
@@ -54,16 +57,6 @@
 [[redirects]]
   from = "/author/md-shamim"
   to = "/author/md-shamim/"
-  status = 301
-
-[[redirects]]
-  from = "/category/:slug"
-  to = "/category/:slug/"
-  status = 301
-
-[[redirects]]
-  from = "/blog/:slug"
-  to = "/blog/:slug/"
   status = 301
 
 [[redirects]]

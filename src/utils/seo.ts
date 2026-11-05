@@ -17,6 +17,7 @@ export function applySeo(opts: {
   image?: string;
   noindex?: boolean;
   type?: 'website' | 'article';
+  notFound?: boolean;
 }) {
   const base = opts.baseUrl.replace(/\/+$/, '');
   const cleanPath = opts.path.split('?')[0];
@@ -52,6 +53,12 @@ export function applySeo(opts: {
       ? 'noindex, follow'
       : 'index, follow, max-image-preview:large, max-snippet:-1, max-video-preview:-1'
   );
+
+  if (opts.notFound) {
+    document.head.querySelectorAll('link[rel="canonical"]').forEach((el) => el.remove());
+    document.head.querySelectorAll('meta[property="og:url"]').forEach((el) => el.remove());
+    return;
+  }
 
   let link = document.head.querySelector<HTMLLinkElement>('link[rel="canonical"]');
   if (!link) {
