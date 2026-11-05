@@ -20,9 +20,9 @@ export default defineConfig({
     },
   },
   server: {
-    host: 'localhost',
+    host: '0.0.0.0',
     port: 3000,
     strictPort: true,
-    allowedHosts: ['localhost', '127.0.0.1'],
+    allowedHosts: true,
   },
 });

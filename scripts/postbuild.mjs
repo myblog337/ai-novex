@@ -86,7 +86,7 @@ for (const p of INDEXABLE_STATIC_PATHS) {
 }
 for (const a of articles) sitemapEntries.push({ loc: `/blog/${a.slug}/`, lastmod: dateOf(a) });
 for (const c of categories) {
-  if (!categoryHasContent(c.slug, articles)) continue; // empty category => noindex => not in sitemap
+  if (!categoryHasContent(c.slug, categories)) continue;
   sitemapEntries.push({ loc: `/category/${c.slug}/`, lastmod: newest(articles.filter((a) => a.category === c.slug)) });
 }
 let sm = `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n`;

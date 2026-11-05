@@ -4,15 +4,11 @@
 //
 // To change what search engines may index, edit ONLY this file.
 
-/** Pages that are indexable (normalised path: no trailing slash). */
 export const INDEXABLE_STATIC_PATHS = new Set([
   '/',
   '/blog',
   '/tools',
   '/categories',
-  '/privacy',
-  '/terms',
-  '/affiliate-disclosure',
 ]);
 
 /** Remove ?query, #hash and trailing slashes. "/" stays "/". */
