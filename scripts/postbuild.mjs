@@ -11,6 +11,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { renderMarkdown } from '../src/utils/markdown.js';
 import { INDEXABLE_STATIC_PATHS, isIndexable, categoryHasContent, categoryTitle } from '../src/config/indexing.js';
+import { LEGAL_TITLES, LEGAL_BREADCRUMBS, formatLegalDate, getLegalContent } from '../src/config/legal.js';
 
 const root = process.cwd();
 const dist = path.join(root, 'dist');
@@ -1199,19 +1200,33 @@ writePage('author/md-shamim/index.html', createPageHtml({
 },
 }));
 
+const legal = getLegalContent({ siteUrl: baseUrl, contactEmail: settings.contactEmail, strict: true });
+const legalDateLabel = formatLegalDate();
+
 const privacyContent = `
 <div class="max-w-4xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
-  ${renderBreadcrumb([{ label: 'Privacy Policy' }])}
-  <div class="py-6 border-b border-slate-200 dark:border-slate-800 mb-8">
-    <h1 class="text-3xl sm:text-4xl font-extrabold text-slate-900 dark:text-white tracking-tight mb-2">Privacy Policy</h1>
-    <p class="text-xs text-slate-500">Last updated: October 18, 2026 &bull; Published by AINOVEX Editorial Team</p>
+  ${renderBreadcrumb([{ label: LEGAL_BREADCRUMBS.privacy }])}
+  <div class="py-6 border-b border-slate-200 dark:border-slate-800/80 mb-8">
+    <h1 class="text-3xl sm:text-4xl font-extrabold text-slate-900 dark:text-white tracking-tight mb-2">${esc(LEGAL_TITLES.privacy)}</h1>
+    <p class="text-xs text-slate-500 dark:text-slate-400">Last updated: ${esc(legalDateLabel)} &bull; Published by AINOVEX Editorial Team</p>
   </div>
-  <div class="space-y-6 text-sm text-slate-700 dark:text-slate-300 leading-relaxed">
-    <p>Read the official AINOVEX Privacy Policy. Learn how we safeguard your personal information, handle essential cookies, and maintain strict data privacy.</p>
-    <h2 class="text-xl font-bold text-slate-900 dark:text-white">1. Information We Collect</h2>
-    <p>At AINOVEX, the privacy of our visitors is paramount. We only collect standard web server access logs (IP address, user-agent, timestamp) for security and operational reliability. We do not sell user data.</p>
-    <h2 class="text-xl font-bold text-slate-900 dark:text-white">2. Cookies &amp; Local Storage</h2>
-    <p>We use local browser storage strictly for functional preferences (such as light or dark theme choices). We do not employ third-party cross-site trackers.</p>
+  <div class="space-y-8 text-sm sm:text-base text-slate-700 dark:text-slate-300 leading-relaxed">
+    <section>
+      <h2 class="text-xl font-bold text-slate-900 dark:text-white mb-2">${esc(legal.privacy.sections[0].heading)}</h2>
+      <p>${esc(legal.privacy.sections[0].textBeforeUrl)}${esc(legal.privacy.sections[0].siteUrl)}${esc(legal.privacy.sections[0].textAfterUrl)}</p>
+    </section>
+    <section>
+      <h2 class="text-xl font-bold text-slate-900 dark:text-white mb-2">${esc(legal.privacy.sections[1].heading)}</h2>
+      <p>${esc(legal.privacy.sections[1].paragraphs[0])}</p>
+    </section>
+    <section>
+      <h2 class="text-xl font-bold text-slate-900 dark:text-white mb-2">${esc(legal.privacy.sections[2].heading)}</h2>
+      <p>${esc(legal.privacy.sections[2].paragraphs[0])}</p>
+    </section>
+    <section>
+      <h2 class="text-xl font-bold text-slate-900 dark:text-white mb-2">${esc(legal.privacy.sections[3].heading)}</h2>
+      <p>${esc(legal.privacy.sections[3].textBeforeEmail)}<strong>${esc(legal.privacy.sections[3].email)}</strong>.</p>
+    </section>
   </div>
 </div>`;
 writePage('privacy/index.html', createPageHtml({
@@ -1223,15 +1238,24 @@ writePage('privacy/index.html', createPageHtml({
 
 const termsContent = `
 <div class="max-w-4xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
-  ${renderBreadcrumb([{ label: 'Terms of Service' }])}
-  <div class="py-6 border-b border-slate-200 dark:border-slate-800 mb-8">
-    <h1 class="text-3xl sm:text-4xl font-extrabold text-slate-900 dark:text-white tracking-tight mb-2">Terms of Service</h1>
-    <p class="text-xs text-slate-500">Last updated: October 18, 2026 &bull; Published by AINOVEX Editorial Team</p>
+  ${renderBreadcrumb([{ label: LEGAL_BREADCRUMBS.terms }])}
+  <div class="py-6 border-b border-slate-200 dark:border-slate-800/80 mb-8">
+    <h1 class="text-3xl sm:text-4xl font-extrabold text-slate-900 dark:text-white tracking-tight mb-2">${esc(LEGAL_TITLES.terms)}</h1>
+    <p class="text-xs text-slate-500 dark:text-slate-400">Last updated: ${esc(legalDateLabel)} &bull; Published by AINOVEX Editorial Team</p>
   </div>
-  <div class="space-y-6 text-sm text-slate-700 dark:text-slate-300 leading-relaxed">
-    <p>Review the AINOVEX Terms of Service. Understand the rules, guidelines, disclaimers, and legal agreements governing the use of our website and directory.</p>
-    <h2 class="text-xl font-bold text-slate-900 dark:text-white">1. Acceptance of Terms</h2>
-    <p>By accessing AINOVEX, you agree to comply with these terms, applicable laws, and regulations. All material is provided for informational and educational purposes.</p>
+  <div class="space-y-8 text-sm sm:text-base text-slate-700 dark:text-slate-300 leading-relaxed">
+    <section>
+      <h2 class="text-xl font-bold text-slate-900 dark:text-white mb-2">${esc(legal.terms.sections[0].heading)}</h2>
+      <p>${esc(legal.terms.sections[0].paragraphs[0])}</p>
+    </section>
+    <section>
+      <h2 class="text-xl font-bold text-slate-900 dark:text-white mb-2">${esc(legal.terms.sections[1].heading)}</h2>
+      <p>${esc(legal.terms.sections[1].paragraphs[0])}</p>
+    </section>
+    <section>
+      <h2 class="text-xl font-bold text-slate-900 dark:text-white mb-2">${esc(legal.terms.sections[2].heading)}</h2>
+      <p>${esc(legal.terms.sections[2].paragraphs[0])}</p>
+    </section>
   </div>
 </div>`;
 writePage('terms/index.html', createPageHtml({
@@ -1243,15 +1267,22 @@ writePage('terms/index.html', createPageHtml({
 
 const editorialContent = `
 <div class="max-w-4xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
-  ${renderBreadcrumb([{ label: 'Editorial Policy' }])}
-  <div class="py-6 border-b border-slate-200 dark:border-slate-800 mb-8">
-    <h1 class="text-3xl sm:text-4xl font-extrabold text-slate-900 dark:text-white tracking-tight mb-2">Editorial Policy &amp; Review Standards</h1>
-    <p class="text-xs text-slate-500">Last updated: October 18, 2026 &bull; Published by AINOVEX Editorial Team</p>
+  ${renderBreadcrumb([{ label: LEGAL_BREADCRUMBS.editorial }])}
+  <div class="py-6 border-b border-slate-200 dark:border-slate-800/80 mb-8">
+    <h1 class="text-3xl sm:text-4xl font-extrabold text-slate-900 dark:text-white tracking-tight mb-2">${esc(LEGAL_TITLES.editorial)}</h1>
+    <p class="text-xs text-slate-500 dark:text-slate-400">Last updated: ${esc(legalDateLabel)} &bull; Published by AINOVEX Editorial Team</p>
   </div>
-  <div class="space-y-6 text-sm text-slate-700 dark:text-slate-300 leading-relaxed">
-    <p>Explore AINOVEX strict editorial policy, review guidelines, testing benchmarks, and independence standards for recommending artificial intelligence tools.</p>
-    <h2 class="text-xl font-bold text-slate-900 dark:text-white">1. Independence Commitment</h2>
-    <p>All reviews are written following independent evaluation. Tool developers cannot pay for higher star ratings or biased coverage.</p>
+  <div class="space-y-8 text-sm sm:text-base text-slate-700 dark:text-slate-300 leading-relaxed">
+    <section>
+      <h2 class="text-xl font-bold text-slate-900 dark:text-white mb-2">${esc(legal.editorial.sections[0].heading)}</h2>
+      <p>${esc(legal.editorial.sections[0].textBeforeAuthor)}<strong>${esc(legal.editorial.sections[0].authorName)}</strong>.</p>
+    </section>
+    <section>
+      <h2 class="text-xl font-bold text-slate-900 dark:text-white mb-2">${esc(legal.editorial.sections[1].heading)}</h2>
+      <ul class="list-disc pl-5 space-y-2">
+        ${legal.editorial.sections[1].bullets.map(b => `<li>${esc(b)}</li>`).join('\n        ')}
+      </ul>
+    </section>
   </div>
 </div>`;
 writePage('editorial-policy/index.html', createPageHtml({
@@ -1263,15 +1294,20 @@ writePage('editorial-policy/index.html', createPageHtml({
 
 const affiliateContent = `
 <div class="max-w-4xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
-  ${renderBreadcrumb([{ label: 'Affiliate Disclosure' }])}
-  <div class="py-6 border-b border-slate-200 dark:border-slate-800 mb-8">
-    <h1 class="text-3xl sm:text-4xl font-extrabold text-slate-900 dark:text-white tracking-tight mb-2">Affiliate &amp; Monetization Disclosure</h1>
-    <p class="text-xs text-slate-500">Last updated: October 18, 2026 &bull; Published by AINOVEX Editorial Team</p>
+  ${renderBreadcrumb([{ label: LEGAL_BREADCRUMBS.affiliate }])}
+  <div class="py-6 border-b border-slate-200 dark:border-slate-800/80 mb-8">
+    <h1 class="text-3xl sm:text-4xl font-extrabold text-slate-900 dark:text-white tracking-tight mb-2">${esc(LEGAL_TITLES.affiliate)}</h1>
+    <p class="text-xs text-slate-500 dark:text-slate-400">Last updated: ${esc(legalDateLabel)} &bull; Published by AINOVEX Editorial Team</p>
   </div>
-  <div class="space-y-6 text-sm text-slate-700 dark:text-slate-300 leading-relaxed">
-    <p>Read the AINOVEX affiliate and advertising disclosure. Learn how our site remains free for readers through transparent monetization and editorial integrity.</p>
-    <h2 class="text-xl font-bold text-slate-900 dark:text-white">1. How We Fund Our Research</h2>
-    <p>Certain links on AINOVEX may be affiliate links. If you click through and purchase a subscription, we may earn a small referral commission at no additional cost to you.</p>
+  <div class="space-y-8 text-sm sm:text-base text-slate-700 dark:text-slate-300 leading-relaxed">
+    <section>
+      <h2 class="text-xl font-bold text-slate-900 dark:text-white mb-2">${esc(legal.affiliate.sections[0].heading)}</h2>
+      <p>${esc(legal.affiliate.sections[0].paragraphs[0])}</p>
+    </section>
+    <section>
+      <h2 class="text-xl font-bold text-slate-900 dark:text-white mb-2">${esc(legal.affiliate.sections[1].heading)}</h2>
+      <p>${esc(legal.affiliate.sections[1].paragraphs[0])}</p>
+    </section>
   </div>
 </div>`;
 writePage('affiliate-disclosure/index.html', createPageHtml({

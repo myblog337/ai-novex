@@ -1,6 +1,13 @@
 import React from 'react';
 import { Breadcrumbs } from '../components/Breadcrumbs';
 import { SITE_URL } from '../config/site';
+import settings from '../../content/settings.json';
+import {
+  LEGAL_TITLES,
+  LEGAL_BREADCRUMBS,
+  formatLegalDate,
+  getLegalContent,
+} from '../config/legal.js';
 
 interface LegalViewProps {
   page: 'privacy' | 'terms' | 'editorial' | 'affiliate';
@@ -8,30 +15,23 @@ interface LegalViewProps {
 }
 
 export const LegalView: React.FC<LegalViewProps> = ({ page, onNavigate }) => {
-  const titles = {
-    privacy: 'Privacy Policy',
-    terms: 'Terms of Service',
-    editorial: 'Editorial Policy',
-    affiliate: 'Affiliate & Monetization Disclosure',
-  };
-
-  const breadcrumbLabels = {
-    privacy: 'Privacy Policy',
-    terms: 'Terms of Service',
-    editorial: 'Editorial Policy',
-    affiliate: 'Affiliate Disclosure',
-  };
+  const CONTACT_EMAIL: string = settings.contactEmail || '';
+  if (!CONTACT_EMAIL) {
+    console.error('[LegalView] "contactEmail" is missing or empty in content/settings.json');
+  }
+  const legal = getLegalContent({ siteUrl: SITE_URL, contactEmail: CONTACT_EMAIL, strict: false });
+  const lastUpdatedLabel = formatLegalDate();
 
   return (
     <div className="max-w-4xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
-      <Breadcrumbs items={[{ label: breadcrumbLabels[page] }]} onNavigate={onNavigate} />
+      <Breadcrumbs items={[{ label: LEGAL_BREADCRUMBS[page] }]} onNavigate={onNavigate} />
 
       <div className="py-6 border-b border-slate-200 dark:border-slate-800/80 mb-8">
         <h1 className="text-3xl sm:text-4xl font-extrabold text-slate-900 dark:text-white tracking-tight mb-2">
-          {titles[page]}
+          {LEGAL_TITLES[page]}
         </h1>
         <p className="text-xs text-slate-500 dark:text-slate-400">
-          Last updated: October 10, 2026 • Published by AINOVEX Editorial Team
+          Last updated: {lastUpdatedLabel} • Published by AINOVEX Editorial Team
         </p>
       </div>
 
@@ -39,28 +39,34 @@ export const LegalView: React.FC<LegalViewProps> = ({ page, onNavigate }) => {
         {page === 'privacy' && (
           <>
             <section>
-              <h2 className="text-xl font-bold text-slate-900 dark:text-white mb-2">1. Introduction</h2>
+              <h2 className="text-xl font-bold text-slate-900 dark:text-white mb-2">{legal.privacy.sections[0].heading}</h2>
               <p>
-                At AINOVEX (accessible from {SITE_URL}), the privacy of our visitors is of paramount importance. This Privacy Policy document outlines the types of information collected and how it is used.
+                {legal.privacy.sections[0].textBeforeUrl}{legal.privacy.sections[0].siteUrl}{legal.privacy.sections[0].textAfterUrl}
               </p>
             </section>
             <section>
-              <h2 className="text-xl font-bold text-slate-900 dark:text-white mb-2">2. Log Files & Analytics</h2>
+              <h2 className="text-xl font-bold text-slate-900 dark:text-white mb-2">{legal.privacy.sections[1].heading}</h2>
               <p>
-                AINOVEX follows a standard procedure of utilizing log files. These files log visitors when they access websites. The information collected includes internet protocol (IP) addresses, browser type, Internet Service Provider (ISP), date and time stamp, referring/exit pages, and number of clicks.
+                {legal.privacy.sections[1].paragraphs[0]}
               </p>
             </section>
             <section>
-              <h2 className="text-xl font-bold text-slate-900 dark:text-white mb-2">3. Cookies & Session Storage</h2>
+              <h2 className="text-xl font-bold text-slate-900 dark:text-white mb-2">{legal.privacy.sections[2].heading}</h2>
               <p>
-                AINOVEX uses essential cookies for storing user interface preferences (such as light or dark theme choices). We do not use intrusive third-party cross-site behavioral tracking cookies.
+                {legal.privacy.sections[2].paragraphs[0]}
               </p>
             </section>
             <section>
-              <h2 className="text-xl font-bold text-slate-900 dark:text-white mb-2">4. Contact Information</h2>
-              <p>
-                If you have questions about our privacy practices, contact us via email at <strong>mdshamimhossaincom129@gmail.com</strong>.
-              </p>
+              <h2 className="text-xl font-bold text-slate-900 dark:text-white mb-2">{legal.privacy.sections[3].heading}</h2>
+              {legal.privacy.sections[3].hasEmail ? (
+                <p>
+                  {legal.privacy.sections[3].textBeforeEmail}<strong>{legal.privacy.sections[3].email}</strong>.
+                </p>
+              ) : (
+                <p>
+                  {legal.privacy.sections[3].paragraphs[0]}
+                </p>
+              )}
             </section>
           </>
         )}
@@ -68,21 +74,21 @@ export const LegalView: React.FC<LegalViewProps> = ({ page, onNavigate }) => {
         {page === 'terms' && (
           <>
             <section>
-              <h2 className="text-xl font-bold text-slate-900 dark:text-white mb-2">1. Terms Acceptance</h2>
+              <h2 className="text-xl font-bold text-slate-900 dark:text-white mb-2">{legal.terms.sections[0].heading}</h2>
               <p>
-                By accessing this website, you agree to be bound by these Terms and Conditions of Use and agree that you are responsible for compliance with any applicable local laws.
+                {legal.terms.sections[0].paragraphs[0]}
               </p>
             </section>
             <section>
-              <h2 className="text-xl font-bold text-slate-900 dark:text-white mb-2">2. Informational Purpose</h2>
+              <h2 className="text-xl font-bold text-slate-900 dark:text-white mb-2">{legal.terms.sections[1].heading}</h2>
               <p>
-                All content, comparisons, prompt examples, and software directories provided on AINOVEX are for informational and educational purposes only. While we rigorously test the tools we review, external artificial intelligence software changes rapidly and without notice.
+                {legal.terms.sections[1].paragraphs[0]}
               </p>
             </section>
             <section>
-              <h2 className="text-xl font-bold text-slate-900 dark:text-white mb-2">3. Intellectual Property</h2>
+              <h2 className="text-xl font-bold text-slate-900 dark:text-white mb-2">{legal.terms.sections[2].heading}</h2>
               <p>
-                The materials contained in this website are protected by applicable copyright and trademark law. Brand logos and trademarks of external AI tools (such as ChatGPT, Midjourney, Canva) belong to their respective corporate owners.
+                {legal.terms.sections[2].paragraphs[0]}
               </p>
             </section>
           </>
@@ -91,17 +97,17 @@ export const LegalView: React.FC<LegalViewProps> = ({ page, onNavigate }) => {
         {page === 'editorial' && (
           <>
             <section>
-              <h2 className="text-xl font-bold text-slate-900 dark:text-white mb-2">Our Editorial Standards</h2>
+              <h2 className="text-xl font-bold text-slate-900 dark:text-white mb-2">{legal.editorial.sections[0].heading}</h2>
               <p>
-                At AINOVEX, our mission is to publish accurate, trustworthy, and actionable artificial intelligence guides. Every tutorial, comparison, and tool listing is authored or vetted by lead editor <strong>Md Shamim</strong>.
+                {legal.editorial.sections[0].textBeforeAuthor}<strong>{legal.editorial.sections[0].authorName}</strong>.
               </p>
             </section>
             <section>
-              <h2 className="text-xl font-bold text-slate-900 dark:text-white mb-2">Testing Methodology</h2>
+              <h2 className="text-xl font-bold text-slate-900 dark:text-white mb-2">{legal.editorial.sections[1].heading}</h2>
               <ul className="list-disc pl-5 space-y-2">
-                <li>We test tools on real-world prompts, datasets, and creative projects.</li>
-                <li>We independently verify pricing models (Free vs. Freemium vs. Paid) to prevent deceptive advertising.</li>
-                <li>We highlight potential limitations, hallucination risks, and data privacy policies.</li>
+                {legal.editorial.sections[1].bullets?.map((bullet: string, idx: number) => (
+                  <li key={idx}>{bullet}</li>
+                ))}
               </ul>
             </section>
           </>
@@ -110,15 +116,15 @@ export const LegalView: React.FC<LegalViewProps> = ({ page, onNavigate }) => {
         {page === 'affiliate' && (
           <>
             <section>
-              <h2 className="text-xl font-bold text-slate-900 dark:text-white mb-2">Affiliate & Advertising Transparency</h2>
+              <h2 className="text-xl font-bold text-slate-900 dark:text-white mb-2">{legal.affiliate.sections[0].heading}</h2>
               <p>
-                In compliance with FTC guidelines, we maintain full disclosure regarding any current or future monetization models on AINOVEX.
+                {legal.affiliate.sections[0].paragraphs[0]}
               </p>
             </section>
             <section>
-              <h2 className="text-xl font-bold text-slate-900 dark:text-white mb-2">Current Monetization Status</h2>
+              <h2 className="text-xl font-bold text-slate-900 dark:text-white mb-2">{legal.affiliate.sections[1].heading}</h2>
               <p>
-                Google AdSense is currently not active, and affiliate tracking links are not currently active on the site. If in the future we include affiliate links for software we recommend, we will explicitly disclose it at the top of that specific guide. Our editorial reviews remain completely independent.
+                {legal.affiliate.sections[1].paragraphs[0]}
               </p>
             </section>
           </>
