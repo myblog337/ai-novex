@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { INDEXABLE_STATIC_PATHS, isIndexable } from '../src/config/indexing.js';
+import { INDEXABLE_STATIC_PATHS, isIndexable, categoryHasContent } from '../src/config/indexing.js';
+import { isValidHttpOriginUrl } from './lib/validators.mjs';
 
 const root = process.cwd();
 const dist = path.join(root, 'dist');
@@ -12,6 +13,17 @@ if (!fs.existsSync(dist)) {
 }
 
 const settings = readJson('settings.json');
+if (
+  typeof settings?.productionUrl !== 'string' ||
+  !settings.productionUrl.trim() ||
+  !isValidHttpOriginUrl(settings.productionUrl)
+) {
+  console.error(
+    '[finalize-sitemap] Invalid or missing productionUrl in content/settings.json: must be a valid HTTP or HTTPS origin URL without a path, query, or fragment (e.g., https://example.com)'
+  );
+  process.exit(1);
+}
+
 const articles = readJson('articles.json').filter((article) => article.isPublished);
 const categories = readJson('categories.json');
 const context = { articles, categories };
@@ -29,12 +41,13 @@ for (const route of INDEXABLE_STATIC_PATHS) {
   }
 }
 
-// Include every published article and every generated category route, even if a category is empty.
+// Include every published article and categories with at least one published article.
 for (const article of articles) {
   const route = `/blog/${article.slug}/`;
   if (isIndexable(route, context)) entries.set(toLoc(route), dateOf(article));
 }
 for (const category of categories) {
+  if (!categoryHasContent(category.slug, categories, articles)) continue;
   const route = `/category/${category.slug}/`;
   if (isIndexable(route, context)) {
     entries.set(toLoc(route), newest(articles.filter((article) => article.category === category.slug)));

@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Calendar, Clock, Share2, Check, Tag } from 'lucide-react';
+import { Calendar, Clock, Share2, Check, Tag, AlertCircle, RefreshCw, ArrowLeft } from 'lucide-react';
 import { Article } from '../types';
 import { Breadcrumbs } from '../components/Breadcrumbs';
 
@@ -42,12 +42,127 @@ if (typeof document !== 'undefined') {
   }
 }
 
+function findMarkdownLoaderKey(article: Article): string | undefined {
+  const contentPath = typeof article.contentPath === 'string' ? article.contentPath.trim() : '';
+  if (contentPath) {
+    const normalized = contentPath.replace(/^(\.\/|\/)+/, '');
+    const filename = normalized.split('/').pop() || '';
+    return Object.keys(markdownLoaders).find((k) => {
+      if (k.endsWith(normalized) || k.endsWith(`/${normalized}`)) return true;
+      if (filename && k.endsWith(`/${filename}`)) return true;
+      return false;
+    });
+  }
+  return Object.keys(markdownLoaders).find((k) => k.endsWith(`/${article.slug}.md`));
+}
+
 async function loadArticleHtml(article: Article): Promise<string> {
-  const key = Object.keys(markdownLoaders).find((k) => k.endsWith(`/${article.slug}.md`));
-  if (!key) return '';
-  const [raw, { renderMarkdown }] = await Promise.all([markdownLoaders[key](), import('../utils/markdown')]);
+  const hasContentPath = typeof article.contentPath === 'string' && article.contentPath.trim().length > 0;
+  const key = findMarkdownLoaderKey(article);
+  if (!key) {
+    const reason = hasContentPath
+      ? `contentPath "${article.contentPath}"`
+      : `slug "${article.slug}"`;
+    throw new Error(`Markdown content file not found for article "${article.slug}" using ${reason}`);
+  }
+  const loader = markdownLoaders[key];
+  if (typeof loader !== 'function') {
+    throw new Error(`Invalid markdown loader for key "${key}"`);
+  }
+  const [raw, { renderMarkdown }] = await Promise.all([loader(), import('../utils/markdown')]);
   return renderMarkdown(raw);
 }
+
+interface ArticleErrorPanelProps {
+  error?: string | null;
+  onRetry: () => void;
+  onNavigate: (path: string) => void;
+}
+
+const ArticleLoadingSkeleton: React.FC = () => (
+  <div
+    id="article-content-body"
+    role="status"
+    aria-label="Loading article content"
+    aria-busy="true"
+    className="mb-12 min-h-[40vh] animate-pulse space-y-8"
+  >
+    {/* Intro paragraph lines */}
+    <div className="space-y-3">
+      <div className="h-4 bg-slate-200 dark:bg-slate-800 rounded w-full" />
+      <div className="h-4 bg-slate-200 dark:bg-slate-800 rounded w-11/12" />
+      <div className="h-4 bg-slate-200 dark:bg-slate-800 rounded w-4/5" />
+      <div className="h-4 bg-slate-200 dark:bg-slate-800 rounded w-5/6" />
+    </div>
+
+    {/* Section heading + paragraph */}
+    <div className="pt-2 space-y-3">
+      <div className="h-7 bg-slate-200 dark:bg-slate-800 rounded-lg w-2/5 mb-4" />
+      <div className="h-4 bg-slate-200 dark:bg-slate-800 rounded w-full" />
+      <div className="h-4 bg-slate-200 dark:bg-slate-800 rounded w-full" />
+      <div className="h-4 bg-slate-200 dark:bg-slate-800 rounded w-3/4" />
+    </div>
+
+    {/* Callout box placeholder */}
+    <div className="p-6 rounded-2xl bg-slate-100 dark:bg-slate-800/40 border border-slate-200/80 dark:border-slate-800 space-y-2.5">
+      <div className="h-4 bg-slate-200 dark:bg-slate-700/60 rounded w-5/6" />
+      <div className="h-4 bg-slate-200 dark:bg-slate-700/60 rounded w-2/3" />
+    </div>
+
+    {/* Additional section placeholder */}
+    <div className="pt-2 space-y-3">
+      <div className="h-6 bg-slate-200 dark:bg-slate-800 rounded-lg w-1/3 mb-4" />
+      <div className="h-4 bg-slate-200 dark:bg-slate-800 rounded w-full" />
+      <div className="h-4 bg-slate-200 dark:bg-slate-800 rounded w-5/6" />
+      <div className="h-4 bg-slate-200 dark:bg-slate-800 rounded w-4/5" />
+    </div>
+    <span className="sr-only">Loading article content...</span>
+  </div>
+);
+
+const ArticleErrorPanel: React.FC<ArticleErrorPanelProps> = ({
+  error,
+  onRetry,
+  onNavigate,
+}) => (
+  <div
+    id="article-content-body"
+    role="alert"
+    aria-live="assertive"
+    className="my-10 p-6 sm:p-8 rounded-2xl bg-slate-50 dark:bg-slate-900/60 border border-slate-200 dark:border-slate-800 text-center max-w-2xl mx-auto shadow-sm"
+  >
+    <div className="w-12 h-12 mx-auto rounded-2xl bg-red-100 dark:bg-red-950/50 text-red-600 dark:text-red-400 border border-red-200 dark:border-red-900/50 flex items-center justify-center mb-4">
+      <AlertCircle className="w-6 h-6" />
+    </div>
+    <h3 className="text-xl font-bold text-slate-900 dark:text-white mb-2">
+      Unable to Load Article
+    </h3>
+    <p className="text-sm text-slate-600 dark:text-slate-400 mb-6 max-w-md mx-auto leading-relaxed">
+      {error || "We couldn't load this article. Please check your connection and try again."}
+    </p>
+    <div className="flex flex-wrap items-center justify-center gap-3">
+      <button
+        type="button"
+        onClick={onRetry}
+        className="inline-flex items-center gap-2 px-5 py-2.5 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-sm font-semibold shadow-sm transition-all cursor-pointer"
+      >
+        <RefreshCw className="w-4 h-4" />
+        <span>Try Again</span>
+      </button>
+      <a
+        href="/blog/"
+        onClick={(e) => {
+          e.preventDefault();
+          onNavigate('/blog/');
+        }}
+        className="inline-flex items-center gap-1.5 px-4 py-2.5 rounded-xl bg-white dark:bg-slate-800 hover:bg-slate-100 dark:hover:bg-slate-700/70 text-slate-700 dark:text-slate-200 text-sm font-semibold border border-slate-200 dark:border-slate-700 transition-colors cursor-pointer"
+      >
+        <ArrowLeft className="w-4 h-4" />
+        <span>Return to Blog Archive</span>
+      </a>
+    </div>
+  </div>
+);
 
 export const ArticleDetailView: React.FC<ArticleDetailViewProps> = ({
   slug,
@@ -58,28 +173,62 @@ export const ArticleDetailView: React.FC<ArticleDetailViewProps> = ({
   const initialHtml = prerendered && prerendered.slug === slug ? prerendered.html : '';
 
   const [contentHtml, setContentHtml] = useState<string>(initialHtml);
+  const [isLoading, setIsLoading] = useState<boolean>(!initialHtml);
+  const [error, setError] = useState<string | null>(null);
+  const [retryCount, setRetryCount] = useState<number>(0);
   const [copied, setCopied] = useState(false);
+  const [prevSlug, setPrevSlug] = useState<string>(slug);
 
-  // Re-runs for every slug: navigating Article A -> Article B always shows B's own content.
+  // Synchronize state when navigating between articles before render
+  if (prevSlug !== slug) {
+    setPrevSlug(slug);
+    const hasPre = Boolean(prerendered && prerendered.slug === slug);
+    setContentHtml(hasPre ? prerendered.html : '');
+    setIsLoading(!hasPre);
+    setError(null);
+  }
+
+  // Re-runs for every slug or retry: navigating Article A -> Article B always shows B's own content.
   useEffect(() => {
     if (!article) return;
     if (prerendered && prerendered.slug === slug) {
       // First view of the landing page: reuse the pre-rendered HTML once, afterwards behave normally.
       setContentHtml(prerendered.html);
+      setIsLoading(false);
+      setError(null);
       prerendered = null;
       return;
     }
+
     let active = true;
+    setIsLoading(true);
+    setError(null);
     setContentHtml('');
+
     loadArticleHtml(article)
       .then((html) => {
-        if (active) setContentHtml(html);
+        if (!active) return;
+        setContentHtml(html);
+        setIsLoading(false);
+        setError(null);
       })
-      .catch((err) => console.error('Failed to load article:', err));
+      .catch((err) => {
+        if (!active) return;
+        console.error('Failed to load article:', err);
+        setError("We couldn't load this article. Please check your connection and try again.");
+        setIsLoading(false);
+      });
+
     return () => {
       active = false;
     };
-  }, [slug, article]);
+  }, [slug, article, retryCount]);
+
+  const handleRetry = () => {
+    setError(null);
+    setIsLoading(true);
+    setRetryCount((prev) => prev + 1);
+  };
 
   const handleCopy = async () => {
     // navigator.clipboard is undefined on insecure origins and writeText() can reject (permissions):
@@ -242,11 +391,17 @@ export const ArticleDetailView: React.FC<ArticleDetailViewProps> = ({
       )}
 
       {/* Article Content Render */}
-      <div
-        id="article-content-body"
-        className="article-content mb-12 min-h-[40vh]"
-        dangerouslySetInnerHTML={{ __html: contentHtml }}
-      />
+      {isLoading ? (
+        <ArticleLoadingSkeleton />
+      ) : error ? (
+        <ArticleErrorPanel error={error} onRetry={handleRetry} onNavigate={onNavigate} />
+      ) : (
+        <div
+          id="article-content-body"
+          className="article-content mb-12 min-h-[40vh]"
+          dangerouslySetInnerHTML={{ __html: contentHtml }}
+        />
+      )}
 
       {/* Tags */}
       {article.tags && article.tags.length > 0 && (

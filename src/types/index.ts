@@ -29,8 +29,10 @@ export interface Tool {
   slug: string;
   url: string;
   description: string;
+  /** Optional extended description (max 2000 characters). */
   longDescription?: string;
   category: string;
+  /** Required display name matching the referenced Category.name. */
   categoryName: string;
   tags: string[];
   pricing: 'Free' | 'Freemium' | 'Paid';
@@ -38,6 +40,7 @@ export interface Tool {
   icon: string;
   iconBg?: string;
   brandInitial?: string;
+  /** Optional finite rating between 0 and 5. */
   rating?: number;
 }
 

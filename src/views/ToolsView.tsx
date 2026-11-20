@@ -39,7 +39,7 @@ export const ToolsView: React.FC<ToolsViewProps> = ({
 
       return matchesSearch && matchesCat && matchesPricing;
     }).sort((a, b) => {
-      if (sortBy === 'rating') return (b.rating || 0) - (a.rating || 0);
+      if (sortBy === 'rating') return (b.rating ?? 0) - (a.rating ?? 0);
       if (sortBy === 'name') return a.name.localeCompare(b.name);
       return (b.isFeatured ? 1 : 0) - (a.isFeatured ? 1 : 0);
     });
@@ -160,7 +160,7 @@ export const ToolsView: React.FC<ToolsViewProps> = ({
 
                 <div className="flex items-center justify-center gap-1 text-xs text-amber-500 font-semibold mb-1">
                   <Star className="w-3.5 h-3.5 fill-amber-400 text-amber-400" />
-                  <span>{tool.rating || 4.8}</span>
+                  <span>{tool.rating ?? 4.8}</span>
                   <span className="text-slate-400">•</span>
                   <span className="text-slate-500 dark:text-slate-400 font-normal">{tool.pricing}</span>
                 </div>

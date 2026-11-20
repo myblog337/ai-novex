@@ -9,10 +9,43 @@
 //   sitemap.xml lists ONLY the indexable URLs.
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { renderMarkdown } from '../src/utils/markdown.js';
 import { INDEXABLE_STATIC_PATHS, isIndexable, categoryHasContent, categoryTitle } from '../src/config/indexing.js';
 import { LEGAL_TITLES, LEGAL_BREADCRUMBS, formatLegalDate, getLegalContent } from '../src/config/legal.js';
+import {
+  isValidArticleSlug,
+  isValidHttpOriginUrl
+} from './lib/validators.mjs';
+import { isInsideAuthorizedDirectory } from './lib/storage.mjs';
 
+const esc = (v) =>
+  String(v ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+
+export function renderToolDirectoryCard(t) {
+  return `
+    <div class="p-6 rounded-2xl bg-white dark:bg-slate-900/70 border border-slate-200 dark:border-slate-800 text-center flex flex-col justify-between">
+      <div>
+        <div class="w-12 h-12 mx-auto mb-3 rounded-xl overflow-hidden bg-slate-50 dark:bg-slate-800/80 p-1 border border-slate-200/60 dark:border-slate-700/60 flex items-center justify-center">
+          <img src="${esc(t.icon)}" alt="${esc(t.name)} Logo" class="w-full h-full object-contain" />
+        </div>
+        <div class="text-xs text-amber-500 font-semibold mb-1">&#9733; ${t.rating ?? 4.8} &bull; ${esc(t.pricing)}</div>
+        <h2 class="text-lg font-bold text-slate-900 dark:text-white mb-2">${esc(t.name)}</h2>
+        <p class="text-xs sm:text-sm text-slate-600 dark:text-slate-400 line-clamp-2 leading-relaxed mb-4">${esc(t.description)}</p>
+        <div class="flex flex-wrap items-center justify-center gap-1.5 mb-6">
+          ${(t.tags || []).map(tag => `<span class="px-2.5 py-0.5 rounded-full text-[11px] bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300">${esc(tag)}</span>`).join('')}
+        </div>
+      </div>
+      <a href="${esc(t.url)}" target="_blank" rel="nofollow noopener noreferrer" class="w-full py-2.5 px-4 rounded-xl text-xs font-semibold text-white bg-slate-900 hover:bg-blue-600 dark:bg-slate-800 transition-colors inline-block">Visit Tool &rarr;</a>
+    </div>`;
+}
+
+export function runPostbuild() {
 const root = process.cwd();
 const dist = path.join(root, 'dist');
 const contentSrc = path.join(root, 'content');
@@ -44,24 +77,132 @@ const readJson = (f, { optional = false, fallback } = {}) => {
   }
 };
 
-const esc = (v) =>
-  String(v ?? '')
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#39;');
-
 const settings = readJson('settings.json', { optional: false, fallback: {} });
-if (!settings.productionUrl || typeof settings.productionUrl !== 'string' || !settings.productionUrl.trim()) {
-  console.error('[postbuild] Invalid or missing productionUrl in content/settings.json');
+if (
+  typeof settings?.productionUrl !== 'string' ||
+  !settings.productionUrl.trim() ||
+  !isValidHttpOriginUrl(settings.productionUrl)
+) {
+  console.error(
+    '[postbuild] Invalid or missing productionUrl in content/settings.json: must be a valid HTTP or HTTPS origin URL without a path, query, or fragment (e.g., https://example.com)'
+  );
   process.exit(1);
 }
 
 const categories = readJson('categories.json', { optional: false, fallback: [] });
 const tools = readJson('tools.json', { optional: false, fallback: [] });
 const ads = readJson('ads.json', { optional: true, fallback: {} });
+
+const allowedArticlesDir = path.resolve(root, 'content', 'articles');
+const canonicalAllowedArticlesDir = fs.existsSync(allowedArticlesDir)
+  ? fs.realpathSync(allowedArticlesDir)
+  : allowedArticlesDir;
+
+const validateArticleSlug = (slug) => {
+  if (typeof slug !== 'string' || !slug.trim()) {
+    throw new Error('Article slug is missing or empty');
+  }
+  if (slug.trim() !== slug) {
+    throw new Error('Article slug contains leading or trailing whitespace');
+  }
+  if (slug.includes('\0')) {
+    throw new Error('Article slug contains forbidden null bytes');
+  }
+  if (slug.includes('/') || slug.includes('\\') || slug.includes('..')) {
+    throw new Error('Article slug contains directory separators or path traversal sequences');
+  }
+  if (slug.toLowerCase().endsWith('.md')) {
+    throw new Error('Pass the article slug identifier without the .md extension');
+  }
+  if (slug.length < 3 || slug.length > 80) {
+    throw new Error('Article slug length must be between 3 and 80 characters');
+  }
+  if (!isValidArticleSlug(slug)) {
+    throw new Error(
+      'Article slug contains invalid characters or formatting (must be 3-80 lowercase alphanumeric characters with single hyphens, no underscores or consecutive hyphens)'
+    );
+  }
+  return slug;
+};
+
+const resolveArticleMarkdownPath = (article) => {
+  const slug = article?.slug;
+  validateArticleSlug(slug);
+
+  // Reject any stored article record whose contentPath does not exactly equal "content/articles/${slug}.md"
+  const expectedContentPath = `content/articles/${slug}.md`;
+  if (article?.contentPath !== expectedContentPath) {
+    throw new Error(
+      `Stored article record contentPath "${article?.contentPath}" does not match server-generated path policy: "${expectedContentPath}"`
+    );
+  }
+
+  // Always derive the Markdown path exclusively from the validated slug against canonical authorized articles directory
+  const expectedFileName = `${slug}.md`;
+  const candidatePath = path.resolve(canonicalAllowedArticlesDir, expectedFileName);
+
+  // Enforce boundary containment inside authorized content/articles/ directory
+  if (!isInsideAuthorizedDirectory(canonicalAllowedArticlesDir, candidatePath)) {
+    throw new Error('Derived article path resolves outside the authorized content/articles/ directory');
+  }
+
+  // Ensure file exists
+  if (!fs.existsSync(candidatePath)) {
+    throw new Error(`Markdown file "${expectedFileName}" does not exist in the authorized content directory`);
+  }
+
+  // Symlink check on candidate path
+  const lstat = fs.lstatSync(candidatePath);
+  if (lstat.isSymbolicLink()) {
+    throw new Error('Symlinks are forbidden for article Markdown files');
+  }
+
+  // Resolve canonical path to detect and prevent symlink directory escape
+  let canonicalTarget;
+  try {
+    canonicalTarget = fs.realpathSync(candidatePath);
+  } catch {
+    throw new Error('Failed to resolve canonical path for Markdown file');
+  }
+
+  if (!isInsideAuthorizedDirectory(canonicalAllowedArticlesDir, canonicalTarget)) {
+    throw new Error('Symlink target escapes authorized content/articles/ directory');
+  }
+
+  if (path.extname(canonicalTarget).toLowerCase() !== '.md') {
+    throw new Error('Canonical target file must have a .md extension');
+  }
+
+  if (path.basename(canonicalTarget) !== expectedFileName) {
+    throw new Error('Canonical target filename does not match expected article filename');
+  }
+
+  const stat = fs.statSync(canonicalTarget);
+  if (!stat.isFile()) {
+    throw new Error('Canonical target path is not a regular file');
+  }
+
+  return canonicalTarget;
+};
+
 const allArticles = readJson('articles.json', { optional: false, fallback: [] });
+
+// Validate all stored article records against unified slug and server-generated contentPath policies
+for (const a of allArticles) {
+  try {
+    validateArticleSlug(a?.slug);
+    const expected = `content/articles/${a.slug}.md`;
+    if (a?.contentPath !== expected) {
+      throw new Error(
+        `contentPath "${a?.contentPath}" does not match server-generated path policy: "${expected}"`
+      );
+    }
+  } catch (err) {
+    console.error(`[postbuild] Security validation failed for stored article "${a?.slug || 'unknown'}": ${err.message}`);
+    process.exit(1);
+  }
+}
+
 const articles = allArticles.filter((a) => a.isPublished);
 
 if (articles.length === 0) {
@@ -86,7 +227,7 @@ for (const p of INDEXABLE_STATIC_PATHS) {
 }
 for (const a of articles) sitemapEntries.push({ loc: `/blog/${a.slug}/`, lastmod: dateOf(a) });
 for (const c of categories) {
-  if (!categoryHasContent(c.slug, categories)) continue;
+  if (!categoryHasContent(c.slug, categories, articles)) continue;
   sitemapEntries.push({ loc: `/category/${c.slug}/`, lastmod: newest(articles.filter((a) => a.category === c.slug)) });
 }
 let sm = `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n`;
@@ -587,21 +728,7 @@ const toolsContent = `
     ${categories.map(c => `<a href="/category/${c.slug}/" class="px-3 py-1 rounded-full text-xs font-medium bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 text-slate-700 dark:text-slate-300">${esc(c.name)}</a>`).join('')}
   </div>
   <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-5">
-    ${tools.map(t => `
-    <div class="p-6 rounded-2xl bg-white dark:bg-slate-900/70 border border-slate-200 dark:border-slate-800 text-center flex flex-col justify-between">
-      <div>
-        <div class="w-12 h-12 mx-auto mb-3 rounded-xl overflow-hidden bg-slate-50 dark:bg-slate-800/80 p-1 border border-slate-200/60 dark:border-slate-700/60 flex items-center justify-center">
-          <img src="${esc(t.icon)}" alt="${esc(t.name)} Logo" class="w-full h-full object-contain" />
-        </div>
-        <div class="text-xs text-amber-500 font-semibold mb-1">&#9733; ${t.rating || 4.8} &bull; ${esc(t.pricing)}</div>
-        <h2 class="text-lg font-bold text-slate-900 dark:text-white mb-2">${esc(t.name)}</h2>
-        <p class="text-xs sm:text-sm text-slate-600 dark:text-slate-400 line-clamp-2 leading-relaxed mb-4">${esc(t.description)}</p>
-        <div class="flex flex-wrap items-center justify-center gap-1.5 mb-6">
-          ${(t.tags || []).map(tag => `<span class="px-2.5 py-0.5 rounded-full text-[11px] bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300">${esc(tag)}</span>`).join('')}
-        </div>
-      </div>
-      <a href="${esc(t.url)}" target="_blank" rel="nofollow noopener noreferrer" class="w-full py-2.5 px-4 rounded-xl text-xs font-semibold text-white bg-slate-900 hover:bg-blue-600 dark:bg-slate-800 transition-colors inline-block">Visit Tool &rarr;</a>
-    </div>`).join('')}
+    ${tools.map(renderToolDirectoryCard).join('')}
   </div>
 </div>`;
 
@@ -710,9 +837,11 @@ writePage('categories/index.html', categoriesPageHtml);
 // 5. Individual Article Pages (/blog/[slug]/)
 // ----------------------------------------------------------------------------
 for (const a of articles) {
-  const mdFile = path.resolve(root, a.contentPath || `content/articles/${a.slug}.md`);
-  if (!fs.existsSync(mdFile)) {
-    console.error(`[postbuild] Missing markdown file for published article "${a.slug}": ${mdFile}`);
+  let mdFile;
+  try {
+    mdFile = resolveArticleMarkdownPath(a);
+  } catch (err) {
+    console.error(`[postbuild] Security validation failed for article "${a?.slug || 'unknown'}": ${err.message}`);
     process.exit(1);
   }
   const mdRaw = fs.readFileSync(mdFile, 'utf-8');
@@ -1426,4 +1555,13 @@ if (offending.length > 0) {
 }
 
 console.log('[postbuild] URL consistency check passed');
+}
+
+const isDirectExecution =
+  Boolean(process.argv[1]) &&
+  fs.realpathSync(path.resolve(process.argv[1])) === fs.realpathSync(fileURLToPath(import.meta.url));
+
+if (isDirectExecution) {
+  runPostbuild();
+}
 

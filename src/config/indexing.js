@@ -9,6 +9,10 @@ export const INDEXABLE_STATIC_PATHS = new Set([
   '/blog',
   '/tools',
   '/categories',
+  '/about',
+  '/contact',
+  '/editorial-policy',
+  '/author/md-shamim',
 ]);
 
 /** Remove ?query, #hash and trailing slashes. "/" stays "/". */
@@ -17,14 +21,19 @@ export function normalizePath(p) {
   return clean === '' ? '/' : clean;
 }
 
-/** Whether a category route exists on the site. */
-export function categoryHasContent(slug, categories) {
-  return categories.some((c) => c.slug === slug);
+/** Whether a category route exists on the site and has at least one published article. */
+export function categoryHasContent(slug, categories = [], articles = []) {
+  const categoryExists = categories.some((c) => c.slug === slug);
+  if (!categoryExists) return false;
+
+  return articles.some(
+    (a) => a.category === slug && a.isPublished !== false
+  );
 }
 
 /**
  * Should this URL be `index, follow` (true) or `noindex, follow` (false)?
- * About, contact, author, editorial-policy, unknown URLs and 404 are intentionally noindex.
+ * Legal pages (privacy, terms, affiliate), unknown URLs and 404 are intentionally noindex.
  */
 export function isIndexable(path, { articles = [], categories = [] } = {}) {
   const p = normalizePath(path);
@@ -35,7 +44,7 @@ export function isIndexable(path, { articles = [], categories = [] } = {}) {
   }
   if (p.startsWith('/category/')) {
     const slug = p.slice('/category/'.length);
-    return categoryHasContent(slug, categories);
+    return categoryHasContent(slug, categories, articles);
   }
   return false;
 }
