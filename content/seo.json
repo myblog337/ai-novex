@@ -1,0 +1,243 @@
+{
+  "version": 1,
+  "updatedAt": "2026-11-21T00:00:00.000Z",
+  "defaults": {
+    "siteName": "AINOVEX",
+    "titleTemplate": "%s | AINOVEX",
+    "defaultSeoTitle": "AINOVEX - Discover the Best AI Tools & Resources",
+    "defaultMetaDescription": "Discover the best AI tools, software reviews, and guides on AINOVEX. Boost productivity and work smarter with curated artificial intelligence.",
+    "defaultFocusKeyword": "AI tools",
+    "defaultSecondaryKeywords": [
+      "artificial intelligence software",
+      "AI guides",
+      "productivity tools"
+    ],
+    "defaultIndex": true,
+    "defaultFollow": true,
+    "defaultMaxImagePreview": "large",
+    "defaultMaxSnippet": -1,
+    "defaultMaxVideoPreview": -1,
+    "defaultOgImage": "/images/og-default.png",
+    "defaultOgType": "website",
+    "defaultTwitterCard": "summary_large_image",
+    "defaultSchemaType": "WebPage",
+    "defaultBreadcrumbEnabled": true,
+    "defaultImageAlt": "AINOVEX AI tools directory and editorial guides",
+    "updatedAt": "2026-11-21T00:00:00.000Z"
+  },
+  "pages": {
+    "home": {
+      "pageId": "home",
+      "pageType": "home",
+      "path": "/",
+      "slug": "home",
+      "seoTitle": "AINOVEX - AI Tools & Technology Platform",
+      "metaDescription": "Discover the best AI tools, software reviews, and guides on AINOVEX. Boost productivity and work smarter with curated artificial intelligence.",
+      "focusKeyword": "AI tools platform",
+      "secondaryKeywords": [
+        "AI tools directory",
+        "AI software reviews",
+        "AI tutorials"
+      ],
+      "index": true,
+      "follow": true,
+      "ogType": "website",
+      "twitterCard": "summary_large_image",
+      "schemaType": "WebSite",
+      "breadcrumb": {
+        "enabled": false,
+        "label": "Home"
+      },
+      "createdAt": "2026-11-21T00:00:00.000Z",
+      "updatedAt": "2026-11-21T00:00:00.000Z"
+    },
+    "static:tools": {
+      "pageId": "static:tools",
+      "pageType": "static",
+      "path": "/tools/",
+      "slug": "tools",
+      "seoTitle": "Best AI Tools Directory & Software Reviews 2026 | AINOVEX",
+      "metaDescription": "Browse and compare the top artificial intelligence tools for writing, image creation, video, coding, and productivity. Find the best software for your needs.",
+      "focusKeyword": "best AI tools directory",
+      "secondaryKeywords": [
+        "AI software reviews",
+        "AI comparison"
+      ],
+      "index": true,
+      "follow": true,
+      "ogType": "website",
+      "twitterCard": "summary_large_image",
+      "schemaType": "CollectionPage",
+      "breadcrumb": {
+        "enabled": true,
+        "label": "AI Tools Directory"
+      },
+      "createdAt": "2026-11-21T00:00:00.000Z",
+      "updatedAt": "2026-11-21T00:00:00.000Z"
+    },
+    "static:blog": {
+      "pageId": "static:blog",
+      "pageType": "static",
+      "path": "/blog/",
+      "slug": "blog",
+      "seoTitle": "AI Insights, Tutorials & Technology Guides | AINOVEX",
+      "metaDescription": "Explore actionable AI tutorials, practical workflows, tool comparisons, and tech guides from the AINOVEX editorial team. Master modern AI applications today.",
+      "focusKeyword": "AI tutorials and guides",
+      "secondaryKeywords": [
+        "AI workflows",
+        "AI tool comparisons"
+      ],
+      "index": true,
+      "follow": true,
+      "ogType": "website",
+      "twitterCard": "summary_large_image",
+      "schemaType": "CollectionPage",
+      "breadcrumb": {
+        "enabled": true,
+        "label": "Blog"
+      },
+      "createdAt": "2026-11-21T00:00:00.000Z",
+      "updatedAt": "2026-11-21T00:00:00.000Z"
+    },
+    "static:categories": {
+      "pageId": "static:categories",
+      "pageType": "static",
+      "path": "/categories/",
+      "slug": "categories",
+      "seoTitle": "Browse AI Categories & Topics | AINOVEX",
+      "metaDescription": "Explore specialized AI software categories from writing and image generation to coding and productivity. Find the right tools for your specific workflow.",
+      "focusKeyword": "AI software categories",
+      "secondaryKeywords": [
+        "AI topics",
+        "curated AI workflows"
+      ],
+      "index": true,
+      "follow": true,
+      "ogType": "website",
+      "twitterCard": "summary_large_image",
+      "schemaType": "CollectionPage",
+      "breadcrumb": {
+        "enabled": true,
+        "label": "Categories"
+      },
+      "createdAt": "2026-11-21T00:00:00.000Z",
+      "updatedAt": "2026-11-21T00:00:00.000Z"
+    },
+    "about": {
+      "pageId": "about",
+      "pageType": "about",
+      "path": "/about/",
+      "slug": "about",
+      "seoTitle": "About Us & Editorial Standards | AINOVEX",
+      "metaDescription": "Learn about AINOVEX, our mission to simplify artificial intelligence, our testing standards, and our independent editorial review methodology.",
+      "focusKeyword": "about AINOVEX",
+      "index": true,
+      "follow": true,
+      "ogType": "website",
+      "twitterCard": "summary_large_image",
+      "schemaType": "AboutPage",
+      "breadcrumb": {
+        "enabled": true,
+        "label": "About"
+      },
+      "createdAt": "2026-11-21T00:00:00.000Z",
+      "updatedAt": "2026-11-21T00:00:00.000Z"
+    },
+    "contact": {
+      "pageId": "contact",
+      "pageType": "contact",
+      "path": "/contact/",
+      "slug": "contact",
+      "seoTitle": "Contact AINOVEX | Editorial & Support Team",
+      "metaDescription": "Contact the AINOVEX editorial team for software recommendations, directory submissions, editorial corrections, or partnership inquiries.",
+      "focusKeyword": "contact AINOVEX",
+      "index": true,
+      "follow": true,
+      "ogType": "website",
+      "twitterCard": "summary_large_image",
+      "schemaType": "ContactPage",
+      "breadcrumb": {
+        "enabled": true,
+        "label": "Contact"
+      },
+      "createdAt": "2026-11-21T00:00:00.000Z",
+      "updatedAt": "2026-11-21T00:00:00.000Z"
+    },
+    "privacy": {
+      "pageId": "privacy",
+      "pageType": "privacy",
+      "path": "/privacy/",
+      "slug": "privacy",
+      "seoTitle": "Privacy Policy | AINOVEX AI Platform",
+      "metaDescription": "Read the official AINOVEX Privacy Policy. Learn how we safeguard your personal information, handle essential cookies, and maintain data privacy.",
+      "index": false,
+      "follow": true,
+      "ogType": "website",
+      "twitterCard": "summary_large_image",
+      "schemaType": "WebPage",
+      "breadcrumb": {
+        "enabled": true,
+        "label": "Privacy Policy"
+      },
+      "createdAt": "2026-11-21T00:00:00.000Z",
+      "updatedAt": "2026-11-21T00:00:00.000Z"
+    },
+    "terms": {
+      "pageId": "terms",
+      "pageType": "terms",
+      "path": "/terms/",
+      "slug": "terms",
+      "seoTitle": "Terms of Service | AINOVEX Platform",
+      "metaDescription": "Review the AINOVEX Terms of Service. Understand the rules, guidelines, disclaimers, and legal agreements governing the use of our website.",
+      "index": false,
+      "follow": true,
+      "ogType": "website",
+      "twitterCard": "summary_large_image",
+      "schemaType": "WebPage",
+      "breadcrumb": {
+        "enabled": true,
+        "label": "Terms of Service"
+      },
+      "createdAt": "2026-11-21T00:00:00.000Z",
+      "updatedAt": "2026-11-21T00:00:00.000Z"
+    },
+    "static:editorial-policy": {
+      "pageId": "static:editorial-policy",
+      "pageType": "static",
+      "path": "/editorial-policy/",
+      "slug": "editorial-policy",
+      "seoTitle": "Editorial Policy & Review Standards | AINOVEX",
+      "metaDescription": "Explore AINOVEX editorial policy, review guidelines, testing benchmarks, and independence standards for recommending artificial intelligence tools.",
+      "index": true,
+      "follow": true,
+      "ogType": "website",
+      "twitterCard": "summary_large_image",
+      "schemaType": "WebPage",
+      "breadcrumb": {
+        "enabled": true,
+        "label": "Editorial Policy"
+      },
+      "createdAt": "2026-11-21T00:00:00.000Z",
+      "updatedAt": "2026-11-21T00:00:00.000Z"
+    },
+    "static:affiliate-disclosure": {
+      "pageId": "static:affiliate-disclosure",
+      "pageType": "static",
+      "path": "/affiliate-disclosure/",
+      "slug": "affiliate-disclosure",
+      "seoTitle": "Affiliate & Monetization Disclosure | AINOVEX",
+      "metaDescription": "Read the AINOVEX affiliate and advertising disclosure. Learn how our site remains free for readers through transparent monetization and integrity.",
+      "index": false,
+      "follow": true,
+      "ogType": "website",
+      "twitterCard": "summary_large_image",
+      "schemaType": "WebPage",
+      "breadcrumb": {
+        "enabled": true,
+        "label": "Affiliate Disclosure"
+      },
+      "createdAt": "2026-11-21T00:00:00.000Z",
+      "updatedAt": "2026-11-21T00:00:00.000Z"
+    }
+  }
+}

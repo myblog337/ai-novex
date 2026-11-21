@@ -419,7 +419,7 @@ export function isValidEmail(emailStr) {
 }
 
 const ALLOWED_CONTENT_FILES = Object.freeze(
-  new Set(['articles.json', 'tools.json', 'categories.json', 'settings.json', 'ads.json'])
+  new Set(['articles.json', 'tools.json', 'categories.json', 'settings.json', 'ads.json', 'seo.json'])
 );
 
 /**
@@ -1809,7 +1809,1665 @@ export function validateAds(ads) {
 }
 
 // ----------------------------------------------------------------------------
-// 6. Validator Self-Test Runner (--test)
+// 6. Global & Page-Level SEO Validation (Task 113)
+// ----------------------------------------------------------------------------
+
+export const ALLOWED_SEO_PAGE_TYPES = Object.freeze([
+  'home',
+  'article',
+  'category',
+  'tool',
+  'author',
+  'about',
+  'contact',
+  'privacy',
+  'terms',
+  'static',
+]);
+
+export const ALLOWED_SEO_SCHEMA_TYPES = Object.freeze([
+  'WebPage',
+  'WebSite',
+  'Article',
+  'BlogPosting',
+  'NewsArticle',
+  'CollectionPage',
+  'ItemList',
+  'ProfilePage',
+  'AboutPage',
+  'ContactPage',
+  'FAQPage',
+  'SoftwareApplication',
+  'Product',
+  'Review',
+  'Custom',
+]);
+
+export const ALLOWED_SEO_OG_TYPES = Object.freeze([
+  'website',
+  'article',
+  'profile',
+]);
+
+export const ALLOWED_SEO_TWITTER_CARDS = Object.freeze([
+  'summary',
+  'summary_large_image',
+]);
+
+export const ALLOWED_SEO_MAX_IMAGE_PREVIEW = Object.freeze([
+  'none',
+  'standard',
+  'large',
+]);
+
+export const MAX_SEO_PAGES = 5000;
+export const MAX_SEO_SECONDARY_KEYWORDS = 25;
+export const MAX_SEO_BREADCRUMB_ITEMS = 10;
+export const MAX_SEO_CUSTOM_IMAGE_ALTS = 20;
+export const MAX_SEO_STRUCTURED_DATA_DEPTH = 6;
+export const MAX_SEO_STRUCTURED_DATA_BYTES = 16384;
+
+const SEO_PROTO_POLLUTION_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+const SEO_SINGLE_LINE_CONTROL_REGEX = /[\u0000-\u001F\u007F-\u009F]/;
+const SEO_DANGEROUS_MARKUP_REGEX = /<\/script|<!--|-->/i;
+const SEO_DANGEROUS_SCHEME_REGEX = /^\s*(?:javascript|data|vbscript):/i;
+const SEO_PAGE_ID_REGEX = /^[a-z0-9][a-z0-9:_-]{0,127}$/;
+const SEO_PAGE_SLUG_REGEX = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+const SEO_PAGE_PATH_REGEX =
+  /^\/(?:[a-z0-9](?:[a-z0-9_-]*[a-z0-9])?(?:\/[a-z0-9](?:[a-z0-9_-]*[a-z0-9])?)*\/?)?$/;
+const SEO_SCHEMA_TYPE_VALUE_REGEX = /^[A-Za-z][A-Za-z0-9_:-]{0,63}$/;
+const SEO_IMAGE_KEY_REGEX = /^[a-zA-Z0-9][a-zA-Z0-9._:/-]{0,127}$/;
+
+export const ALLOWED_SEO_DEFAULTS_FIELDS = Object.freeze([
+  'siteName',
+  'titleTemplate',
+  'defaultSeoTitle',
+  'defaultMetaDescription',
+  'defaultFocusKeyword',
+  'defaultSecondaryKeywords',
+  'defaultIndex',
+  'defaultFollow',
+  'defaultMaxImagePreview',
+  'defaultMaxSnippet',
+  'defaultMaxVideoPreview',
+  'defaultOgTitle',
+  'defaultOgDescription',
+  'defaultOgImage',
+  'defaultOgType',
+  'defaultTwitterTitle',
+  'defaultTwitterDescription',
+  'defaultTwitterImage',
+  'defaultTwitterCard',
+  'defaultTwitterSite',
+  'defaultSchemaType',
+  'defaultBreadcrumbEnabled',
+  'defaultImageAlt',
+  'updatedAt',
+]);
+
+export const ALLOWED_SEO_PAGE_FIELDS = Object.freeze([
+  'pageId',
+  'pageType',
+  'path',
+  'slug',
+  'seoTitle',
+  'metaDescription',
+  'focusKeyword',
+  'secondaryKeywords',
+  'canonicalUrl',
+  'index',
+  'follow',
+  'maxImagePreview',
+  'maxSnippet',
+  'maxVideoPreview',
+  'ogTitle',
+  'ogDescription',
+  'ogImage',
+  'ogType',
+  'twitterTitle',
+  'twitterDescription',
+  'twitterImage',
+  'twitterCard',
+  'schemaType',
+  'customStructuredData',
+  'breadcrumb',
+  'imageAlt',
+  'ogImageAlt',
+  'twitterImageAlt',
+  'customImageAlts',
+  'createdAt',
+  'updatedAt',
+]);
+
+const ALLOWED_SEO_DEFAULTS_SET = new Set(ALLOWED_SEO_DEFAULTS_FIELDS);
+const ALLOWED_SEO_PAGE_SET = new Set(ALLOWED_SEO_PAGE_FIELDS);
+const ALLOWED_SEO_BREADCRUMB_SET = new Set(['enabled', 'label', 'items']);
+const ALLOWED_SEO_BREADCRUMB_ITEM_SET = new Set(['name', 'path']);
+
+function isStrictPlainObject(val) {
+  if (!val || typeof val !== 'object' || Array.isArray(val)) return false;
+  const proto = Object.getPrototypeOf(val);
+  return proto === Object.prototype || proto === null;
+}
+
+function findSeoProtoPollutionKey(root, maxDepth = 10) {
+  const stack = [{ node: root, depth: 0 }];
+  const seen = new WeakSet();
+  while (stack.length > 0) {
+    const { node, depth } = stack.pop();
+    if (node === null || typeof node !== 'object') continue;
+    if (depth > maxDepth) {
+      return { ok: false, reason: 'excessive_depth', key: null };
+    }
+    if (seen.has(node)) continue;
+    seen.add(node);
+
+    if (Array.isArray(node)) {
+      for (const item of node) {
+        if (item !== null && typeof item === 'object') {
+          if (depth + 1 > maxDepth) {
+            return { ok: false, reason: 'excessive_depth', key: null };
+          }
+          stack.push({ node: item, depth: depth + 1 });
+        }
+      }
+      continue;
+    }
+
+    for (const key of Object.getOwnPropertyNames(node)) {
+      if (SEO_PROTO_POLLUTION_KEYS.has(key)) {
+        return { ok: false, reason: 'prototype_pollution', key };
+      }
+      const val = node[key];
+      if (val !== null && typeof val === 'object') {
+        if (depth + 1 > maxDepth) {
+          return { ok: false, reason: 'excessive_depth', key: null };
+        }
+        stack.push({ node: val, depth: depth + 1 });
+      }
+    }
+  }
+  return { ok: true, reason: null, key: null };
+}
+
+/**
+ * Validates a stable SEO page ID (1-128 chars, lowercase alphanumeric, :, _, -).
+ */
+export function isValidSeoPageId(pageId) {
+  if (typeof pageId !== 'string') return false;
+  if (SEO_PROTO_POLLUTION_KEYS.has(pageId)) return false;
+  return SEO_PAGE_ID_REGEX.test(pageId);
+}
+
+/**
+ * Validates a page slug based on pageType.
+ * Homepage allows '' or 'home'; all other page types require 1-120 char lowercase slug.
+ */
+export function isValidSeoPageSlug(slug, pageType = 'static') {
+  if (typeof slug !== 'string') return false;
+  if (pageType === 'home') {
+    return slug === '' || slug === 'home';
+  }
+  if (slug.length < 1 || slug.length > 120) return false;
+  return SEO_PAGE_SLUG_REGEX.test(slug);
+}
+
+/**
+ * Validates a clean internal website route path (e.g. "/", "/about/", "/blog/my-post/", "/future/page").
+ * Rejects traversal, protocol-relative URLs, query/hash, percent encoding, backslashes, whitespace, and uppercase.
+ */
+export function isValidSeoPagePath(rawPath) {
+  if (typeof rawPath !== 'string' || rawPath.length < 1 || rawPath.length > 256) {
+    return false;
+  }
+  if (SEO_SINGLE_LINE_CONTROL_REGEX.test(rawPath) || /\s/.test(rawPath)) {
+    return false;
+  }
+  if (
+    rawPath.includes('\\') ||
+    rawPath.includes('..') ||
+    rawPath.includes('//') ||
+    rawPath.includes('?') ||
+    rawPath.includes('#') ||
+    rawPath.includes('%')
+  ) {
+    return false;
+  }
+  return SEO_PAGE_PATH_REGEX.test(rawPath);
+}
+
+/**
+ * Normalizes a valid SEO page path to canonical trailing-slash form ("/" stays "/").
+ * Returns null if rawPath fails strict path validation.
+ */
+export function normalizeSeoPagePath(rawPath) {
+  if (!isValidSeoPagePath(rawPath)) return null;
+  if (rawPath === '/') return '/';
+  return rawPath.endsWith('/') ? rawPath : `${rawPath}/`;
+}
+
+/**
+ * Validates an ISO 8601 UTC timestamp string (YYYY-MM-DDTHH:mm:ss(.sss)?Z).
+ */
+export function isValidIsoTimestamp(ts) {
+  if (typeof ts !== 'string') return false;
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/.test(ts)) {
+    return false;
+  }
+  const parsedMs = Date.parse(ts);
+  if (!Number.isFinite(parsedMs)) return false;
+  const roundTrip = new Date(parsedMs).toISOString();
+  if (ts.includes('.')) {
+    return roundTrip === ts;
+  }
+  return roundTrip.slice(0, 19) + 'Z' === ts;
+}
+
+/**
+ * Iteratively validates custom structured-data JSON-LD configuration objects
+ * for depth, size, prototype pollution, control characters, script breakouts, and dangerous URI schemes.
+ */
+export function inspectSeoStructuredDataSafety(
+  value,
+  maxDepth = MAX_SEO_STRUCTURED_DATA_DEPTH,
+  maxBytes = MAX_SEO_STRUCTURED_DATA_BYTES
+) {
+  if (!isStrictPlainObject(value)) {
+    return { ok: false, error: 'customStructuredData must be a plain JSON object or null' };
+  }
+
+  let serialized;
+  try {
+    serialized = JSON.stringify(value);
+  } catch {
+    return { ok: false, error: 'customStructuredData must be JSON-serializable' };
+  }
+
+  if (typeof serialized !== 'string' || Buffer.byteLength(serialized, 'utf8') > maxBytes) {
+    return {
+      ok: false,
+      error: `customStructuredData cannot exceed ${maxBytes} bytes`,
+    };
+  }
+
+  const stack = [{ node: value, depth: 0 }];
+  const seen = new WeakSet();
+
+  while (stack.length > 0) {
+    const { node, depth } = stack.pop();
+    if (depth > maxDepth) {
+      return {
+        ok: false,
+        error: `customStructuredData exceeds maximum nesting depth of ${maxDepth}`,
+      };
+    }
+
+    if (typeof node === 'string') {
+      if (/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/.test(node)) {
+        return {
+          ok: false,
+          error: 'customStructuredData contains disallowed control characters',
+        };
+      }
+      if (SEO_DANGEROUS_MARKUP_REGEX.test(node)) {
+        return {
+          ok: false,
+          error: 'customStructuredData cannot contain HTML script breakout or comment sequences',
+        };
+      }
+      if (SEO_DANGEROUS_SCHEME_REGEX.test(node)) {
+        return {
+          ok: false,
+          error: 'customStructuredData cannot contain javascript:, data:, or vbscript: URIs',
+        };
+      }
+      continue;
+    }
+
+    if (node === null || typeof node === 'boolean') {
+      continue;
+    }
+
+    if (typeof node === 'number') {
+      if (!Number.isFinite(node)) {
+        return { ok: false, error: 'customStructuredData cannot contain non-finite numbers' };
+      }
+      continue;
+    }
+
+    if (typeof node !== 'object') {
+      return { ok: false, error: 'customStructuredData contains unsupported value types' };
+    }
+
+    if (seen.has(node)) {
+      return { ok: false, error: 'customStructuredData cannot contain circular references' };
+    }
+    seen.add(node);
+
+    if (Array.isArray(node)) {
+      for (const item of node) {
+        if (item !== null && typeof item === 'object' && depth + 1 > maxDepth) {
+          return {
+            ok: false,
+            error: `customStructuredData exceeds maximum nesting depth of ${maxDepth}`,
+          };
+        }
+        stack.push({ node: item, depth: depth + 1 });
+      }
+      continue;
+    }
+
+    if (!isStrictPlainObject(node)) {
+      return { ok: false, error: 'customStructuredData must contain only plain JSON objects' };
+    }
+
+    for (const key of Object.getOwnPropertyNames(node)) {
+      if (SEO_PROTO_POLLUTION_KEYS.has(key)) {
+        return { ok: false, error: `Forbidden prototype pollution key: "${key}"` };
+      }
+      if (SEO_SINGLE_LINE_CONTROL_REGEX.test(key)) {
+        return { ok: false, error: 'customStructuredData key contains disallowed control characters' };
+      }
+      const val = node[key];
+      if (val !== null && typeof val === 'object' && depth + 1 > maxDepth) {
+        return {
+          ok: false,
+          error: `customStructuredData exceeds maximum nesting depth of ${maxDepth}`,
+        };
+      }
+      stack.push({ node: val, depth: depth + 1 });
+    }
+  }
+
+  if (Object.prototype.hasOwnProperty.call(value, '@context') && value['@context'] !== undefined) {
+    const ctx = value['@context'];
+    if (
+      typeof ctx !== 'string' ||
+      (!['https://schema.org', 'http://schema.org', 'https://schema.org/', 'http://schema.org/'].includes(ctx) &&
+        !isValidHttpUrl(ctx))
+    ) {
+      return {
+        ok: false,
+        error: 'customStructuredData.@context must be https://schema.org or a valid HTTP/HTTPS URL',
+      };
+    }
+  }
+
+  if (Object.prototype.hasOwnProperty.call(value, '@type') && value['@type'] !== undefined) {
+    const t = value['@type'];
+    const validSingleType = (v) => typeof v === 'string' && SEO_SCHEMA_TYPE_VALUE_REGEX.test(v);
+    if (Array.isArray(t)) {
+      if (t.length === 0 || !t.every(validSingleType)) {
+        return {
+          ok: false,
+          error: 'customStructuredData.@type array must contain valid Schema.org type names',
+        };
+      }
+    } else if (!validSingleType(t)) {
+      return {
+        ok: false,
+        error: 'customStructuredData.@type must be a valid Schema.org type name',
+      };
+    }
+  }
+
+  return { ok: true, error: null };
+}
+
+function validateSeoStringField(
+  errors,
+  fieldPath,
+  value,
+  { required = false, nullable = true, minLen = 1, maxLen = 300, allowEmpty = false } = {}
+) {
+  if (value === undefined) {
+    if (required) {
+      pushError(errors, fieldPath, `${fieldPath} is required`, 'REQUIRED');
+    }
+    return;
+  }
+  if (value === null) {
+    if (!nullable || required) {
+      pushError(errors, fieldPath, `${fieldPath} cannot be null`, 'INVALID_TYPE');
+    }
+    return;
+  }
+  if (typeof value !== 'string') {
+    pushError(errors, fieldPath, `${fieldPath} must be a string`, 'INVALID_TYPE');
+    return;
+  }
+  if (SEO_SINGLE_LINE_CONTROL_REGEX.test(value)) {
+    pushError(
+      errors,
+      fieldPath,
+      `${fieldPath} contains disallowed control characters`,
+      'INVALID_CHARACTERS'
+    );
+    return;
+  }
+  const trimmed = value.trim();
+  if (trimmed.length === 0) {
+    if (allowEmpty && value.length === 0 && !required) {
+      return;
+    }
+    pushError(
+      errors,
+      fieldPath,
+      `${fieldPath} cannot be empty or whitespace-only`,
+      required ? 'REQUIRED' : 'INVALID_LENGTH'
+    );
+    return;
+  }
+  if (trimmed.length < minLen || trimmed.length > maxLen) {
+    pushError(
+      errors,
+      fieldPath,
+      `${fieldPath} must be between ${minLen} and ${maxLen} characters`,
+      'INVALID_LENGTH'
+    );
+  }
+}
+
+function validateSeoKeywordsArray(errors, fieldPath, value, { nullable = true } = {}) {
+  if (value === undefined) return;
+  if (value === null) {
+    if (!nullable) {
+      pushError(errors, fieldPath, `${fieldPath} cannot be null`, 'INVALID_TYPE');
+    }
+    return;
+  }
+  if (!Array.isArray(value)) {
+    pushError(errors, fieldPath, `${fieldPath} must be an array of strings`, 'INVALID_TYPE');
+    return;
+  }
+  if (value.length > MAX_SEO_SECONDARY_KEYWORDS) {
+    pushError(
+      errors,
+      fieldPath,
+      `${fieldPath} cannot exceed ${MAX_SEO_SECONDARY_KEYWORDS} keywords`,
+      'LENGTH_EXCEEDED'
+    );
+    return;
+  }
+  const seen = new Set();
+  for (let i = 0; i < value.length; i++) {
+    const kw = value[i];
+    if (typeof kw !== 'string') {
+      pushError(errors, `${fieldPath}[${i}]`, 'Each keyword must be a string', 'INVALID_TYPE');
+      continue;
+    }
+    if (SEO_SINGLE_LINE_CONTROL_REGEX.test(kw)) {
+      pushError(
+        errors,
+        `${fieldPath}[${i}]`,
+        'Keyword contains disallowed control characters',
+        'INVALID_CHARACTERS'
+      );
+      continue;
+    }
+    const trimmed = kw.trim();
+    if (!trimmed || trimmed.length > 100) {
+      pushError(
+        errors,
+        `${fieldPath}[${i}]`,
+        'Each keyword must be between 1 and 100 characters',
+        'INVALID_LENGTH'
+      );
+      continue;
+    }
+    const lower = trimmed.toLowerCase();
+    if (seen.has(lower)) {
+      pushError(
+        errors,
+        `${fieldPath}[${i}]`,
+        `Duplicate keyword "${trimmed}"`,
+        'DUPLICATE_KEYWORD'
+      );
+    } else {
+      seen.add(lower);
+    }
+  }
+}
+
+function validateSeoSnippetLimit(errors, fieldPath, value, { nullable = true } = {}) {
+  if (value === undefined) return;
+  if (value === null) {
+    if (!nullable) {
+      pushError(errors, fieldPath, `${fieldPath} cannot be null`, 'INVALID_TYPE');
+    }
+    return;
+  }
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < -1 || value > 1000) {
+    pushError(
+      errors,
+      fieldPath,
+      `${fieldPath} must be an integer between -1 and 1000`,
+      'INVALID_VALUE'
+    );
+  }
+}
+
+/**
+ * Validates the global default SEO settings object (seo.defaults).
+ */
+export function validateSeoDefaults(defaults, options = {}) {
+  const errors = [];
+  const prefix = options.prefix || '';
+  const isCmsInput = Boolean(options.isCmsInput);
+
+  const safety = findSeoProtoPollutionKey(defaults, 6);
+  if (!safety.ok) {
+    pushError(
+      errors,
+      `${prefix}defaults`,
+      safety.reason === 'prototype_pollution'
+        ? `Forbidden prototype pollution key: "${safety.key}"`
+        : 'SEO defaults exceed maximum allowed nesting depth',
+      'INVALID_PAYLOAD'
+    );
+    return createResult(errors);
+  }
+
+  if (!isStrictPlainObject(defaults)) {
+    pushError(errors, `${prefix}defaults`, 'SEO defaults must be a plain JSON object', 'INVALID_TYPE');
+    return createResult(errors);
+  }
+
+  for (const key of Object.getOwnPropertyNames(defaults)) {
+    if (SEO_PROTO_POLLUTION_KEYS.has(key)) {
+      pushError(
+        errors,
+        `${prefix}${key}`,
+        `Forbidden prototype pollution key: "${key}"`,
+        'FORBIDDEN_FIELD'
+      );
+    } else if (!ALLOWED_SEO_DEFAULTS_SET.has(key)) {
+      pushError(errors, `${prefix}${key}`, `Unknown SEO defaults field: "${key}"`, 'UNKNOWN_FIELD');
+    }
+  }
+
+  if (isCmsInput) {
+    if ('updatedAt' in defaults && defaults.updatedAt !== undefined) {
+      pushError(
+        errors,
+        `${prefix}updatedAt`,
+        'updatedAt is server-managed and cannot be provided in CMS input',
+        'FORBIDDEN_FIELD'
+      );
+    }
+  } else {
+    if (typeof defaults.updatedAt !== 'string' || !isValidIsoTimestamp(defaults.updatedAt)) {
+      pushError(
+        errors,
+        `${prefix}updatedAt`,
+        'updatedAt must be a valid UTC ISO 8601 timestamp',
+        'INVALID_TIMESTAMP'
+      );
+    }
+  }
+
+  validateSeoStringField(errors, `${prefix}siteName`, defaults.siteName, {
+    required: true,
+    nullable: false,
+    minLen: 1,
+    maxLen: 100,
+  });
+
+  validateSeoStringField(errors, `${prefix}titleTemplate`, defaults.titleTemplate, {
+    required: true,
+    nullable: false,
+    minLen: 2,
+    maxLen: 120,
+  });
+  if (typeof defaults.titleTemplate === 'string' && !defaults.titleTemplate.includes('%s')) {
+    pushError(
+      errors,
+      `${prefix}titleTemplate`,
+      'titleTemplate must include "%s" placeholder',
+      'INVALID_FORMAT'
+    );
+  }
+
+  validateSeoStringField(errors, `${prefix}defaultSeoTitle`, defaults.defaultSeoTitle, {
+    required: true,
+    nullable: false,
+    minLen: 3,
+    maxLen: 160,
+  });
+
+  validateSeoStringField(errors, `${prefix}defaultMetaDescription`, defaults.defaultMetaDescription, {
+    required: true,
+    nullable: false,
+    minLen: 10,
+    maxLen: 320,
+  });
+
+  validateSeoStringField(errors, `${prefix}defaultFocusKeyword`, defaults.defaultFocusKeyword, {
+    required: false,
+    nullable: true,
+    minLen: 1,
+    maxLen: 120,
+    allowEmpty: true,
+  });
+
+  validateSeoKeywordsArray(
+    errors,
+    `${prefix}defaultSecondaryKeywords`,
+    defaults.defaultSecondaryKeywords,
+    { nullable: true }
+  );
+
+  if (typeof defaults.defaultIndex !== 'boolean') {
+    pushError(errors, `${prefix}defaultIndex`, 'defaultIndex must be a boolean', 'INVALID_TYPE');
+  }
+
+  if (typeof defaults.defaultFollow !== 'boolean') {
+    pushError(errors, `${prefix}defaultFollow`, 'defaultFollow must be a boolean', 'INVALID_TYPE');
+  }
+
+  if (
+    'defaultMaxImagePreview' in defaults &&
+    defaults.defaultMaxImagePreview !== undefined &&
+    defaults.defaultMaxImagePreview !== null
+  ) {
+    if (
+      typeof defaults.defaultMaxImagePreview !== 'string' ||
+      !ALLOWED_SEO_MAX_IMAGE_PREVIEW.includes(defaults.defaultMaxImagePreview)
+    ) {
+      pushError(
+        errors,
+        `${prefix}defaultMaxImagePreview`,
+        `defaultMaxImagePreview must be one of: ${ALLOWED_SEO_MAX_IMAGE_PREVIEW.join(', ')}`,
+        'INVALID_VALUE'
+      );
+    }
+  }
+
+  validateSeoSnippetLimit(errors, `${prefix}defaultMaxSnippet`, defaults.defaultMaxSnippet);
+  validateSeoSnippetLimit(
+    errors,
+    `${prefix}defaultMaxVideoPreview`,
+    defaults.defaultMaxVideoPreview
+  );
+
+  validateSeoStringField(errors, `${prefix}defaultOgTitle`, defaults.defaultOgTitle, {
+    required: false,
+    nullable: true,
+    minLen: 1,
+    maxLen: 160,
+  });
+
+  validateSeoStringField(errors, `${prefix}defaultOgDescription`, defaults.defaultOgDescription, {
+    required: false,
+    nullable: true,
+    minLen: 1,
+    maxLen: 320,
+  });
+
+  if (typeof defaults.defaultOgImage !== 'string' || !defaults.defaultOgImage.trim()) {
+    pushError(errors, `${prefix}defaultOgImage`, 'defaultOgImage is required', 'REQUIRED');
+  } else if (
+    SEO_SINGLE_LINE_CONTROL_REGEX.test(defaults.defaultOgImage) ||
+    !isValidAssetPathOrUrl(defaults.defaultOgImage)
+  ) {
+    pushError(
+      errors,
+      `${prefix}defaultOgImage`,
+      'defaultOgImage must be a valid path starting with "/" or an absolute HTTP/HTTPS URL',
+      'INVALID_URL'
+    );
+  }
+
+  if (
+    'defaultOgType' in defaults &&
+    defaults.defaultOgType !== undefined &&
+    defaults.defaultOgType !== null
+  ) {
+    if (
+      typeof defaults.defaultOgType !== 'string' ||
+      !ALLOWED_SEO_OG_TYPES.includes(defaults.defaultOgType)
+    ) {
+      pushError(
+        errors,
+        `${prefix}defaultOgType`,
+        `defaultOgType must be one of: ${ALLOWED_SEO_OG_TYPES.join(', ')}`,
+        'INVALID_VALUE'
+      );
+    }
+  }
+
+  validateSeoStringField(errors, `${prefix}defaultTwitterTitle`, defaults.defaultTwitterTitle, {
+    required: false,
+    nullable: true,
+    minLen: 1,
+    maxLen: 160,
+  });
+
+  validateSeoStringField(
+    errors,
+    `${prefix}defaultTwitterDescription`,
+    defaults.defaultTwitterDescription,
+    {
+      required: false,
+      nullable: true,
+      minLen: 1,
+      maxLen: 320,
+    }
+  );
+
+  if (
+    'defaultTwitterImage' in defaults &&
+    defaults.defaultTwitterImage !== undefined &&
+    defaults.defaultTwitterImage !== null &&
+    defaults.defaultTwitterImage !== ''
+  ) {
+    if (
+      typeof defaults.defaultTwitterImage !== 'string' ||
+      SEO_SINGLE_LINE_CONTROL_REGEX.test(defaults.defaultTwitterImage) ||
+      !isValidAssetPathOrUrl(defaults.defaultTwitterImage)
+    ) {
+      pushError(
+        errors,
+        `${prefix}defaultTwitterImage`,
+        'defaultTwitterImage must be a valid path starting with "/" or an absolute HTTP/HTTPS URL',
+        'INVALID_URL'
+      );
+    }
+  }
+
+  if (
+    'defaultTwitterCard' in defaults &&
+    defaults.defaultTwitterCard !== undefined &&
+    defaults.defaultTwitterCard !== null
+  ) {
+    if (
+      typeof defaults.defaultTwitterCard !== 'string' ||
+      !ALLOWED_SEO_TWITTER_CARDS.includes(defaults.defaultTwitterCard)
+    ) {
+      pushError(
+        errors,
+        `${prefix}defaultTwitterCard`,
+        `defaultTwitterCard must be one of: ${ALLOWED_SEO_TWITTER_CARDS.join(', ')}`,
+        'INVALID_VALUE'
+      );
+    }
+  }
+
+  if (
+    'defaultTwitterSite' in defaults &&
+    defaults.defaultTwitterSite !== undefined &&
+    defaults.defaultTwitterSite !== null &&
+    defaults.defaultTwitterSite !== ''
+  ) {
+    if (
+      typeof defaults.defaultTwitterSite !== 'string' ||
+      SEO_SINGLE_LINE_CONTROL_REGEX.test(defaults.defaultTwitterSite) ||
+      !/^@[a-zA-Z0-9_]{1,30}$/.test(defaults.defaultTwitterSite.trim())
+    ) {
+      pushError(
+        errors,
+        `${prefix}defaultTwitterSite`,
+        'defaultTwitterSite must be a valid Twitter/X handle starting with "@"',
+        'INVALID_FORMAT'
+      );
+    }
+  }
+
+  if (
+    'defaultSchemaType' in defaults &&
+    defaults.defaultSchemaType !== undefined &&
+    defaults.defaultSchemaType !== null
+  ) {
+    if (
+      typeof defaults.defaultSchemaType !== 'string' ||
+      !ALLOWED_SEO_SCHEMA_TYPES.includes(defaults.defaultSchemaType)
+    ) {
+      pushError(
+        errors,
+        `${prefix}defaultSchemaType`,
+        `defaultSchemaType must be one of: ${ALLOWED_SEO_SCHEMA_TYPES.join(', ')}`,
+        'INVALID_VALUE'
+      );
+    }
+  }
+
+  if (typeof defaults.defaultBreadcrumbEnabled !== 'boolean') {
+    pushError(
+      errors,
+      `${prefix}defaultBreadcrumbEnabled`,
+      'defaultBreadcrumbEnabled must be a boolean',
+      'INVALID_TYPE'
+    );
+  }
+
+  validateSeoStringField(errors, `${prefix}defaultImageAlt`, defaults.defaultImageAlt, {
+    required: false,
+    nullable: true,
+    minLen: 1,
+    maxLen: 300,
+    allowEmpty: true,
+  });
+
+  return createResult(errors);
+}
+
+/**
+ * Validates a single page-level SEO record.
+ */
+export function validateSeoPageRecord(page, options = {}) {
+  const errors = [];
+  const prefix = options.prefix || '';
+  const isCmsInput = Boolean(options.isCmsInput);
+
+  const safety = findSeoProtoPollutionKey(page, 10);
+  if (!safety.ok) {
+    pushError(
+      errors,
+      `${prefix}page`,
+      safety.reason === 'prototype_pollution'
+        ? `Forbidden prototype pollution key: "${safety.key}"`
+        : 'Page SEO record exceeds maximum allowed nesting depth',
+      'INVALID_PAYLOAD'
+    );
+    return createResult(errors);
+  }
+
+  if (!isStrictPlainObject(page)) {
+    pushError(errors, `${prefix}page`, 'Page SEO record must be a plain JSON object', 'INVALID_TYPE');
+    return createResult(errors);
+  }
+
+  for (const key of Object.getOwnPropertyNames(page)) {
+    if (SEO_PROTO_POLLUTION_KEYS.has(key)) {
+      pushError(
+        errors,
+        `${prefix}${key}`,
+        `Forbidden prototype pollution key: "${key}"`,
+        'FORBIDDEN_FIELD'
+      );
+    } else if (!ALLOWED_SEO_PAGE_SET.has(key)) {
+      pushError(errors, `${prefix}${key}`, `Unknown page SEO field: "${key}"`, 'UNKNOWN_FIELD');
+    }
+  }
+
+  // pageId
+  if (typeof page.pageId !== 'string' || !page.pageId.trim()) {
+    pushError(errors, `${prefix}pageId`, 'pageId is required', 'REQUIRED');
+  } else if (!isValidSeoPageId(page.pageId)) {
+    pushError(
+      errors,
+      `${prefix}pageId`,
+      'pageId must be 1-128 lowercase alphanumeric characters, colons, underscores, or hyphens starting with alphanumeric',
+      'INVALID_PAGE_ID'
+    );
+  }
+
+  // pageType
+  if (typeof page.pageType !== 'string' || !page.pageType.trim()) {
+    pushError(errors, `${prefix}pageType`, 'pageType is required', 'REQUIRED');
+  } else if (!ALLOWED_SEO_PAGE_TYPES.includes(page.pageType)) {
+    pushError(
+      errors,
+      `${prefix}pageType`,
+      `pageType must be one of: ${ALLOWED_SEO_PAGE_TYPES.join(', ')}`,
+      'INVALID_PAGE_TYPE'
+    );
+  }
+
+  // path
+  if (typeof page.path !== 'string' || !page.path) {
+    pushError(errors, `${prefix}path`, 'path is required', 'REQUIRED');
+  } else if (!isValidSeoPagePath(page.path)) {
+    pushError(
+      errors,
+      `${prefix}path`,
+      'path must be a clean normalized site path starting with "/" (lowercase alphanumeric, hyphens, underscores; no traversal, query, hash, or percent encoding)',
+      'INVALID_PATH'
+    );
+  } else {
+    const normalizedPath = normalizeSeoPagePath(page.path);
+    if (!isCmsInput && page.path !== normalizedPath) {
+      pushError(
+        errors,
+        `${prefix}path`,
+        `Stored path must be in canonical trailing-slash form ("${normalizedPath}")`,
+        'NON_CANONICAL_PATH'
+      );
+    }
+    if (page.pageType === 'home' && normalizedPath !== '/') {
+      pushError(
+        errors,
+        `${prefix}path`,
+        'Homepage (pageType="home") must use path "/"',
+        'PATH_PAGE_TYPE_MISMATCH'
+      );
+    }
+    if (
+      typeof page.pageType === 'string' &&
+      ALLOWED_SEO_PAGE_TYPES.includes(page.pageType) &&
+      page.pageType !== 'home' &&
+      normalizedPath === '/'
+    ) {
+      pushError(
+        errors,
+        `${prefix}path`,
+        `Only pageType="home" may use root path "/" (received pageType="${page.pageType}")`,
+        'PATH_PAGE_TYPE_MISMATCH'
+      );
+    }
+  }
+
+  // slug
+  if (typeof page.slug !== 'string') {
+    pushError(errors, `${prefix}slug`, 'slug must be a string', 'REQUIRED');
+  } else if (!isValidSeoPageSlug(page.slug, page.pageType)) {
+    pushError(
+      errors,
+      `${prefix}slug`,
+      page.pageType === 'home'
+        ? 'Homepage slug must be "" or "home"'
+        : 'slug must be 1-120 lowercase alphanumeric characters with single hyphens',
+      'INVALID_SLUG'
+    );
+  }
+
+  // Timestamps (server-managed)
+  if (isCmsInput) {
+    if ('createdAt' in page && page.createdAt !== undefined) {
+      pushError(
+        errors,
+        `${prefix}createdAt`,
+        'createdAt is server-generated and cannot be provided in CMS input',
+        'FORBIDDEN_FIELD'
+      );
+    }
+    if ('updatedAt' in page && page.updatedAt !== undefined) {
+      pushError(
+        errors,
+        `${prefix}updatedAt`,
+        'updatedAt is server-generated and cannot be provided in CMS input',
+        'FORBIDDEN_FIELD'
+      );
+    }
+  } else {
+    if (typeof page.createdAt !== 'string' || !isValidIsoTimestamp(page.createdAt)) {
+      pushError(
+        errors,
+        `${prefix}createdAt`,
+        'createdAt must be a valid UTC ISO 8601 timestamp',
+        'INVALID_TIMESTAMP'
+      );
+    }
+    if (typeof page.updatedAt !== 'string' || !isValidIsoTimestamp(page.updatedAt)) {
+      pushError(
+        errors,
+        `${prefix}updatedAt`,
+        'updatedAt must be a valid UTC ISO 8601 timestamp',
+        'INVALID_TIMESTAMP'
+      );
+    }
+    if (
+      typeof page.createdAt === 'string' &&
+      typeof page.updatedAt === 'string' &&
+      isValidIsoTimestamp(page.createdAt) &&
+      isValidIsoTimestamp(page.updatedAt) &&
+      Date.parse(page.updatedAt) < Date.parse(page.createdAt)
+    ) {
+      pushError(
+        errors,
+        `${prefix}updatedAt`,
+        'updatedAt cannot be earlier than createdAt',
+        'TIMESTAMP_OUT_OF_ORDER'
+      );
+    }
+  }
+
+  // Optional SEO override fields
+  validateSeoStringField(errors, `${prefix}seoTitle`, page.seoTitle, {
+    required: false,
+    nullable: true,
+    minLen: 3,
+    maxLen: 160,
+  });
+
+  validateSeoStringField(errors, `${prefix}metaDescription`, page.metaDescription, {
+    required: false,
+    nullable: true,
+    minLen: 10,
+    maxLen: 320,
+  });
+
+  validateSeoStringField(errors, `${prefix}focusKeyword`, page.focusKeyword, {
+    required: false,
+    nullable: true,
+    minLen: 1,
+    maxLen: 120,
+  });
+
+  validateSeoKeywordsArray(errors, `${prefix}secondaryKeywords`, page.secondaryKeywords, {
+    nullable: true,
+  });
+
+  if ('canonicalUrl' in page && page.canonicalUrl !== undefined && page.canonicalUrl !== null) {
+    if (typeof page.canonicalUrl !== 'string' || !isValidHttpUrl(page.canonicalUrl)) {
+      pushError(
+        errors,
+        `${prefix}canonicalUrl`,
+        'canonicalUrl must be a valid absolute HTTP or HTTPS URL (or null)',
+        'INVALID_URL'
+      );
+    }
+  }
+
+  if ('index' in page && page.index !== undefined && page.index !== null) {
+    if (typeof page.index !== 'boolean') {
+      pushError(errors, `${prefix}index`, 'index must be a boolean or null', 'INVALID_TYPE');
+    }
+  }
+
+  if ('follow' in page && page.follow !== undefined && page.follow !== null) {
+    if (typeof page.follow !== 'boolean') {
+      pushError(errors, `${prefix}follow`, 'follow must be a boolean or null', 'INVALID_TYPE');
+    }
+  }
+
+  if (
+    'maxImagePreview' in page &&
+    page.maxImagePreview !== undefined &&
+    page.maxImagePreview !== null
+  ) {
+    if (
+      typeof page.maxImagePreview !== 'string' ||
+      !ALLOWED_SEO_MAX_IMAGE_PREVIEW.includes(page.maxImagePreview)
+    ) {
+      pushError(
+        errors,
+        `${prefix}maxImagePreview`,
+        `maxImagePreview must be one of: ${ALLOWED_SEO_MAX_IMAGE_PREVIEW.join(', ')}`,
+        'INVALID_VALUE'
+      );
+    }
+  }
+
+  validateSeoSnippetLimit(errors, `${prefix}maxSnippet`, page.maxSnippet, { nullable: true });
+  validateSeoSnippetLimit(errors, `${prefix}maxVideoPreview`, page.maxVideoPreview, {
+    nullable: true,
+  });
+
+  // Open Graph overrides
+  validateSeoStringField(errors, `${prefix}ogTitle`, page.ogTitle, {
+    required: false,
+    nullable: true,
+    minLen: 1,
+    maxLen: 160,
+  });
+
+  validateSeoStringField(errors, `${prefix}ogDescription`, page.ogDescription, {
+    required: false,
+    nullable: true,
+    minLen: 1,
+    maxLen: 320,
+  });
+
+  if ('ogImage' in page && page.ogImage !== undefined && page.ogImage !== null) {
+    if (
+      typeof page.ogImage !== 'string' ||
+      SEO_SINGLE_LINE_CONTROL_REGEX.test(page.ogImage) ||
+      !isValidAssetPathOrUrl(page.ogImage)
+    ) {
+      pushError(
+        errors,
+        `${prefix}ogImage`,
+        'ogImage must be a valid path starting with "/" or an absolute HTTP/HTTPS URL (or null)',
+        'INVALID_URL'
+      );
+    }
+  }
+
+  if ('ogType' in page && page.ogType !== undefined && page.ogType !== null) {
+    if (typeof page.ogType !== 'string' || !ALLOWED_SEO_OG_TYPES.includes(page.ogType)) {
+      pushError(
+        errors,
+        `${prefix}ogType`,
+        `ogType must be one of: ${ALLOWED_SEO_OG_TYPES.join(', ')}`,
+        'INVALID_VALUE'
+      );
+    }
+  }
+
+  // Twitter overrides
+  validateSeoStringField(errors, `${prefix}twitterTitle`, page.twitterTitle, {
+    required: false,
+    nullable: true,
+    minLen: 1,
+    maxLen: 160,
+  });
+
+  validateSeoStringField(errors, `${prefix}twitterDescription`, page.twitterDescription, {
+    required: false,
+    nullable: true,
+    minLen: 1,
+    maxLen: 320,
+  });
+
+  if ('twitterImage' in page && page.twitterImage !== undefined && page.twitterImage !== null) {
+    if (
+      typeof page.twitterImage !== 'string' ||
+      SEO_SINGLE_LINE_CONTROL_REGEX.test(page.twitterImage) ||
+      !isValidAssetPathOrUrl(page.twitterImage)
+    ) {
+      pushError(
+        errors,
+        `${prefix}twitterImage`,
+        'twitterImage must be a valid path starting with "/" or an absolute HTTP/HTTPS URL (or null)',
+        'INVALID_URL'
+      );
+    }
+  }
+
+  if ('twitterCard' in page && page.twitterCard !== undefined && page.twitterCard !== null) {
+    if (
+      typeof page.twitterCard !== 'string' ||
+      !ALLOWED_SEO_TWITTER_CARDS.includes(page.twitterCard)
+    ) {
+      pushError(
+        errors,
+        `${prefix}twitterCard`,
+        `twitterCard must be one of: ${ALLOWED_SEO_TWITTER_CARDS.join(', ')}`,
+        'INVALID_VALUE'
+      );
+    }
+  }
+
+  // Schema type & custom structured data
+  if ('schemaType' in page && page.schemaType !== undefined && page.schemaType !== null) {
+    if (
+      typeof page.schemaType !== 'string' ||
+      !ALLOWED_SEO_SCHEMA_TYPES.includes(page.schemaType)
+    ) {
+      pushError(
+        errors,
+        `${prefix}schemaType`,
+        `schemaType must be one of: ${ALLOWED_SEO_SCHEMA_TYPES.join(', ')}`,
+        'INVALID_VALUE'
+      );
+    }
+  }
+
+  if (
+    'customStructuredData' in page &&
+    page.customStructuredData !== undefined &&
+    page.customStructuredData !== null
+  ) {
+    const sdCheck = inspectSeoStructuredDataSafety(page.customStructuredData);
+    if (!sdCheck.ok) {
+      pushError(
+        errors,
+        `${prefix}customStructuredData`,
+        sdCheck.error || 'Invalid customStructuredData',
+        'INVALID_STRUCTURED_DATA'
+      );
+    }
+  }
+
+  // Breadcrumb configuration
+  if ('breadcrumb' in page && page.breadcrumb !== undefined && page.breadcrumb !== null) {
+    if (!isStrictPlainObject(page.breadcrumb)) {
+      pushError(
+        errors,
+        `${prefix}breadcrumb`,
+        'breadcrumb must be a plain JSON object or null',
+        'INVALID_TYPE'
+      );
+    } else {
+      for (const bKey of Object.getOwnPropertyNames(page.breadcrumb)) {
+        if (SEO_PROTO_POLLUTION_KEYS.has(bKey)) {
+          pushError(
+            errors,
+            `${prefix}breadcrumb.${bKey}`,
+            `Forbidden prototype pollution key: "${bKey}"`,
+            'FORBIDDEN_FIELD'
+          );
+        } else if (!ALLOWED_SEO_BREADCRUMB_SET.has(bKey)) {
+          pushError(
+            errors,
+            `${prefix}breadcrumb.${bKey}`,
+            `Unknown breadcrumb field: "${bKey}"`,
+            'UNKNOWN_FIELD'
+          );
+        }
+      }
+
+      if (
+        'enabled' in page.breadcrumb &&
+        page.breadcrumb.enabled !== undefined &&
+        typeof page.breadcrumb.enabled !== 'boolean'
+      ) {
+        pushError(
+          errors,
+          `${prefix}breadcrumb.enabled`,
+          'breadcrumb.enabled must be a boolean',
+          'INVALID_TYPE'
+        );
+      }
+
+      validateSeoStringField(errors, `${prefix}breadcrumb.label`, page.breadcrumb.label, {
+        required: false,
+        nullable: true,
+        minLen: 1,
+        maxLen: 100,
+      });
+
+      if (
+        'items' in page.breadcrumb &&
+        page.breadcrumb.items !== undefined &&
+        page.breadcrumb.items !== null
+      ) {
+        if (!Array.isArray(page.breadcrumb.items)) {
+          pushError(
+            errors,
+            `${prefix}breadcrumb.items`,
+            'breadcrumb.items must be an array or null',
+            'INVALID_TYPE'
+          );
+        } else if (page.breadcrumb.items.length > MAX_SEO_BREADCRUMB_ITEMS) {
+          pushError(
+            errors,
+            `${prefix}breadcrumb.items`,
+            `breadcrumb.items cannot exceed ${MAX_SEO_BREADCRUMB_ITEMS} items`,
+            'LENGTH_EXCEEDED'
+          );
+        } else {
+          for (let i = 0; i < page.breadcrumb.items.length; i++) {
+            const item = page.breadcrumb.items[i];
+            const itemPrefix = `${prefix}breadcrumb.items[${i}].`;
+            if (!isStrictPlainObject(item)) {
+              pushError(
+                errors,
+                `${prefix}breadcrumb.items[${i}]`,
+                'Each breadcrumb item must be an object',
+                'INVALID_TYPE'
+              );
+              continue;
+            }
+            for (const iKey of Object.getOwnPropertyNames(item)) {
+              if (!ALLOWED_SEO_BREADCRUMB_ITEM_SET.has(iKey)) {
+                pushError(
+                  errors,
+                  `${itemPrefix}${iKey}`,
+                  `Unknown breadcrumb item field: "${iKey}"`,
+                  'UNKNOWN_FIELD'
+                );
+              }
+            }
+            validateSeoStringField(errors, `${itemPrefix}name`, item.name, {
+              required: true,
+              nullable: false,
+              minLen: 1,
+              maxLen: 100,
+            });
+            if (typeof item.path !== 'string' || !isValidSeoPagePath(item.path)) {
+              pushError(
+                errors,
+                `${itemPrefix}path`,
+                'Breadcrumb item path must be a valid site path starting with "/"',
+                'INVALID_PATH'
+              );
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // Image alt-text metadata
+  validateSeoStringField(errors, `${prefix}imageAlt`, page.imageAlt, {
+    required: false,
+    nullable: true,
+    minLen: 1,
+    maxLen: 300,
+  });
+
+  validateSeoStringField(errors, `${prefix}ogImageAlt`, page.ogImageAlt, {
+    required: false,
+    nullable: true,
+    minLen: 1,
+    maxLen: 300,
+  });
+
+  validateSeoStringField(errors, `${prefix}twitterImageAlt`, page.twitterImageAlt, {
+    required: false,
+    nullable: true,
+    minLen: 1,
+    maxLen: 300,
+  });
+
+  if (
+    'customImageAlts' in page &&
+    page.customImageAlts !== undefined &&
+    page.customImageAlts !== null
+  ) {
+    if (!isStrictPlainObject(page.customImageAlts)) {
+      pushError(
+        errors,
+        `${prefix}customImageAlts`,
+        'customImageAlts must be a plain object mapping image keys to alt text strings',
+        'INVALID_TYPE'
+      );
+    } else {
+      const entries = Object.getOwnPropertyNames(page.customImageAlts);
+      if (entries.length > MAX_SEO_CUSTOM_IMAGE_ALTS) {
+        pushError(
+          errors,
+          `${prefix}customImageAlts`,
+          `customImageAlts cannot exceed ${MAX_SEO_CUSTOM_IMAGE_ALTS} entries`,
+          'LENGTH_EXCEEDED'
+        );
+      } else {
+        for (const imgKey of entries) {
+          if (SEO_PROTO_POLLUTION_KEYS.has(imgKey) || !SEO_IMAGE_KEY_REGEX.test(imgKey)) {
+            pushError(
+              errors,
+              `${prefix}customImageAlts.${imgKey}`,
+              `Invalid image key "${imgKey}" in customImageAlts`,
+              'INVALID_KEY'
+            );
+            continue;
+          }
+          validateSeoStringField(
+            errors,
+            `${prefix}customImageAlts.${imgKey}`,
+            page.customImageAlts[imgKey],
+            {
+              required: true,
+              nullable: false,
+              minLen: 1,
+              maxLen: 300,
+            }
+          );
+        }
+      }
+    }
+  }
+
+  return createResult(errors);
+}
+
+/**
+ * Validates the complete content/seo.json store structure.
+ * Enforces unique pageIds (key === record.pageId), unique normalized paths across all pages,
+ * valid global defaults, and valid timestamps.
+ */
+export function validateSeoConfig(seoConfig, options = {}) {
+  const errors = [];
+
+  const safety = findSeoProtoPollutionKey(seoConfig, 12);
+  if (!safety.ok) {
+    pushError(
+      errors,
+      'seo',
+      safety.reason === 'prototype_pollution'
+        ? `Forbidden prototype pollution key: "${safety.key}"`
+        : 'SEO configuration exceeds maximum allowed nesting depth',
+      'INVALID_PAYLOAD'
+    );
+    return createResult(errors);
+  }
+
+  if (!isStrictPlainObject(seoConfig)) {
+    pushError(errors, 'seo', 'SEO configuration must be a plain JSON object', 'INVALID_TYPE');
+    return createResult(errors);
+  }
+
+  const ALLOWED_ROOT_KEYS = new Set(['version', 'updatedAt', 'defaults', 'pages']);
+  for (const key of Object.getOwnPropertyNames(seoConfig)) {
+    if (!ALLOWED_ROOT_KEYS.has(key)) {
+      pushError(errors, key, `Unknown SEO configuration field: "${key}"`, 'UNKNOWN_FIELD');
+    }
+  }
+
+  if (
+    typeof seoConfig.version !== 'number' ||
+    !Number.isSafeInteger(seoConfig.version) ||
+    seoConfig.version < 1
+  ) {
+    pushError(errors, 'version', 'SEO configuration version must be an integer >= 1', 'INVALID_VALUE');
+  }
+
+  if (typeof seoConfig.updatedAt !== 'string' || !isValidIsoTimestamp(seoConfig.updatedAt)) {
+    pushError(
+      errors,
+      'updatedAt',
+      'SEO configuration updatedAt must be a valid UTC ISO 8601 timestamp',
+      'INVALID_TIMESTAMP'
+    );
+  }
+
+  if (!('defaults' in seoConfig) || !isStrictPlainObject(seoConfig.defaults)) {
+    pushError(errors, 'defaults', 'SEO defaults object is required', 'REQUIRED');
+  } else {
+    const defRes = validateSeoDefaults(seoConfig.defaults, {
+      isCmsInput: Boolean(options.isCmsInput),
+      prefix: 'defaults.',
+    });
+    if (!defRes.isValid) {
+      errors.push(...defRes.errors);
+    }
+  }
+
+  if (!('pages' in seoConfig) || !isStrictPlainObject(seoConfig.pages)) {
+    pushError(errors, 'pages', 'SEO pages map must be a plain JSON object', 'REQUIRED');
+  } else {
+    const pageKeys = Object.getOwnPropertyNames(seoConfig.pages);
+    if (pageKeys.length > MAX_SEO_PAGES) {
+      pushError(
+        errors,
+        'pages',
+        `SEO pages map cannot exceed ${MAX_SEO_PAGES} entries`,
+        'LENGTH_EXCEEDED'
+      );
+    } else {
+      const seenPaths = new Map();
+      for (const pageKey of pageKeys) {
+        if (!isValidSeoPageId(pageKey)) {
+          pushError(
+            errors,
+            `pages.${pageKey}`,
+            `Invalid page key "${pageKey}" in SEO pages map`,
+            'INVALID_PAGE_ID'
+          );
+          continue;
+        }
+        const record = seoConfig.pages[pageKey];
+        const pageRes = validateSeoPageRecord(record, {
+          isCmsInput: false,
+          prefix: `pages.${pageKey}.`,
+        });
+        if (!pageRes.isValid) {
+          errors.push(...pageRes.errors);
+        }
+        if (isStrictPlainObject(record)) {
+          if (record.pageId !== pageKey) {
+            pushError(
+              errors,
+              `pages.${pageKey}.pageId`,
+              `Page key "${pageKey}" must match record.pageId ("${record.pageId}")`,
+              'PAGE_ID_MISMATCH'
+            );
+          }
+          const normPath = normalizeSeoPagePath(record.path);
+          if (normPath) {
+            if (seenPaths.has(normPath)) {
+              pushError(
+                errors,
+                `pages.${pageKey}.path`,
+                `Duplicate SEO page path "${normPath}" (already assigned to pageId "${seenPaths.get(normPath)}")`,
+                'DUPLICATE_PATH'
+              );
+            } else {
+              seenPaths.set(normPath, pageKey);
+            }
+          }
+        }
+      }
+    }
+  }
+
+  return createResult(errors);
+}
+
+/**
+ * Resolves effective SEO metadata by merging global defaults with an optional page-level override record.
+ * Never mutates either input object.
+ */
+export function resolveEffectiveSeo(pageRecord, defaults, fallbackPath = '/') {
+  const safeDefaults = isStrictPlainObject(defaults) ? defaults : {};
+  const safePage = isStrictPlainObject(pageRecord) ? pageRecord : null;
+  const resolvedPath = safePage?.path
+    ? normalizeSeoPagePath(safePage.path) || fallbackPath
+    : normalizeSeoPagePath(fallbackPath) || '/';
+
+  const seoTitle =
+    safePage && typeof safePage.seoTitle === 'string' && safePage.seoTitle.trim()
+      ? safePage.seoTitle
+      : safeDefaults.defaultSeoTitle || '';
+
+  const metaDescription =
+    safePage && typeof safePage.metaDescription === 'string' && safePage.metaDescription.trim()
+      ? safePage.metaDescription
+      : safeDefaults.defaultMetaDescription || '';
+
+  const ogTitle =
+    safePage && typeof safePage.ogTitle === 'string' && safePage.ogTitle.trim()
+      ? safePage.ogTitle
+      : safePage && typeof safePage.seoTitle === 'string' && safePage.seoTitle.trim()
+        ? safePage.seoTitle
+        : safeDefaults.defaultOgTitle || safeDefaults.defaultSeoTitle || '';
+
+  const ogDescription =
+    safePage && typeof safePage.ogDescription === 'string' && safePage.ogDescription.trim()
+      ? safePage.ogDescription
+      : safePage && typeof safePage.metaDescription === 'string' && safePage.metaDescription.trim()
+        ? safePage.metaDescription
+        : safeDefaults.defaultOgDescription || safeDefaults.defaultMetaDescription || '';
+
+  const ogImage =
+    safePage && typeof safePage.ogImage === 'string' && safePage.ogImage.trim()
+      ? safePage.ogImage
+      : safeDefaults.defaultOgImage || '';
+
+  const twitterTitle =
+    safePage && typeof safePage.twitterTitle === 'string' && safePage.twitterTitle.trim()
+      ? safePage.twitterTitle
+      : ogTitle;
+
+  const twitterDescription =
+    safePage && typeof safePage.twitterDescription === 'string' && safePage.twitterDescription.trim()
+      ? safePage.twitterDescription
+      : ogDescription;
+
+  const twitterImage =
+    safePage && typeof safePage.twitterImage === 'string' && safePage.twitterImage.trim()
+      ? safePage.twitterImage
+      : safePage && typeof safePage.ogImage === 'string' && safePage.ogImage.trim()
+        ? safePage.ogImage
+        : safeDefaults.defaultTwitterImage || safeDefaults.defaultOgImage || '';
+
+  const imageAlt =
+    safePage && typeof safePage.imageAlt === 'string' && safePage.imageAlt.trim()
+      ? safePage.imageAlt
+      : safeDefaults.defaultImageAlt || '';
+
+  const ogImageAlt =
+    safePage && typeof safePage.ogImageAlt === 'string' && safePage.ogImageAlt.trim()
+      ? safePage.ogImageAlt
+      : imageAlt;
+
+  const twitterImageAlt =
+    safePage && typeof safePage.twitterImageAlt === 'string' && safePage.twitterImageAlt.trim()
+      ? safePage.twitterImageAlt
+      : imageAlt;
+
+  const breadcrumbEnabled =
+    safePage?.breadcrumb && typeof safePage.breadcrumb.enabled === 'boolean'
+      ? safePage.breadcrumb.enabled
+      : typeof safeDefaults.defaultBreadcrumbEnabled === 'boolean'
+        ? safeDefaults.defaultBreadcrumbEnabled
+        : true;
+
+  return {
+    pageId: safePage?.pageId ?? null,
+    pageType: safePage?.pageType ?? (resolvedPath === '/' ? 'home' : 'static'),
+    path: resolvedPath,
+    slug: safePage?.slug ?? (resolvedPath === '/' ? 'home' : ''),
+    seoTitle,
+    metaDescription,
+    focusKeyword:
+      safePage && typeof safePage.focusKeyword === 'string'
+        ? safePage.focusKeyword
+        : safeDefaults.defaultFocusKeyword || '',
+    secondaryKeywords: Array.isArray(safePage?.secondaryKeywords)
+      ? [...safePage.secondaryKeywords]
+      : Array.isArray(safeDefaults.defaultSecondaryKeywords)
+        ? [...safeDefaults.defaultSecondaryKeywords]
+        : [],
+    canonicalUrl: safePage?.canonicalUrl ?? null,
+    index:
+      safePage && typeof safePage.index === 'boolean'
+        ? safePage.index
+        : Boolean(safeDefaults.defaultIndex ?? true),
+    follow:
+      safePage && typeof safePage.follow === 'boolean'
+        ? safePage.follow
+        : Boolean(safeDefaults.defaultFollow ?? true),
+    maxImagePreview:
+      safePage?.maxImagePreview ?? safeDefaults.defaultMaxImagePreview ?? 'large',
+    maxSnippet:
+      typeof safePage?.maxSnippet === 'number'
+        ? safePage.maxSnippet
+        : typeof safeDefaults.defaultMaxSnippet === 'number'
+          ? safeDefaults.defaultMaxSnippet
+          : -1,
+    maxVideoPreview:
+      typeof safePage?.maxVideoPreview === 'number'
+        ? safePage.maxVideoPreview
+        : typeof safeDefaults.defaultMaxVideoPreview === 'number'
+          ? safeDefaults.defaultMaxVideoPreview
+          : -1,
+    ogTitle,
+    ogDescription,
+    ogImage,
+    ogType: safePage?.ogType ?? safeDefaults.defaultOgType ?? 'website',
+    twitterTitle,
+    twitterDescription,
+    twitterImage,
+    twitterCard:
+      safePage?.twitterCard ?? safeDefaults.defaultTwitterCard ?? 'summary_large_image',
+    twitterSite: safeDefaults.defaultTwitterSite || '',
+    schemaType: safePage?.schemaType ?? safeDefaults.defaultSchemaType ?? 'WebPage',
+    customStructuredData: safePage?.customStructuredData
+      ? JSON.parse(JSON.stringify(safePage.customStructuredData))
+      : null,
+    breadcrumb: {
+      enabled: breadcrumbEnabled,
+      label: safePage?.breadcrumb?.label ?? null,
+      items: Array.isArray(safePage?.breadcrumb?.items)
+        ? safePage.breadcrumb.items.map((item) => ({ name: item.name, path: item.path }))
+        : null,
+    },
+    imageAlt,
+    ogImageAlt,
+    twitterImageAlt,
+    customImageAlts: isStrictPlainObject(safePage?.customImageAlts)
+      ? { ...safePage.customImageAlts }
+      : {},
+    hasPageOverride: Boolean(safePage),
+    updatedAt: safePage?.updatedAt ?? safeDefaults.updatedAt ?? null,
+  };
+}
+
+// ----------------------------------------------------------------------------
+// 7. Validator Self-Test Runner (--test)
 // ----------------------------------------------------------------------------
 
 export function runValidatorTests() {

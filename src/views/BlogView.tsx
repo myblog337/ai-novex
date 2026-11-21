@@ -2,6 +2,7 @@ import React, { useState, useMemo } from 'react';
 import { Search, Calendar, Clock, ArrowRight, BookOpen } from 'lucide-react';
 import { Article, Category } from '../types';
 import { Breadcrumbs } from '../components/Breadcrumbs';
+import { getAuthorDisplayName } from '../utils/authors.js';
 
 interface BlogViewProps {
   articles: Article[];
@@ -150,7 +151,7 @@ export const BlogView: React.FC<BlogViewProps> = ({
 
               <div className="px-5 pb-5 pt-2 border-t border-slate-100 dark:border-slate-800/50 flex items-center justify-between text-xs">
                 <span className="font-medium text-slate-600 dark:text-slate-300">
-                  By {article.author || 'Md Shamim'}
+                  By {getAuthorDisplayName(article.author)}
                 </span>
                 <span className="inline-flex items-center gap-1 font-semibold text-blue-600 dark:text-blue-400 group-hover:translate-x-1 transition-transform">
                   Read Guide

@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { Calendar, Clock, Share2, Check, Tag, AlertCircle, RefreshCw, ArrowLeft } from 'lucide-react';
 import { Article } from '../types';
 import { Breadcrumbs } from '../components/Breadcrumbs';
+import { getArticleAuthorProfile, DEFAULT_EDITORIAL_TEAM_NAME } from '../utils/authors.js';
 
 function getResponsiveSrcSet(imgPath: string): string {
   if (!imgPath) return '';
@@ -278,6 +279,8 @@ export const ArticleDetailView: React.FC<ArticleDetailViewProps> = ({
     );
   }
 
+  const authorProfile = getArticleAuthorProfile(article.author);
+
   const related = allArticles
     .filter((a) => a.slug !== article.slug && a.isPublished)
     .sort((x, y) => Number(y.category === article.category) - Number(x.category === article.category))
@@ -317,21 +320,32 @@ export const ArticleDetailView: React.FC<ArticleDetailViewProps> = ({
 
         <div className="flex flex-wrap items-center justify-between gap-4 text-xs text-slate-500 dark:text-slate-400">
           <div className="flex flex-wrap items-center gap-3 sm:gap-4">
-            <a
-              href="/author/md-shamim/"
-              onClick={(e) => {
-                e.preventDefault();
-                onNavigate('/author/md-shamim/');
-              }}
-              className="flex items-center gap-2 group cursor-pointer"
-            >
-              <div className="w-7 h-7 rounded-full bg-blue-100 dark:bg-blue-600/20 border border-blue-200 dark:border-blue-500/30 flex items-center justify-center font-bold text-blue-600 dark:text-blue-400 text-xs">
-                MS
-              </div>
-              <span className="font-semibold text-slate-800 dark:text-slate-200 group-hover:text-blue-600 dark:group-hover:text-blue-400 transition-colors">
-                By {article.author || 'Md Shamim'}
+            {authorProfile ? (
+              <a
+                href={authorProfile.path}
+                onClick={(e) => {
+                  e.preventDefault();
+                  onNavigate(authorProfile.path);
+                }}
+                className="flex items-center gap-2 group cursor-pointer"
+              >
+                <div className="w-7 h-7 rounded-full bg-blue-100 dark:bg-blue-600/20 border border-blue-200 dark:border-blue-500/30 flex items-center justify-center font-bold text-blue-600 dark:text-blue-400 text-xs">
+                  {authorProfile.initials}
+                </div>
+                <span className="font-semibold text-slate-800 dark:text-slate-200 group-hover:text-blue-600 dark:group-hover:text-blue-400 transition-colors">
+                  By {authorProfile.name}
+                </span>
+              </a>
+            ) : (
+              <span className="flex items-center gap-2">
+                <span className="w-7 h-7 rounded-full bg-blue-100 dark:bg-blue-600/20 border border-blue-200 dark:border-blue-500/30 flex items-center justify-center font-bold text-blue-600 dark:text-blue-400 text-xs">
+                  AE
+                </span>
+                <span className="font-semibold text-slate-800 dark:text-slate-200">
+                  By {DEFAULT_EDITORIAL_TEAM_NAME}
+                </span>
               </span>
-            </a>
+            )}
             <span>•</span>
             <span className="flex items-center gap-1" title="Initial publication date">
               <Calendar className="w-3.5 h-3.5" />
@@ -419,62 +433,93 @@ export const ArticleDetailView: React.FC<ArticleDetailViewProps> = ({
       )}
 
       {/* Author Card */}
-      <div className="p-6 sm:p-7 rounded-3xl bg-white dark:bg-slate-900/60 border border-slate-200 dark:border-slate-800 shadow-sm flex flex-col sm:flex-row items-start gap-4 sm:gap-5 mb-12">
-        <a
-          href="/author/md-shamim/"
-          onClick={(e) => {
-            e.preventDefault();
-            onNavigate('/author/md-shamim/');
-          }}
-          className="w-14 h-14 rounded-2xl bg-gradient-to-tr from-blue-600 to-sky-400 flex items-center justify-center font-bold text-white text-lg shrink-0 shadow-md hover:opacity-90 transition-opacity"
-        >
-          MS
-        </a>
-        <div className="flex-1">
-          <div className="text-xs uppercase font-bold tracking-wider text-blue-600 dark:text-blue-400 mb-1">
-            Author &amp; Lead Researcher
-          </div>
-          <h3 className="text-lg font-bold text-slate-900 dark:text-white mb-1">
-            <a
-              href="/author/md-shamim/"
-              onClick={(e) => {
-                e.preventDefault();
-                onNavigate('/author/md-shamim/');
-              }}
-              className="hover:text-blue-600 dark:hover:text-blue-400 transition-colors"
-            >
-              {article.author || 'Md Shamim'}
-            </a>
-          </h3>
-          <p className="text-xs sm:text-sm text-slate-600 dark:text-slate-400 leading-relaxed mb-3">
-            Lead researcher and editor at AINOVEX. Conducts research, software evaluations, and technical guides published across the platform.
-          </p>
-          <div className="flex flex-wrap items-center gap-4 text-xs font-semibold text-blue-600 dark:text-blue-400">
-            <a
-              href="/author/md-shamim/"
-              onClick={(e) => {
-                e.preventDefault();
-                onNavigate('/author/md-shamim/');
-              }}
-              className="hover:underline flex items-center gap-1"
-            >
-              <span>View Editorial Profile &amp; Guides</span>
-              <span>&rarr;</span>
-            </a>
-            <span>•</span>
-            <a
-              href="/editorial-policy/"
-              onClick={(e) => {
-                e.preventDefault();
-                onNavigate('/editorial-policy/');
-              }}
-              className="text-slate-500 dark:text-slate-400 hover:text-slate-800 dark:hover:text-slate-200 hover:underline"
-            >
-              Editorial Policy
-            </a>
+      {authorProfile ? (
+        <div className="p-6 sm:p-7 rounded-3xl bg-white dark:bg-slate-900/60 border border-slate-200 dark:border-slate-800 shadow-sm flex flex-col sm:flex-row items-start gap-4 sm:gap-5 mb-12">
+          <a
+            href={authorProfile.path}
+            onClick={(e) => {
+              e.preventDefault();
+              onNavigate(authorProfile.path);
+            }}
+            className="w-14 h-14 rounded-2xl bg-gradient-to-tr from-blue-600 to-sky-400 flex items-center justify-center font-bold text-white text-lg shrink-0 shadow-md hover:opacity-90 transition-opacity"
+          >
+            {authorProfile.initials}
+          </a>
+          <div className="flex-1">
+            <div className="text-xs uppercase font-bold tracking-wider text-blue-600 dark:text-blue-400 mb-1">
+              {authorProfile.cardBadge}
+            </div>
+            <h3 className="text-lg font-bold text-slate-900 dark:text-white mb-1">
+              <a
+                href={authorProfile.path}
+                onClick={(e) => {
+                  e.preventDefault();
+                  onNavigate(authorProfile.path);
+                }}
+                className="hover:text-blue-600 dark:hover:text-blue-400 transition-colors"
+              >
+                {authorProfile.name}
+              </a>
+            </h3>
+            <p className="text-xs sm:text-sm text-slate-600 dark:text-slate-400 leading-relaxed mb-3">
+              {authorProfile.shortBio}
+            </p>
+            <div className="flex flex-wrap items-center gap-4 text-xs font-semibold text-blue-600 dark:text-blue-400">
+              <a
+                href={authorProfile.path}
+                onClick={(e) => {
+                  e.preventDefault();
+                  onNavigate(authorProfile.path);
+                }}
+                className="hover:underline flex items-center gap-1"
+              >
+                <span>View Editorial Profile &amp; Guides</span>
+                <span>&rarr;</span>
+              </a>
+              <span>•</span>
+              <a
+                href="/editorial-policy/"
+                onClick={(e) => {
+                  e.preventDefault();
+                  onNavigate('/editorial-policy/');
+                }}
+                className="text-slate-500 dark:text-slate-400 hover:text-slate-800 dark:hover:text-slate-200 hover:underline"
+              >
+                Editorial Policy
+              </a>
+            </div>
           </div>
         </div>
-      </div>
+      ) : (
+        <div className="p-6 sm:p-7 rounded-3xl bg-white dark:bg-slate-900/60 border border-slate-200 dark:border-slate-800 shadow-sm flex flex-col sm:flex-row items-start gap-4 sm:gap-5 mb-12">
+          <div className="w-14 h-14 rounded-2xl bg-gradient-to-tr from-blue-600 to-sky-400 flex items-center justify-center font-bold text-white text-lg shrink-0 shadow-md">
+            AE
+          </div>
+          <div className="flex-1">
+            <div className="text-xs uppercase font-bold tracking-wider text-blue-600 dark:text-blue-400 mb-1">
+              Editorial Desk
+            </div>
+            <h3 className="text-lg font-bold text-slate-900 dark:text-white mb-1">
+              {DEFAULT_EDITORIAL_TEAM_NAME}
+            </h3>
+            <p className="text-xs sm:text-sm text-slate-600 dark:text-slate-400 leading-relaxed mb-3">
+              Independent AI software reviews, workflows, and technical guides published across the AINOVEX platform.
+            </p>
+            <div className="flex flex-wrap items-center gap-4 text-xs font-semibold text-blue-600 dark:text-blue-400">
+              <a
+                href="/editorial-policy/"
+                onClick={(e) => {
+                  e.preventDefault();
+                  onNavigate('/editorial-policy/');
+                }}
+                className="text-slate-500 dark:text-slate-400 hover:text-slate-800 dark:hover:text-slate-200 hover:underline"
+              >
+                Editorial Policy
+              </a>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Related Guides */}
       {related.length > 0 && (

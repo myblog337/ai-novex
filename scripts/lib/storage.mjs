@@ -11,6 +11,7 @@ import {
   validateCategories,
   validateSettings,
   validateAds,
+  validateSeoConfig,
 } from './validators.mjs';
 
 // ----------------------------------------------------------------------------
@@ -19,7 +20,7 @@ import {
 
 /**
  * Strict file allowlist for CMS JSON content stores.
- * Only these 5 files located directly in the /content directory may be accessed or updated.
+ * Only these 6 files located directly in the /content directory may be accessed or updated.
  */
 export const ALLOWED_JSON_FILES = Object.freeze([
   'articles.json',
@@ -27,6 +28,7 @@ export const ALLOWED_JSON_FILES = Object.freeze([
   'categories.json',
   'settings.json',
   'ads.json',
+  'seo.json',
 ]);
 
 const ALLOWED_JSON_SET = new Set(ALLOWED_JSON_FILES);
@@ -44,6 +46,7 @@ const SCHEMA_VALIDATORS = Object.freeze({
   'categories.json': validateCategories,
   'settings.json': validateSettings,
   'ads.json': validateAds,
+  'seo.json': validateSeoConfig,
 });
 
 /**

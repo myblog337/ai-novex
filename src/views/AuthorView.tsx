@@ -2,6 +2,7 @@ import React from 'react';
 import { Shield, BookOpen, ArrowRight } from 'lucide-react';
 import { Article } from '../types';
 import { Breadcrumbs } from '../components/Breadcrumbs';
+import { findAuthorBySlug } from '../utils/authors.js';
 
 interface AuthorViewProps {
   slug?: string;
@@ -14,12 +15,32 @@ export const AuthorView: React.FC<AuthorViewProps> = ({
   articles,
   onNavigate,
 }) => {
-  const authorName = 'Md Shamim';
-  const authorRole = 'Lead researcher and editor at AINOVEX';
+  const author = findAuthorBySlug(slug, articles);
 
-  const authorArticles = articles
-    .filter((a) => a.isPublished && (a.author === authorName || !a.author))
-    .sort((x, y) => String(y.updatedAt || y.publishedAt).localeCompare(String(x.updatedAt || x.publishedAt)));
+  if (!author) {
+    return (
+      <div className="max-w-3xl mx-auto px-4 py-24 text-center">
+        <h1 className="text-2xl font-bold text-slate-900 dark:text-white mb-2">Author Not Found</h1>
+        <p className="text-sm text-slate-500 dark:text-slate-400 mb-6">
+          The requested author profile could not be located or has no published articles.
+        </p>
+        <a
+          href="/blog/"
+          onClick={(e) => {
+            e.preventDefault();
+            onNavigate('/blog/');
+          }}
+          className="px-5 py-2.5 rounded-full bg-blue-600 text-white text-sm font-semibold hover:bg-blue-500 inline-block"
+        >
+          Return to Blog Archive
+        </a>
+      </div>
+    );
+  }
+
+  const authorName = author.name;
+  const authorRole = author.role;
+  const authorArticles = author.articles;
 
   return (
     <div className="max-w-5xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
@@ -35,7 +56,7 @@ export const AuthorView: React.FC<AuthorViewProps> = ({
       <div className="bg-white dark:bg-slate-900/70 border border-slate-200 dark:border-slate-800 rounded-3xl p-6 sm:p-10 shadow-sm mb-12">
         <div className="flex flex-col sm:flex-row items-start sm:items-center gap-6 mb-8 pb-8 border-b border-slate-200 dark:border-slate-800">
           <div className="w-20 h-20 sm:w-24 sm:h-24 rounded-3xl bg-gradient-to-tr from-blue-600 via-sky-500 to-blue-400 flex items-center justify-center font-extrabold text-white text-2xl sm:text-3xl shrink-0 shadow-lg shadow-blue-500/20">
-            MS
+            {author.initials}
           </div>
           <div className="flex-1">
             <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold bg-blue-50 text-blue-600 border border-blue-200 dark:bg-blue-950/60 dark:border-blue-500/30 dark:text-blue-400 mb-2">
@@ -51,7 +72,7 @@ export const AuthorView: React.FC<AuthorViewProps> = ({
           </div>
         </div>
 
-        {/* Bio & Background (strictly verified facts, zero placeholders) */}
+        {/* Bio & Background */}
         <div className="space-y-6 text-sm sm:text-base text-slate-700 dark:text-slate-300 leading-relaxed">
           <div>
             <h2 className="text-lg font-bold text-slate-900 dark:text-white mb-2 flex items-center gap-2">
@@ -59,11 +80,11 @@ export const AuthorView: React.FC<AuthorViewProps> = ({
               Editorial Role
             </h2>
             <p className="mb-3">
-              Md Shamim is the lead researcher and editor at <strong>AINOVEX</strong>. He conducts research, software evaluations, and technical guides published across the platform.
+              {author.bioLead}
+              <strong>AINOVEX</strong>
+              {author.bioLeadSuffix}
             </p>
-            <p>
-              His editorial work focuses on analyzing publicly available software documentation, vendor specifications, and user documentation to produce clear, structured comparisons for readers.
-            </p>
+            <p>{author.bioSecondary}</p>
           </div>
 
           <div className="border-t border-slate-200 dark:border-slate-800 pt-6">
@@ -71,7 +92,7 @@ export const AuthorView: React.FC<AuthorViewProps> = ({
               Editorial Standards
             </h3>
             <p className="text-xs sm:text-sm text-slate-600 dark:text-slate-400 leading-relaxed mb-3">
-              Md Shamim adheres to the{' '}
+              {author.standardsPrefix}
               <a
                 href="/editorial-policy/"
                 onClick={(e) => {
@@ -82,7 +103,7 @@ export const AuthorView: React.FC<AuthorViewProps> = ({
               >
                 AINOVEX Editorial Policy
               </a>
-              . Articles are compiled through independent technical research and official vendor documentation review.
+              {author.standardsSuffix}
             </p>
             <p className="text-xs text-slate-500 dark:text-slate-400">
               For questions, feedback, or editorial corrections, please visit our{' '}
@@ -106,7 +127,7 @@ export const AuthorView: React.FC<AuthorViewProps> = ({
       <section>
         <div className="flex items-center justify-between mb-6">
           <h2 className="text-xl sm:text-2xl font-bold text-slate-900 dark:text-white tracking-tight">
-            Articles by Md Shamim ({authorArticles.length})
+            Articles by {authorName} ({authorArticles.length})
           </h2>
           <span className="text-xs text-slate-500 dark:text-slate-400">
             Sorted by update date

@@ -18,6 +18,7 @@ import {
   isValidHttpOriginUrl
 } from './lib/validators.mjs';
 import { isInsideAuthorizedDirectory } from './lib/storage.mjs';
+import { collectAuthors, getArticleAuthorProfile, DEFAULT_EDITORIAL_TEAM_NAME } from '../src/utils/authors.js';
 
 const esc = (v) =>
   String(v ?? '')
@@ -219,11 +220,15 @@ const today = new Date().toISOString().slice(0, 10);
 // reflects a real content date (never "today"), because Google ignores sitemaps whose lastmod is always fresh.
 const dateOf = (a) => a.updatedAt || a.publishedAt;
 const newest = (list) => list.map(dateOf).filter(Boolean).sort().pop();
+const authors = collectAuthors(articles);
 const sitemapEntries = [];
 for (const p of INDEXABLE_STATIC_PATHS) {
   const loc = p === '/' ? '/' : `${p}/`;
-  const lastmod = ['/', '/blog', '/author/md-shamim'].includes(p) ? newest(articles) : undefined;
+  const lastmod = ['/', '/blog'].includes(p) ? newest(articles) : undefined;
   sitemapEntries.push({ loc, lastmod });
+}
+for (const author of authors) {
+  sitemapEntries.push({ loc: `/author/${author.slug}/`, lastmod: newest(author.articles) });
 }
 for (const a of articles) sitemapEntries.push({ loc: `/blog/${a.slug}/`, lastmod: dateOf(a) });
 for (const c of categories) {
@@ -558,7 +563,7 @@ function createPageHtml({ title, description, path: pagePath, image, imageAlt, o
     const tags = [
       `<meta property="article:published_time" content="${esc(articleMeta.published)}" />`,
       `<meta property="article:modified_time" content="${esc(articleMeta.modified)}" />`,
-      `<meta property="article:author" content="${esc(articleMeta.authorUrl)}" />`,
+      ...(articleMeta.authorUrl ? [`<meta property="article:author" content="${esc(articleMeta.authorUrl)}" />`] : []),
       `<meta property="article:section" content="${esc(articleMeta.section)}" />`,
       ...(articleMeta.tags || []).map((t) => `<meta property="article:tag" content="${esc(t)}" />`),
     ].join('\n    ');
@@ -852,7 +857,7 @@ for (const a of articles) {
     .sort((x, y) => Number(y.category === a.category) - Number(x.category === a.category))
     .slice(0, 2);
   const imgSize = getImageSize(a.featuredImage);
-  const authorSlug = (a.author || 'md-shamim').toLowerCase().replace(/[^a-z0-9]+/g, '-');
+  const authorProfile = getArticleAuthorProfile(a.author);
 
   const articleContent = `
 <article class="max-w-4xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
@@ -872,7 +877,7 @@ for (const a of articles) {
       ${esc(a.excerpt)}
     </p>
     <div class="flex flex-wrap items-center gap-3 sm:gap-4 text-xs text-slate-500 dark:text-slate-400">
-      <a href="/author/${authorSlug}/" class="font-semibold text-slate-800 dark:text-slate-200 hover:text-blue-600 dark:hover:text-blue-400 transition-colors">By ${esc(a.author || 'Md Shamim')}</a>
+      ${authorProfile ? `<a href="${esc(authorProfile.path)}" class="font-semibold text-slate-800 dark:text-slate-200 hover:text-blue-600 dark:hover:text-blue-400 transition-colors">By ${esc(authorProfile.name)}</a>` : `<span class="font-semibold text-slate-800 dark:text-slate-200">By ${esc(DEFAULT_EDITORIAL_TEAM_NAME)}</span>`}
       <span>&bull;</span>
       <span>Published: <time datetime="${esc(a.publishedAt)}">${esc(a.publishedAt)}</time></span>
       ${a.updatedAt ? `<span>&bull;</span><span class="text-emerald-600 dark:text-emerald-400 font-medium">Last updated: <time datetime="${esc(a.updatedAt)}">${esc(a.updatedAt)}</time></span>` : ''}
@@ -889,20 +894,21 @@ for (const a of articles) {
   <div class="py-6 border-t border-b border-slate-200 dark:border-slate-800/80 flex items-center gap-2 flex-wrap mb-10">
     ${a.tags.map(t => `<span class="px-3 py-1 rounded-full text-xs font-medium bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-300">#${esc(t)}</span>`).join('')}
   </div>` : ''}
+  ${authorProfile ? `
   <div class="p-6 sm:p-7 rounded-3xl bg-white dark:bg-slate-900/60 border border-slate-200 dark:border-slate-800 shadow-sm flex flex-col sm:flex-row items-start gap-4 sm:gap-5 mb-12">
-    <a href="/author/${authorSlug}/" class="w-14 h-14 rounded-2xl bg-gradient-to-tr from-blue-600 to-sky-400 flex items-center justify-center font-bold text-white text-lg shrink-0 shadow-md hover:opacity-90 transition-opacity">
-      MS
+    <a href="${esc(authorProfile.path)}" class="w-14 h-14 rounded-2xl bg-gradient-to-tr from-blue-600 to-sky-400 flex items-center justify-center font-bold text-white text-lg shrink-0 shadow-md hover:opacity-90 transition-opacity">
+      ${esc(authorProfile.initials)}
     </a>
     <div class="flex-1">
-      <div class="text-xs uppercase font-bold tracking-wider text-blue-600 dark:text-blue-400 mb-1">Author &amp; Lead Researcher</div>
+      <div class="text-xs uppercase font-bold tracking-wider text-blue-600 dark:text-blue-400 mb-1">${esc(authorProfile.cardBadge)}</div>
       <h3 class="text-lg font-bold text-slate-900 dark:text-white mb-1">
-        <a href="/author/${authorSlug}/" class="hover:text-blue-600 dark:hover:text-blue-400 transition-colors">${esc(a.author || 'Md Shamim')}</a>
+        <a href="${esc(authorProfile.path)}" class="hover:text-blue-600 dark:hover:text-blue-400 transition-colors">${esc(authorProfile.name)}</a>
       </h3>
       <p class="text-xs sm:text-sm text-slate-600 dark:text-slate-400 leading-relaxed mb-3">
-        Lead researcher and editor at AINOVEX. Conducts research, software evaluations, and technical guides published across the platform.
+        ${esc(authorProfile.shortBio)}
       </p>
       <div class="flex flex-wrap items-center gap-4 text-xs font-semibold text-blue-600 dark:text-blue-400">
-        <a href="/author/${authorSlug}/" class="hover:underline flex items-center gap-1">
+        <a href="${esc(authorProfile.path)}" class="hover:underline flex items-center gap-1">
           <span>View Editorial Profile &amp; Guides</span>
           <span>&rarr;</span>
         </a>
@@ -910,7 +916,22 @@ for (const a of articles) {
         <a href="/editorial-policy/" class="text-slate-500 dark:text-slate-400 hover:text-slate-800 dark:hover:text-slate-200 hover:underline">Editorial Policy</a>
       </div>
     </div>
-  </div>
+  </div>` : `
+  <div class="p-6 sm:p-7 rounded-3xl bg-white dark:bg-slate-900/60 border border-slate-200 dark:border-slate-800 shadow-sm flex flex-col sm:flex-row items-start gap-4 sm:gap-5 mb-12">
+    <div class="w-14 h-14 rounded-2xl bg-gradient-to-tr from-blue-600 to-sky-400 flex items-center justify-center font-bold text-white text-lg shrink-0 shadow-md">
+      AE
+    </div>
+    <div class="flex-1">
+      <div class="text-xs uppercase font-bold tracking-wider text-blue-600 dark:text-blue-400 mb-1">Editorial Desk</div>
+      <h3 class="text-lg font-bold text-slate-900 dark:text-white mb-1">${esc(DEFAULT_EDITORIAL_TEAM_NAME)}</h3>
+      <p class="text-xs sm:text-sm text-slate-600 dark:text-slate-400 leading-relaxed mb-3">
+        Independent AI software reviews, workflows, and technical guides published across the AINOVEX platform.
+      </p>
+      <div class="flex flex-wrap items-center gap-4 text-xs font-semibold text-blue-600 dark:text-blue-400">
+        <a href="/editorial-policy/" class="text-slate-500 dark:text-slate-400 hover:text-slate-800 dark:hover:text-slate-200 hover:underline">Editorial Policy</a>
+      </div>
+    </div>
+  </div>`}
   ${related.length ? `
   <div class="pt-6 border-t border-slate-200 dark:border-slate-800/80">
     <h3 class="text-xl font-bold text-slate-900 dark:text-white mb-6">Related Guides &amp; Tutorials</h3>
@@ -927,21 +948,22 @@ for (const a of articles) {
 
   const absArticleUrl = `${baseUrl}/blog/${a.slug}/`;
   const absImageUrl = toAbsoluteUrl(a.ogImage || a.featuredImage);
+  const absAuthorUrl = authorProfile ? `${baseUrl}${authorProfile.path}` : null;
 
   const graphNodes = [
     websiteNode,
     orgNode,
-    {
+    ...(authorProfile ? [{
       '@type': 'Person',
-      '@id': `${baseUrl}/author/${authorSlug}/#person`,
-      name: a.author || 'Md Shamim',
-      url: `${baseUrl}/author/${authorSlug}/`,
-      jobTitle: 'Lead researcher and editor at AINOVEX',
-      description: 'Lead researcher and editor at AINOVEX. Focuses on artificial intelligence software analysis, catalog automation benchmarks, and technical workflows.',
+      '@id': `${absAuthorUrl}#person`,
+      name: authorProfile.name,
+      url: absAuthorUrl,
+      jobTitle: authorProfile.role,
+      description: authorProfile.schemaDescription,
       worksFor: {
         '@id': `${baseUrl}/#organization`,
       },
-    },
+    }] : []),
     {
       '@type': 'BlogPosting',
       '@id': `${absArticleUrl}#article`,
@@ -959,9 +981,9 @@ for (const a of articles) {
       dateModified: a.updatedAt || a.publishedAt,
       wordCount: mdRaw.split(/\s+/).filter(Boolean).length,
       mainEntityOfPage: absArticleUrl,
-      author: {
-        '@id': `${baseUrl}/author/${authorSlug}/#person`,
-      },
+      author: absAuthorUrl
+        ? { '@id': `${absAuthorUrl}#person` }
+        : { '@id': `${baseUrl}/#organization` },
       publisher: {
         '@id': `${baseUrl}/#organization`,
       },
@@ -1055,7 +1077,7 @@ for (const a of articles) {
     articleMeta: {
       published: a.publishedAt,
       modified: a.updatedAt || a.publishedAt,
-      authorUrl: `${baseUrl}/author/${authorSlug}/`,
+      authorUrl: absAuthorUrl,
       section: a.categoryName || a.category,
       tags: a.tags || [],
     },
@@ -1211,32 +1233,36 @@ writePage('contact/index.html', createPageHtml({
 }));
 
 // ----------------------------------------------------------------------------
-// Author Profile Page (/author/md-shamim/)
+// Author Profile Pages (/author/[slug]/)
 // ----------------------------------------------------------------------------
-const authorArticlesList = articles
-  .filter(a => a.author === 'Md Shamim' || !a.author)
-  .sort((x, y) => String(y.updatedAt || y.publishedAt).localeCompare(String(x.updatedAt || x.publishedAt)));
-const authorContent = `
+for (const author of authors) {
+  if (!author.slug || !author.articles || author.articles.length === 0) continue;
+
+  const authorArticlesList = author.articles;
+  const authorUrlPath = author.path;
+  const authorAbsUrl = `${baseUrl}${authorUrlPath}`;
+
+  const authorContent = `
 <div class="max-w-5xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
   ${renderBreadcrumb([
     { label: 'Authors', path: '/about/' },
-    { label: 'Md Shamim' },
+    { label: author.name },
   ])}
 
   <div class="bg-white dark:bg-slate-900/70 border border-slate-200 dark:border-slate-800 rounded-3xl p-6 sm:p-10 shadow-sm mb-12">
     <div class="flex flex-col sm:flex-row items-start sm:items-center gap-6 mb-8 pb-8 border-b border-slate-200 dark:border-slate-800">
       <div class="w-20 h-20 sm:w-24 sm:h-24 rounded-3xl bg-gradient-to-tr from-blue-600 via-sky-500 to-blue-400 flex items-center justify-center font-extrabold text-white text-2xl sm:text-3xl shrink-0 shadow-lg shadow-blue-500/20">
-        MS
+        ${esc(author.initials)}
       </div>
       <div class="flex-1">
         <div class="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold bg-blue-50 text-blue-600 border border-blue-200 dark:bg-blue-950/60 dark:border-blue-500/30 dark:text-blue-400 mb-2">
           <span>Editorial Profile</span>
         </div>
         <h1 class="text-2xl sm:text-4xl font-extrabold text-slate-900 dark:text-white tracking-tight mb-1">
-          Md Shamim
+          ${esc(author.name)}
         </h1>
         <p class="text-sm sm:text-base font-medium text-slate-600 dark:text-slate-300">
-          Lead researcher and editor at AINOVEX
+          ${esc(author.role)}
         </p>
       </div>
     </div>
@@ -1245,10 +1271,10 @@ const authorContent = `
       <div>
         <h2 class="text-lg font-bold text-slate-900 dark:text-white mb-2">Editorial Role</h2>
         <p class="mb-3">
-          Md Shamim is the lead researcher and editor at <strong>AINOVEX</strong>. He conducts research, software evaluations, and technical guides published across the platform.
+          ${esc(author.bioLead)}<strong>AINOVEX</strong>${esc(author.bioLeadSuffix)}
         </p>
         <p>
-          His editorial work focuses on analyzing publicly available software documentation, vendor specifications, and user documentation to produce clear, structured comparisons for readers.
+          ${esc(author.bioSecondary)}
         </p>
       </div>
 
@@ -1257,7 +1283,7 @@ const authorContent = `
           Editorial Standards
         </h3>
         <p class="text-xs sm:text-sm text-slate-600 dark:text-slate-400 leading-relaxed mb-3">
-          Md Shamim adheres to the <a href="/editorial-policy/" class="text-blue-600 dark:text-blue-400 underline font-semibold">AINOVEX Editorial Policy</a>. Articles are compiled through independent technical research and official vendor documentation review.
+          ${esc(author.standardsPrefix)}<a href="/editorial-policy/" class="text-blue-600 dark:text-blue-400 underline font-semibold">AINOVEX Editorial Policy</a>${esc(author.standardsSuffix)}
         </p>
         <p class="text-xs text-slate-500 dark:text-slate-400">
           For questions, feedback, or editorial corrections, please visit our <a href="/contact/" class="text-blue-600 dark:text-blue-400 underline font-medium">Contact page</a>.
@@ -1269,7 +1295,7 @@ const authorContent = `
   <section>
     <div class="flex items-center justify-between mb-6">
       <h2 class="text-xl sm:text-2xl font-bold text-slate-900 dark:text-white tracking-tight">
-        Articles &amp; Guides by Md Shamim (${authorArticlesList.length})
+        Articles &amp; Guides by ${esc(author.name)} (${authorArticlesList.length})
       </h2>
       <span class="text-xs text-slate-500 dark:text-slate-400">Sorted by most recent update</span>
     </div>
@@ -1305,29 +1331,30 @@ const authorContent = `
   </section>
 </div>`;
 
-writePage('author/md-shamim/index.html', createPageHtml({
-  title: 'Md Shamim - Lead Researcher & Editor | AINOVEX',
-  description: 'Read the editorial profile and guides by Md Shamim, lead researcher and editor at AINOVEX specializing in AI tools and catalog enrichment.',
-  path: '/author/md-shamim/',
-  contentHtml: authorContent,
-  jsonLd: {
-    '@context': 'https://schema.org',
-    '@graph': [orgNode, {
-    '@type': 'ProfilePage',
-    mainEntity: {
-      '@type': 'Person',
-      '@id': `${baseUrl}/author/md-shamim/#person`,
-      name: 'Md Shamim',
-      url: `${baseUrl}/author/md-shamim/`,
-      jobTitle: 'Lead researcher and editor at AINOVEX',
-      description: 'Lead researcher and editor at AINOVEX. Focuses on artificial intelligence software analysis, catalog automation benchmarks, and technical workflows.',
-      worksFor: {
-        '@id': `${baseUrl}/#organization`,
-      },
+  writePage(`author/${author.slug}/index.html`, createPageHtml({
+    title: author.seoTitle,
+    description: author.seoDescription,
+    path: authorUrlPath,
+    contentHtml: authorContent,
+    jsonLd: {
+      '@context': 'https://schema.org',
+      '@graph': [orgNode, {
+        '@type': 'ProfilePage',
+        mainEntity: {
+          '@type': 'Person',
+          '@id': `${authorAbsUrl}#person`,
+          name: author.name,
+          url: authorAbsUrl,
+          jobTitle: author.role,
+          description: author.schemaDescription,
+          worksFor: {
+            '@id': `${baseUrl}/#organization`,
+          },
+        },
+      }],
     },
-  }],
-},
-}));
+  }));
+}
 
 const legal = getLegalContent({ siteUrl: baseUrl, contactEmail: settings.contactEmail, strict: true });
 const legalDateLabel = formatLegalDate();

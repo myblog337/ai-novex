@@ -36,6 +36,22 @@ import {
   validateTools,
   validateSettings,
   validateAds,
+  ALLOWED_SEO_PAGE_TYPES,
+  ALLOWED_SEO_SCHEMA_TYPES,
+  ALLOWED_SEO_OG_TYPES,
+  ALLOWED_SEO_TWITTER_CARDS,
+  ALLOWED_SEO_MAX_IMAGE_PREVIEW,
+  MAX_SEO_PAGES,
+  ALLOWED_SEO_DEFAULTS_FIELDS,
+  ALLOWED_SEO_PAGE_FIELDS,
+  isValidSeoPageId,
+  isValidSeoPageSlug,
+  isValidSeoPagePath,
+  normalizeSeoPagePath,
+  validateSeoDefaults,
+  validateSeoPageRecord,
+  validateSeoConfig,
+  resolveEffectiveSeo,
 } from './lib/validators.mjs';
 
 const HOST = '127.0.0.1';
@@ -2538,6 +2554,351 @@ function buildUpdatedAds(existingAds, incomingAds) {
       : safeExisting.adsTxtContent,
     slots: updatedSlots,
   };
+}
+
+// ----------------------------------------------------------------------------
+// Global & Page-Level SEO Helpers (Task 113)
+// ----------------------------------------------------------------------------
+
+const SEO_ROUTE_PREFIX = '/api/cms/seo';
+const SEO_PAGE_ROUTE_PREFIX = '/api/cms/seo/pages/';
+const ALLOWED_SEO_DEFAULTS_SET = new Set(ALLOWED_SEO_DEFAULTS_FIELDS);
+const ALLOWED_SEO_PAGE_SET = new Set(ALLOWED_SEO_PAGE_FIELDS);
+const SEO_DEFAULTS_NULLABLE_OPTIONAL_FIELDS = new Set([
+  'defaultFocusKeyword',
+  'defaultSecondaryKeywords',
+  'defaultMaxImagePreview',
+  'defaultOgTitle',
+  'defaultOgDescription',
+  'defaultOgType',
+  'defaultTwitterTitle',
+  'defaultTwitterDescription',
+  'defaultTwitterImage',
+  'defaultTwitterCard',
+  'defaultTwitterSite',
+  'defaultSchemaType',
+  'defaultImageAlt',
+]);
+const SEO_PAGE_NULLABLE_OPTIONAL_FIELDS = new Set([
+  'seoTitle',
+  'metaDescription',
+  'focusKeyword',
+  'secondaryKeywords',
+  'canonicalUrl',
+  'index',
+  'follow',
+  'maxImagePreview',
+  'maxSnippet',
+  'maxVideoPreview',
+  'ogTitle',
+  'ogDescription',
+  'ogImage',
+  'ogType',
+  'twitterTitle',
+  'twitterDescription',
+  'twitterImage',
+  'twitterCard',
+  'schemaType',
+  'customStructuredData',
+  'breadcrumb',
+  'imageAlt',
+  'ogImageAlt',
+  'twitterImageAlt',
+  'customImageAlts',
+]);
+
+/**
+ * Safe pageId-aware path parser for SEO CMS routes (/api/cms/seo/pages/:pageId).
+ * Mirrors the strict raw-path validation used by parseArticlePath() and parseToolPath().
+ */
+function parseSeoPagePath(input, options = {}) {
+  const prefix =
+    options && typeof options.prefix === 'string' && options.prefix.startsWith('/')
+      ? options.prefix
+      : SEO_PAGE_ROUTE_PREFIX;
+
+  const makeNotFound = (rawPath = '/', rawPageId = null, error = 'Route not found') => ({
+    matched: false,
+    valid: false,
+    invalid: false,
+    status: 'not_found',
+    statusCode: 404,
+    pageId: null,
+    rawPageId,
+    rawPath,
+    error,
+  });
+
+  const makeInvalid = (rawPath, rawPageId, error) => ({
+    matched: true,
+    valid: false,
+    invalid: true,
+    status: 'invalid',
+    statusCode: 400,
+    pageId: null,
+    rawPageId,
+    rawPath,
+    error,
+  });
+
+  try {
+    let rawUrl = null;
+    if (typeof input === 'string') {
+      rawUrl = input;
+    } else if (input && typeof input === 'object' && !Array.isArray(input)) {
+      if (typeof input.rawRequestPath === 'string') {
+        rawUrl = input.rawRequestPath;
+      } else if (typeof input.url === 'string') {
+        rawUrl = input.url;
+      }
+    }
+
+    if (!rawUrl || typeof rawUrl !== 'string') {
+      return makeNotFound('/');
+    }
+
+    const rawPath = extractRawRequestPath(rawUrl);
+
+    if (!rawPath.startsWith(prefix)) {
+      return makeNotFound(rawPath);
+    }
+
+    const rawPageIdPart = rawPath.slice(prefix.length);
+
+    if (!rawPageIdPart || rawPageIdPart.includes('/')) {
+      return makeNotFound(rawPath, rawPageIdPart || null);
+    }
+
+    if (
+      /%2f/i.test(rawPageIdPart) ||
+      /%5c/i.test(rawPageIdPart) ||
+      rawPageIdPart.includes('\\') ||
+      rawPageIdPart.includes('..') ||
+      /%2e/i.test(rawPageIdPart) ||
+      rawPageIdPart.includes('\0') ||
+      /%00/i.test(rawPageIdPart) ||
+      /%25/i.test(rawPageIdPart) ||
+      /%(?![0-9a-fA-F]{2})/.test(rawPageIdPart)
+    ) {
+      return makeInvalid(rawPath, rawPageIdPart, 'Malformed or forbidden SEO pageId');
+    }
+
+    let decodedPageId;
+    try {
+      decodedPageId = decodeURIComponent(rawPageIdPart);
+    } catch {
+      return makeInvalid(rawPath, rawPageIdPart, 'Malformed percent encoding in SEO pageId');
+    }
+
+    if (
+      decodedPageId.includes('/') ||
+      decodedPageId.includes('\\') ||
+      decodedPageId.includes('..') ||
+      decodedPageId.includes('\0') ||
+      decodedPageId.includes('%') ||
+      !isValidSeoPageId(decodedPageId)
+    ) {
+      return makeInvalid(
+        rawPath,
+        rawPageIdPart,
+        'Invalid SEO pageId: must be 1-128 lowercase alphanumeric characters, colons, underscores, or hyphens starting with alphanumeric'
+      );
+    }
+
+    return {
+      matched: true,
+      valid: true,
+      invalid: false,
+      status: 'valid',
+      statusCode: 200,
+      pageId: decodedPageId,
+      rawPageId: rawPageIdPart,
+      rawPath,
+      error: null,
+    };
+  } catch {
+    return makeNotFound('/');
+  }
+}
+
+function sanitizeSeoDefaultsForResponse(defaults) {
+  if (!isPlainJsonObject(defaults)) {
+    return {};
+  }
+  return clonePlainJsonData(defaults);
+}
+
+function sanitizeSeoPageForResponse(page) {
+  if (!isPlainJsonObject(page)) {
+    return {};
+  }
+  return clonePlainJsonData(page);
+}
+
+function sanitizeSeoConfigForResponse(seo) {
+  if (!isPlainJsonObject(seo)) {
+    return {
+      version: 1,
+      updatedAt: '',
+      defaults: {},
+      pages: {},
+    };
+  }
+  const cleanPages = {};
+  if (isPlainJsonObject(seo.pages)) {
+    for (const key of Object.keys(seo.pages).sort()) {
+      if (PROTO_POLLUTION_KEYS.has(key)) continue;
+      cleanPages[key] = sanitizeSeoPageForResponse(seo.pages[key]);
+    }
+  }
+  return {
+    version: seo.version,
+    updatedAt: seo.updatedAt,
+    defaults: sanitizeSeoDefaultsForResponse(seo.defaults),
+    pages: cleanPages,
+  };
+}
+
+function computeSeoDefaultsETag(defaults) {
+  if (!isPlainJsonObject(defaults)) {
+    throw new TypeError('SEO defaults must be a non-null object');
+  }
+  const clean = canonicalizeMetadata(sanitizeSeoDefaultsForResponse(defaults));
+  return generateETag(JSON.stringify({ kind: 'seo-defaults-v1', defaults: clean }));
+}
+
+const computeSeoDefaultsEtag = computeSeoDefaultsETag;
+
+function computeSeoPageETag(page) {
+  if (!isPlainJsonObject(page)) {
+    throw new TypeError('SEO page record must be a non-null object');
+  }
+  const clean = canonicalizeMetadata(sanitizeSeoPageForResponse(page));
+  return generateETag(JSON.stringify({ kind: 'seo-page-v1', page: clean }));
+}
+
+const computeSeoPageEtag = computeSeoPageETag;
+
+function computeSeoConfigETag(seo) {
+  if (!isPlainJsonObject(seo)) {
+    throw new TypeError('SEO configuration must be a non-null object');
+  }
+  const clean = canonicalizeMetadata(sanitizeSeoConfigForResponse(seo));
+  return generateETag(JSON.stringify({ kind: 'seo-config-v1', seo: clean }));
+}
+
+const computeSeoConfigEtag = computeSeoConfigETag;
+
+function cloneSeoPagesMapPreservingOthers(pages, excludePageId = null) {
+  const cloned = {};
+  if (!isPlainJsonObject(pages)) {
+    return cloned;
+  }
+  for (const [k, v] of Object.entries(pages)) {
+    if (PROTO_POLLUTION_KEYS.has(k)) continue;
+    if (excludePageId !== null && k === excludePageId) continue;
+    cloned[k] = sanitizeSeoPageForResponse(v);
+  }
+  return cloned;
+}
+
+function ensureMonotonicIsoTimestamp(minIso, candidateIso = new Date().toISOString()) {
+  const candidateMs = Date.parse(candidateIso);
+  const minMs = typeof minIso === 'string' ? Date.parse(minIso) : Number.NaN;
+  if (Number.isFinite(minMs) && (!Number.isFinite(candidateMs) || candidateMs < minMs)) {
+    return new Date(minMs).toISOString();
+  }
+  return Number.isFinite(candidateMs) ? new Date(candidateMs).toISOString() : new Date().toISOString();
+}
+
+function buildUpdatedSeoDefaults(existingDefaults, rawDefaults, serverNow = new Date().toISOString()) {
+  const safeExisting = isPlainJsonObject(existingDefaults) ? clonePlainJsonData(existingDefaults) : {};
+  const safeRaw = isPlainJsonObject(rawDefaults) ? rawDefaults : {};
+  const hasOwn = (obj, key) => Object.prototype.hasOwnProperty.call(obj, key);
+
+  const updated = {};
+  for (const field of ALLOWED_SEO_DEFAULTS_FIELDS) {
+    if (field === 'updatedAt') continue;
+    if (hasOwn(safeRaw, field) && safeRaw[field] !== undefined) {
+      if (safeRaw[field] === null && SEO_DEFAULTS_NULLABLE_OPTIONAL_FIELDS.has(field)) {
+        continue;
+      }
+      updated[field] = clonePlainJsonData(safeRaw[field]);
+    } else if (hasOwn(safeExisting, field) && safeExisting[field] !== undefined) {
+      updated[field] = clonePlainJsonData(safeExisting[field]);
+    }
+  }
+
+  updated.updatedAt = ensureMonotonicIsoTimestamp(safeExisting.updatedAt, serverNow);
+  return updated;
+}
+
+function buildCreatedSeoPage(rawPage, serverNow = new Date().toISOString()) {
+  const safeRaw = isPlainJsonObject(rawPage) ? rawPage : {};
+  const hasOwn = (obj, key) => Object.prototype.hasOwnProperty.call(obj, key);
+  const normalizedPath = normalizeSeoPagePath(safeRaw.path);
+
+  const created = {
+    pageId: safeRaw.pageId,
+    pageType: safeRaw.pageType,
+    path: normalizedPath || safeRaw.path,
+    slug: safeRaw.slug,
+  };
+
+  for (const field of SEO_PAGE_NULLABLE_OPTIONAL_FIELDS) {
+    if (!hasOwn(safeRaw, field) || safeRaw[field] === undefined || safeRaw[field] === null) {
+      continue;
+    }
+    created[field] = clonePlainJsonData(safeRaw[field]);
+  }
+
+  const ts = ensureMonotonicIsoTimestamp(null, serverNow);
+  created.createdAt = ts;
+  created.updatedAt = ts;
+  return created;
+}
+
+function buildUpdatedSeoPage(existingPage, rawPage, serverNow = new Date().toISOString()) {
+  const safeExisting = isPlainJsonObject(existingPage) ? existingPage : {};
+  const safeRaw = isPlainJsonObject(rawPage) ? rawPage : {};
+  const hasOwn = (obj, key) => Object.prototype.hasOwnProperty.call(obj, key);
+
+  let nextPath = safeExisting.path;
+  if (hasOwn(safeRaw, 'path') && safeRaw.path !== undefined) {
+    if (typeof safeRaw.path === 'string') {
+      nextPath = normalizeSeoPagePath(safeRaw.path) || safeRaw.path;
+    } else {
+      nextPath = safeRaw.path;
+    }
+  }
+
+  const updated = {
+    pageId: safeExisting.pageId,
+    pageType:
+      hasOwn(safeRaw, 'pageType') && safeRaw.pageType !== undefined
+        ? safeRaw.pageType
+        : safeExisting.pageType,
+    path: nextPath,
+    slug:
+      hasOwn(safeRaw, 'slug') && safeRaw.slug !== undefined
+        ? safeRaw.slug
+        : safeExisting.slug,
+  };
+
+  for (const field of SEO_PAGE_NULLABLE_OPTIONAL_FIELDS) {
+    if (hasOwn(safeRaw, field) && safeRaw[field] !== undefined) {
+      if (safeRaw[field] === null) {
+        continue;
+      }
+      updated[field] = clonePlainJsonData(safeRaw[field]);
+    } else if (hasOwn(safeExisting, field) && safeExisting[field] !== undefined) {
+      updated[field] = clonePlainJsonData(safeExisting[field]);
+    }
+  }
+
+  updated.createdAt = safeExisting.createdAt;
+  updated.updatedAt = ensureMonotonicIsoTimestamp(safeExisting.createdAt, serverNow);
+  return updated;
 }
 
 const server = http.createServer(async (req, res) => {
@@ -7305,6 +7666,1234 @@ const server = http.createServer(async (req, res) => {
       );
     }
 
+    // 7. GET /api/cms/seo - Read full SEO configuration (defaults + all page overrides)
+    if (req.method === 'GET' && pathname === '/api/cms/seo') {
+      const session = requireAuth(req, res);
+      if (!session) return;
+
+      try {
+        let lockedSeo = null;
+        let lockedETag = null;
+
+        await executeTransaction(
+          [{ type: 'readJson', fileName: 'seo.json' }],
+          {
+            precondition: async (snapshotAccessor) => {
+              const seoSnap = snapshotAccessor.get('seo.json');
+              if (!seoSnap || !seoSnap.existed) {
+                const err = new Error('SEO store is unavailable');
+                err.code = 'STORE_INTEGRITY_UNAVAILABLE';
+                throw err;
+              }
+              const seo = snapshotAccessor.getJson('seo.json');
+              const valResult = validateSeoConfig(seo);
+              if (!valResult.isValid) {
+                const err = new Error('SEO store failed schema validation');
+                err.code = 'STORE_INTEGRITY_UNAVAILABLE';
+                throw err;
+              }
+              lockedSeo = sanitizeSeoConfigForResponse(seo);
+              lockedETag = computeSeoConfigETag(seo);
+            },
+          }
+        );
+
+        if (!lockedSeo || !lockedETag) {
+          return sendInternalError(res, 'SEO configuration store is unavailable');
+        }
+
+        res.writeHead(200, {
+          'Content-Type': 'application/json; charset=utf-8',
+          'Cache-Control': 'no-store',
+          'X-Content-Type-Options': 'nosniff',
+          ETag: lockedETag,
+        });
+        return res.end(
+          JSON.stringify({
+            success: true,
+            seo: lockedSeo,
+          })
+        );
+      } catch (err) {
+        console.error('[CMS Server] Failed to read SEO configuration:', err?.code || 'STORE_READ_ERROR');
+        return sendInternalError(res, 'SEO configuration store is unavailable');
+      }
+    }
+
+    // 7a. GET /api/cms/seo/defaults - Read global SEO defaults
+    if (req.method === 'GET' && pathname === '/api/cms/seo/defaults') {
+      const session = requireAuth(req, res);
+      if (!session) return;
+
+      try {
+        let lockedDefaults = null;
+        let lockedETag = null;
+
+        await executeTransaction(
+          [{ type: 'readJson', fileName: 'seo.json' }],
+          {
+            precondition: async (snapshotAccessor) => {
+              const seoSnap = snapshotAccessor.get('seo.json');
+              if (!seoSnap || !seoSnap.existed) {
+                const err = new Error('SEO store is unavailable');
+                err.code = 'STORE_INTEGRITY_UNAVAILABLE';
+                throw err;
+              }
+              const seo = snapshotAccessor.getJson('seo.json');
+              const valResult = validateSeoConfig(seo);
+              if (!valResult.isValid) {
+                const err = new Error('SEO store failed schema validation');
+                err.code = 'STORE_INTEGRITY_UNAVAILABLE';
+                throw err;
+              }
+              lockedDefaults = sanitizeSeoDefaultsForResponse(seo.defaults);
+              lockedETag = computeSeoDefaultsETag(seo.defaults);
+            },
+          }
+        );
+
+        if (!lockedDefaults || !lockedETag) {
+          return sendInternalError(res, 'SEO configuration store is unavailable');
+        }
+
+        res.writeHead(200, {
+          'Content-Type': 'application/json; charset=utf-8',
+          'Cache-Control': 'no-store',
+          'X-Content-Type-Options': 'nosniff',
+          ETag: lockedETag,
+        });
+        return res.end(
+          JSON.stringify({
+            success: true,
+            defaults: lockedDefaults,
+            updatedAt: lockedDefaults.updatedAt,
+          })
+        );
+      } catch (err) {
+        console.error('[CMS Server] Failed to read SEO defaults:', err?.code || 'STORE_READ_ERROR');
+        return sendInternalError(res, 'SEO configuration store is unavailable');
+      }
+    }
+
+    // 7b. PUT /api/cms/seo/defaults - Update global SEO defaults with If-Match & Atomic Transaction
+    if (req.method === 'PUT' && rawRequestPath === '/api/cms/seo/defaults') {
+      const session = requireAuth(req, res);
+      if (!session) {
+        req.resume();
+        return;
+      }
+
+      if (!requireCsrf(req, res, session)) {
+        req.resume();
+        return;
+      }
+
+      const contentType = req.headers['content-type'];
+      const mediaType =
+        typeof contentType === 'string' ? contentType.split(';')[0].trim().toLowerCase() : '';
+      if (mediaType !== 'application/json') {
+        req.resume();
+        res.writeHead(415, {
+          'Content-Type': 'application/json; charset=utf-8',
+          'Cache-Control': 'no-store',
+          'X-Content-Type-Options': 'nosniff',
+        });
+        return res.end(
+          JSON.stringify({
+            error: 'Unsupported Media Type',
+            message: 'Content-Type must be application/json',
+          })
+        );
+      }
+
+      const bodyResult = await parseJsonBody(req, res, MAX_METADATA_BODY);
+      if (!bodyResult.ok) return;
+
+      const body = bodyResult.data;
+
+      const ifMatch = parseIfMatch(req);
+      if (ifMatch.status === 'missing') {
+        return sendPreconditionRequired(res, ifMatch.error || 'If-Match header is required');
+      }
+      if (ifMatch.status === 'invalid') {
+        return sendBadRequest(res, ifMatch.error || 'Invalid If-Match header');
+      }
+
+      const protoKey = findPrototypePollutionKey(body);
+      if (protoKey) {
+        return sendBadRequest(res, `Forbidden prototype pollution key: "${protoKey}"`);
+      }
+
+      if (!isPlainJsonObject(body)) {
+        return sendBadRequest(res, 'Request body must be a JSON object');
+      }
+
+      for (const key of Object.getOwnPropertyNames(body)) {
+        if (key !== 'defaults') {
+          return sendBadRequest(res, `Unknown or forbidden field in request body: "${key}"`);
+        }
+      }
+
+      if (!Object.prototype.hasOwnProperty.call(body, 'defaults')) {
+        return sendBadRequest(res, 'Missing required field: "defaults"');
+      }
+
+      const rawDefaults = body.defaults;
+      if (!isPlainJsonObject(rawDefaults)) {
+        return sendBadRequest(res, '"defaults" must be a JSON object');
+      }
+
+      const suppliedKeys = Object.getOwnPropertyNames(rawDefaults);
+      if (suppliedKeys.length === 0) {
+        return sendBadRequest(res, 'At least one SEO default field must be provided for update');
+      }
+
+      for (const key of suppliedKeys) {
+        if (PROTO_POLLUTION_KEYS.has(key)) {
+          return sendBadRequest(res, `Forbidden prototype pollution key: "${key}"`);
+        }
+        if (key === 'updatedAt') {
+          return sendBadRequest(res, 'updatedAt is server-managed and cannot be provided in CMS input');
+        }
+        if (!ALLOWED_SEO_DEFAULTS_SET.has(key)) {
+          return sendBadRequest(res, `Unknown SEO defaults field: "${key}"`);
+        }
+      }
+
+      let savedDefaults = null;
+      const testFailureIndex = getTestFailureIndex(req);
+
+      try {
+        await executeTransaction(
+          [
+            {
+              type: 'writeJson',
+              fileName: 'seo.json',
+              data: (existingSeo) => {
+                if (!isPlainJsonObject(existingSeo) || !validateSeoConfig(existingSeo).isValid) {
+                  const err = new Error('SEO store is invalid');
+                  err.code = 'STORE_INTEGRITY_UNAVAILABLE';
+                  throw err;
+                }
+
+                const currentETag = computeSeoDefaultsETag(existingSeo.defaults);
+                if (currentETag !== ifMatch.etag) {
+                  const err = new Error('If-Match ETag precondition failed');
+                  err.code = 'PRECONDITION_FAILED';
+                  throw err;
+                }
+
+                const serverNow = ensureMonotonicIsoTimestamp(
+                  existingSeo.updatedAt,
+                  new Date().toISOString()
+                );
+                const updatedDefaults = buildUpdatedSeoDefaults(
+                  existingSeo.defaults,
+                  rawDefaults,
+                  serverNow
+                );
+                const defaultsVal = validateSeoDefaults(updatedDefaults, { isCmsInput: false });
+                if (!defaultsVal.isValid) {
+                  const detail = (defaultsVal.errors || []).map((e) => e.message).join('; ');
+                  const err = new Error(detail || 'SEO defaults validation failed');
+                  err.code = 'SCHEMA_VALIDATION_FAILED';
+                  throw err;
+                }
+
+                const nextSeo = {
+                  version: existingSeo.version,
+                  updatedAt: updatedDefaults.updatedAt,
+                  defaults: updatedDefaults,
+                  pages: cloneSeoPagesMapPreservingOthers(existingSeo.pages),
+                };
+
+                const fullVal = validateSeoConfig(nextSeo);
+                if (!fullVal.isValid) {
+                  const detail = (fullVal.errors || []).map((e) => e.message).join('; ');
+                  const err = new Error(detail || 'SEO configuration validation failed');
+                  err.code = 'SCHEMA_VALIDATION_FAILED';
+                  throw err;
+                }
+
+                savedDefaults = updatedDefaults;
+                return nextSeo;
+              },
+            },
+          ],
+          {
+            ...(testFailureIndex >= 0 ? { _simulateMutationFailureAtIndex: testFailureIndex } : {}),
+            precondition: async (snapshotAccessor) => {
+              const seoSnap = snapshotAccessor.get('seo.json');
+              if (!seoSnap || !seoSnap.existed) {
+                const err = new Error('SEO store is unavailable');
+                err.code = 'STORE_INTEGRITY_UNAVAILABLE';
+                throw err;
+              }
+              const existingSeo = snapshotAccessor.getJson('seo.json');
+              if (!isPlainJsonObject(existingSeo) || !validateSeoConfig(existingSeo).isValid) {
+                const err = new Error('SEO store is invalid');
+                err.code = 'STORE_INTEGRITY_UNAVAILABLE';
+                throw err;
+              }
+              const currentETag = computeSeoDefaultsETag(existingSeo.defaults);
+              if (currentETag !== ifMatch.etag) {
+                const err = new Error('If-Match ETag precondition failed');
+                err.code = 'PRECONDITION_FAILED';
+                throw err;
+              }
+              const serverNow = ensureMonotonicIsoTimestamp(
+                existingSeo.updatedAt,
+                new Date().toISOString()
+              );
+              const candidateDefaults = buildUpdatedSeoDefaults(
+                existingSeo.defaults,
+                rawDefaults,
+                serverNow
+              );
+              const defaultsVal = validateSeoDefaults(candidateDefaults, { isCmsInput: false });
+              if (!defaultsVal.isValid) {
+                const detail = (defaultsVal.errors || []).map((e) => e.message).join('; ');
+                const err = new Error(detail || 'SEO defaults validation failed');
+                err.code = 'SCHEMA_VALIDATION_FAILED';
+                throw err;
+              }
+            },
+          }
+        );
+      } catch (err) {
+        const code = err.code || err.originalError?.code;
+        if (code === 'PRECONDITION_FAILED') {
+          return sendPreconditionFailed(res, 'Precondition failed: ETag mismatch');
+        }
+        if (code === 'SCHEMA_VALIDATION_FAILED') {
+          const detailMessage = sanitizeErrorMessage(
+            err?.originalError?.message || err?.message || 'SEO defaults validation failed'
+          );
+          return sendBadRequest(res, detailMessage);
+        }
+        console.error('[CMS Server] Failed to update SEO defaults:', err?.code || 'STORE_WRITE_ERROR');
+        return sendInternalError(res, 'Failed to update SEO defaults');
+      }
+
+      if (!savedDefaults) {
+        return sendInternalError(res, 'Failed to update SEO defaults');
+      }
+
+      const sanitizedDefaults = sanitizeSeoDefaultsForResponse(savedDefaults);
+      const newETag = computeSeoDefaultsETag(savedDefaults);
+
+      res.writeHead(200, {
+        'Content-Type': 'application/json; charset=utf-8',
+        'Cache-Control': 'no-store',
+        'X-Content-Type-Options': 'nosniff',
+        ETag: newETag,
+      });
+      return res.end(
+        JSON.stringify({
+          success: true,
+          defaults: sanitizedDefaults,
+          updatedAt: sanitizedDefaults.updatedAt,
+        })
+      );
+    }
+
+    // 7c. GET /api/cms/seo/resolve?path=/... - Resolve effective SEO for a normalized path
+    if (req.method === 'GET' && pathname === '/api/cms/seo/resolve') {
+      const session = requireAuth(req, res);
+      if (!session) return;
+
+      for (const qKey of url.searchParams.keys()) {
+        if (qKey !== 'path') {
+          return sendBadRequest(res, `Unsupported query parameter: "${qKey}"`);
+        }
+      }
+
+      const rawPathParam = url.searchParams.get('path');
+      if (rawPathParam === null || !rawPathParam.trim() || !isValidSeoPagePath(rawPathParam)) {
+        return sendBadRequest(
+          res,
+          'Query parameter "path" must be a valid site path starting with "/"'
+        );
+      }
+
+      const normalizedPath = normalizeSeoPagePath(rawPathParam);
+
+      try {
+        let matchedPage = null;
+        let resolvedEffective = null;
+        let lockedETag = null;
+
+        await executeTransaction(
+          [{ type: 'readJson', fileName: 'seo.json' }],
+          {
+            precondition: async (snapshotAccessor) => {
+              const seoSnap = snapshotAccessor.get('seo.json');
+              if (!seoSnap || !seoSnap.existed) {
+                const err = new Error('SEO store is unavailable');
+                err.code = 'STORE_INTEGRITY_UNAVAILABLE';
+                throw err;
+              }
+              const seo = snapshotAccessor.getJson('seo.json');
+              const valResult = validateSeoConfig(seo);
+              if (!valResult.isValid) {
+                const err = new Error('SEO store failed schema validation');
+                err.code = 'STORE_INTEGRITY_UNAVAILABLE';
+                throw err;
+              }
+
+              for (const record of Object.values(seo.pages || {})) {
+                if (record && normalizeSeoPagePath(record.path) === normalizedPath) {
+                  matchedPage = sanitizeSeoPageForResponse(record);
+                  break;
+                }
+              }
+
+              resolvedEffective = resolveEffectiveSeo(matchedPage, seo.defaults, normalizedPath);
+              lockedETag = matchedPage
+                ? computeSeoPageETag(matchedPage)
+                : computeSeoDefaultsETag(seo.defaults);
+            },
+          }
+        );
+
+        if (!resolvedEffective || !lockedETag) {
+          return sendInternalError(res, 'SEO configuration store is unavailable');
+        }
+
+        res.writeHead(200, {
+          'Content-Type': 'application/json; charset=utf-8',
+          'Cache-Control': 'no-store',
+          'X-Content-Type-Options': 'nosniff',
+          ETag: lockedETag,
+        });
+        return res.end(
+          JSON.stringify({
+            success: true,
+            path: normalizedPath,
+            matched: Boolean(matchedPage),
+            page: matchedPage,
+            effective: resolvedEffective,
+          })
+        );
+      } catch (err) {
+        console.error('[CMS Server] Failed to resolve SEO metadata:', err?.code || 'STORE_READ_ERROR');
+        return sendInternalError(res, 'SEO configuration store is unavailable');
+      }
+    }
+
+    // 7d. GET /api/cms/seo/pages - List page SEO records with optional validated filters
+    if (req.method === 'GET' && pathname === '/api/cms/seo/pages') {
+      const session = requireAuth(req, res);
+      if (!session) return;
+
+      for (const qKey of url.searchParams.keys()) {
+        if (qKey !== 'pageType' && qKey !== 'path') {
+          return sendBadRequest(res, `Unsupported query parameter: "${qKey}"`);
+        }
+      }
+
+      const filterPageType = url.searchParams.get('pageType');
+      if (filterPageType !== null && !ALLOWED_SEO_PAGE_TYPES.includes(filterPageType)) {
+        return sendBadRequest(
+          res,
+          `Invalid pageType filter. Must be one of: ${ALLOWED_SEO_PAGE_TYPES.join(', ')}`
+        );
+      }
+
+      const filterPathRaw = url.searchParams.get('path');
+      let filterPathNormalized = null;
+      if (filterPathRaw !== null) {
+        if (!isValidSeoPagePath(filterPathRaw)) {
+          return sendBadRequest(res, 'Invalid "path" query filter');
+        }
+        filterPathNormalized = normalizeSeoPagePath(filterPathRaw);
+      }
+
+      try {
+        let lockedPages = null;
+        let lockedETag = null;
+
+        await executeTransaction(
+          [{ type: 'readJson', fileName: 'seo.json' }],
+          {
+            precondition: async (snapshotAccessor) => {
+              const seoSnap = snapshotAccessor.get('seo.json');
+              if (!seoSnap || !seoSnap.existed) {
+                const err = new Error('SEO store is unavailable');
+                err.code = 'STORE_INTEGRITY_UNAVAILABLE';
+                throw err;
+              }
+              const seo = snapshotAccessor.getJson('seo.json');
+              const valResult = validateSeoConfig(seo);
+              if (!valResult.isValid) {
+                const err = new Error('SEO store failed schema validation');
+                err.code = 'STORE_INTEGRITY_UNAVAILABLE';
+                throw err;
+              }
+
+              const list = [];
+              for (const key of Object.keys(seo.pages || {}).sort()) {
+                const rec = seo.pages[key];
+                if (filterPageType !== null && rec.pageType !== filterPageType) continue;
+                if (
+                  filterPathNormalized !== null &&
+                  normalizeSeoPagePath(rec.path) !== filterPathNormalized
+                ) {
+                  continue;
+                }
+                list.push(sanitizeSeoPageForResponse(rec));
+              }
+              lockedPages = list;
+              lockedETag = computeSeoConfigETag(seo);
+            },
+          }
+        );
+
+        if (!lockedPages || !lockedETag) {
+          return sendInternalError(res, 'SEO configuration store is unavailable');
+        }
+
+        res.writeHead(200, {
+          'Content-Type': 'application/json; charset=utf-8',
+          'Cache-Control': 'no-store',
+          'X-Content-Type-Options': 'nosniff',
+          ETag: lockedETag,
+        });
+        return res.end(
+          JSON.stringify({
+            success: true,
+            pages: lockedPages,
+            total: lockedPages.length,
+          })
+        );
+      } catch (err) {
+        console.error('[CMS Server] Failed to list SEO pages:', err?.code || 'STORE_READ_ERROR');
+        return sendInternalError(res, 'SEO configuration store is unavailable');
+      }
+    }
+
+    // 7e. POST /api/cms/seo/pages - Create a new page-level SEO record
+    if (req.method === 'POST' && rawRequestPath === '/api/cms/seo/pages') {
+      const session = requireAuth(req, res);
+      if (!session) {
+        req.resume();
+        return;
+      }
+
+      if (!requireCsrf(req, res, session)) {
+        req.resume();
+        return;
+      }
+
+      const contentType = req.headers['content-type'];
+      const mediaType =
+        typeof contentType === 'string' ? contentType.split(';')[0].trim().toLowerCase() : '';
+      if (mediaType !== 'application/json') {
+        req.resume();
+        res.writeHead(415, {
+          'Content-Type': 'application/json; charset=utf-8',
+          'Cache-Control': 'no-store',
+          'X-Content-Type-Options': 'nosniff',
+        });
+        return res.end(
+          JSON.stringify({
+            error: 'Unsupported Media Type',
+            message: 'Content-Type must be application/json',
+          })
+        );
+      }
+
+      const bodyResult = await parseJsonBody(req, res, MAX_METADATA_BODY);
+      if (!bodyResult.ok) return;
+
+      const body = bodyResult.data;
+
+      const protoKey = findPrototypePollutionKey(body);
+      if (protoKey) {
+        return sendBadRequest(res, `Forbidden prototype pollution key: "${protoKey}"`);
+      }
+
+      if (!isPlainJsonObject(body)) {
+        return sendBadRequest(res, 'Request body must be a JSON object');
+      }
+
+      for (const key of Object.getOwnPropertyNames(body)) {
+        if (key !== 'page') {
+          return sendBadRequest(res, `Unknown or forbidden field in request body: "${key}"`);
+        }
+      }
+
+      if (!Object.prototype.hasOwnProperty.call(body, 'page')) {
+        return sendBadRequest(res, 'Missing required field: "page"');
+      }
+
+      const rawPage = body.page;
+      const inputCheck = validateSeoPageRecord(rawPage, { isCmsInput: true });
+      if (!inputCheck.isValid) {
+        const detail = (inputCheck.errors || []).map((e) => e.message).join('; ');
+        return sendBadRequest(res, detail || 'Invalid SEO page payload');
+      }
+
+      let savedPage = null;
+      let savedDefaults = null;
+      const testFailureIndex = getTestFailureIndex(req);
+
+      try {
+        await executeTransaction(
+          [
+            {
+              type: 'writeJson',
+              fileName: 'seo.json',
+              data: (existingSeo) => {
+                if (!isPlainJsonObject(existingSeo) || !validateSeoConfig(existingSeo).isValid) {
+                  const err = new Error('SEO store is invalid');
+                  err.code = 'STORE_INTEGRITY_UNAVAILABLE';
+                  throw err;
+                }
+
+                const existingPages = existingSeo.pages || {};
+                if (Object.prototype.hasOwnProperty.call(existingPages, rawPage.pageId)) {
+                  const err = new Error(`SEO page already exists for pageId "${rawPage.pageId}"`);
+                  err.code = 'DUPLICATE_PAGE_ID';
+                  throw err;
+                }
+
+                const existingKeys = Object.keys(existingPages);
+                if (existingKeys.length >= MAX_SEO_PAGES) {
+                  const err = new Error(`Maximum limit of ${MAX_SEO_PAGES} SEO page records reached`);
+                  err.code = 'SCHEMA_VALIDATION_FAILED';
+                  throw err;
+                }
+
+                const normalizedTargetPath = normalizeSeoPagePath(rawPage.path);
+                for (const [otherId, otherRec] of Object.entries(existingPages)) {
+                  if (otherRec && normalizeSeoPagePath(otherRec.path) === normalizedTargetPath) {
+                    const err = new Error(
+                      `SEO path "${normalizedTargetPath}" is already assigned to pageId "${otherId}"`
+                    );
+                    err.code = 'DUPLICATE_PATH';
+                    throw err;
+                  }
+                }
+
+                const serverNow = ensureMonotonicIsoTimestamp(
+                  existingSeo.updatedAt,
+                  new Date().toISOString()
+                );
+                const createdPage = buildCreatedSeoPage(rawPage, serverNow);
+                const recordVal = validateSeoPageRecord(createdPage, { isCmsInput: false });
+                if (!recordVal.isValid) {
+                  const detail = (recordVal.errors || []).map((e) => e.message).join('; ');
+                  const err = new Error(detail || 'Invalid SEO page record');
+                  err.code = 'SCHEMA_VALIDATION_FAILED';
+                  throw err;
+                }
+
+                const nextPages = cloneSeoPagesMapPreservingOthers(existingPages);
+                nextPages[createdPage.pageId] = createdPage;
+
+                const nextSeo = {
+                  version: existingSeo.version,
+                  updatedAt: createdPage.updatedAt,
+                  defaults: sanitizeSeoDefaultsForResponse(existingSeo.defaults),
+                  pages: nextPages,
+                };
+
+                const fullVal = validateSeoConfig(nextSeo);
+                if (!fullVal.isValid) {
+                  const detail = (fullVal.errors || []).map((e) => e.message).join('; ');
+                  const err = new Error(detail || 'SEO configuration validation failed');
+                  err.code = 'SCHEMA_VALIDATION_FAILED';
+                  throw err;
+                }
+
+                savedPage = createdPage;
+                savedDefaults = nextSeo.defaults;
+                return nextSeo;
+              },
+            },
+          ],
+          {
+            ...(testFailureIndex >= 0 ? { _simulateMutationFailureAtIndex: testFailureIndex } : {}),
+            precondition: async (snapshotAccessor) => {
+              const seoSnap = snapshotAccessor.get('seo.json');
+              if (!seoSnap || !seoSnap.existed) {
+                const err = new Error('SEO store is unavailable');
+                err.code = 'STORE_INTEGRITY_UNAVAILABLE';
+                throw err;
+              }
+              const existingSeo = snapshotAccessor.getJson('seo.json');
+              if (!isPlainJsonObject(existingSeo) || !validateSeoConfig(existingSeo).isValid) {
+                const err = new Error('SEO store is invalid');
+                err.code = 'STORE_INTEGRITY_UNAVAILABLE';
+                throw err;
+              }
+              const existingPages = existingSeo.pages || {};
+              if (Object.prototype.hasOwnProperty.call(existingPages, rawPage.pageId)) {
+                const err = new Error(`SEO page already exists for pageId "${rawPage.pageId}"`);
+                err.code = 'DUPLICATE_PAGE_ID';
+                throw err;
+              }
+              const normalizedTargetPath = normalizeSeoPagePath(rawPage.path);
+              for (const [otherId, otherRec] of Object.entries(existingPages)) {
+                if (otherRec && normalizeSeoPagePath(otherRec.path) === normalizedTargetPath) {
+                  const err = new Error(
+                    `SEO path "${normalizedTargetPath}" is already assigned to pageId "${otherId}"`
+                  );
+                  err.code = 'DUPLICATE_PATH';
+                  throw err;
+                }
+              }
+            },
+          }
+        );
+      } catch (err) {
+        const code = err.code || err.originalError?.code;
+        if (code === 'DUPLICATE_PAGE_ID' || code === 'DUPLICATE_PATH') {
+          return sendConflict(res, err?.originalError?.message || err?.message || 'SEO page conflict');
+        }
+        if (code === 'SCHEMA_VALIDATION_FAILED') {
+          return sendBadRequest(res, err?.originalError?.message || err?.message || 'Invalid SEO page payload');
+        }
+        console.error('[CMS Server] Failed to create SEO page:', err?.code || 'STORE_WRITE_ERROR');
+        return sendInternalError(res, 'Failed to create SEO page record');
+      }
+
+      if (!savedPage || !savedDefaults) {
+        return sendInternalError(res, 'Failed to create SEO page record');
+      }
+
+      const sanitizedPage = sanitizeSeoPageForResponse(savedPage);
+      const newETag = computeSeoPageETag(savedPage);
+      const effective = resolveEffectiveSeo(savedPage, savedDefaults, savedPage.path);
+
+      res.writeHead(201, {
+        'Content-Type': 'application/json; charset=utf-8',
+        'Cache-Control': 'no-store',
+        'X-Content-Type-Options': 'nosniff',
+        Location: `/api/cms/seo/pages/${savedPage.pageId}`,
+        ETag: newETag,
+      });
+      return res.end(
+        JSON.stringify({
+          success: true,
+          page: sanitizedPage,
+          effective,
+        })
+      );
+    }
+
+    // 7f. GET /api/cms/seo/pages/:pageId - Read a single page SEO record
+    if (req.method === 'GET' && rawRequestPath.startsWith(SEO_PAGE_ROUTE_PREFIX)) {
+      const session = requireAuth(req, res);
+      if (!session) return;
+
+      const pathResult = parseSeoPagePath(rawRequestPath);
+      if (pathResult.status === 'not_found') {
+        return sendNotFound(res);
+      }
+      if (!pathResult.valid || !pathResult.pageId) {
+        return sendBadRequest(res, pathResult.error || 'Invalid SEO pageId');
+      }
+
+      const pageId = pathResult.pageId;
+
+      try {
+        let lockedPage = null;
+        let lockedEffective = null;
+        let lockedETag = null;
+
+        await executeTransaction(
+          [{ type: 'readJson', fileName: 'seo.json' }],
+          {
+            precondition: async (snapshotAccessor) => {
+              const seoSnap = snapshotAccessor.get('seo.json');
+              if (!seoSnap || !seoSnap.existed) {
+                const err = new Error('SEO store is unavailable');
+                err.code = 'STORE_INTEGRITY_UNAVAILABLE';
+                throw err;
+              }
+              const seo = snapshotAccessor.getJson('seo.json');
+              const valResult = validateSeoConfig(seo);
+              if (!valResult.isValid) {
+                const err = new Error('SEO store failed schema validation');
+                err.code = 'STORE_INTEGRITY_UNAVAILABLE';
+                throw err;
+              }
+              const found =
+                seo.pages && Object.prototype.hasOwnProperty.call(seo.pages, pageId)
+                  ? seo.pages[pageId]
+                  : null;
+              if (!found) {
+                const err = new Error('SEO page not found');
+                err.code = 'PAGE_NOT_FOUND';
+                throw err;
+              }
+              lockedPage = sanitizeSeoPageForResponse(found);
+              lockedEffective = resolveEffectiveSeo(found, seo.defaults, found.path);
+              lockedETag = computeSeoPageETag(found);
+            },
+          }
+        );
+
+        if (!lockedPage || !lockedEffective || !lockedETag) {
+          return sendInternalError(res, 'SEO configuration store is unavailable');
+        }
+
+        res.writeHead(200, {
+          'Content-Type': 'application/json; charset=utf-8',
+          'Cache-Control': 'no-store',
+          'X-Content-Type-Options': 'nosniff',
+          ETag: lockedETag,
+        });
+        return res.end(
+          JSON.stringify({
+            success: true,
+            page: lockedPage,
+            effective: lockedEffective,
+          })
+        );
+      } catch (err) {
+        const code = err.code || err.originalError?.code;
+        if (code === 'PAGE_NOT_FOUND') {
+          return sendNotFound(res, 'SEO page record not found');
+        }
+        console.error('[CMS Server] Failed to read SEO page:', err?.code || 'STORE_READ_ERROR');
+        return sendInternalError(res, 'SEO configuration store is unavailable');
+      }
+    }
+
+    // 7g. PUT /api/cms/seo/pages/:pageId - Update a single page SEO record (isolated from all other pages)
+    if (req.method === 'PUT' && rawRequestPath.startsWith(SEO_PAGE_ROUTE_PREFIX)) {
+      const session = requireAuth(req, res);
+      if (!session) {
+        req.resume();
+        return;
+      }
+
+      if (!requireCsrf(req, res, session)) {
+        req.resume();
+        return;
+      }
+
+      const pathResult = parseSeoPagePath(rawRequestPath);
+      if (pathResult.status === 'not_found') {
+        req.resume();
+        return sendNotFound(res);
+      }
+      if (!pathResult.valid || !pathResult.pageId) {
+        req.resume();
+        return sendBadRequest(res, pathResult.error || 'Invalid SEO pageId');
+      }
+
+      const pageId = pathResult.pageId;
+
+      const contentType = req.headers['content-type'];
+      const mediaType =
+        typeof contentType === 'string' ? contentType.split(';')[0].trim().toLowerCase() : '';
+      if (mediaType !== 'application/json') {
+        req.resume();
+        res.writeHead(415, {
+          'Content-Type': 'application/json; charset=utf-8',
+          'Cache-Control': 'no-store',
+          'X-Content-Type-Options': 'nosniff',
+        });
+        return res.end(
+          JSON.stringify({
+            error: 'Unsupported Media Type',
+            message: 'Content-Type must be application/json',
+          })
+        );
+      }
+
+      const bodyResult = await parseJsonBody(req, res, MAX_METADATA_BODY);
+      if (!bodyResult.ok) return;
+
+      const body = bodyResult.data;
+
+      const ifMatch = parseIfMatch(req);
+      if (ifMatch.status === 'missing') {
+        return sendPreconditionRequired(res, ifMatch.error || 'If-Match header is required');
+      }
+      if (ifMatch.status === 'invalid') {
+        return sendBadRequest(res, ifMatch.error || 'Invalid If-Match header');
+      }
+
+      const protoKey = findPrototypePollutionKey(body);
+      if (protoKey) {
+        return sendBadRequest(res, `Forbidden prototype pollution key: "${protoKey}"`);
+      }
+
+      if (!isPlainJsonObject(body)) {
+        return sendBadRequest(res, 'Request body must be a JSON object');
+      }
+
+      for (const key of Object.getOwnPropertyNames(body)) {
+        if (key !== 'page') {
+          return sendBadRequest(res, `Unknown or forbidden field in request body: "${key}"`);
+        }
+      }
+
+      if (!Object.prototype.hasOwnProperty.call(body, 'page')) {
+        return sendBadRequest(res, 'Missing required field: "page"');
+      }
+
+      const rawPage = body.page;
+      if (!isPlainJsonObject(rawPage)) {
+        return sendBadRequest(res, '"page" must be a JSON object');
+      }
+
+      const suppliedKeys = Object.getOwnPropertyNames(rawPage);
+      const updatableKeys = suppliedKeys.filter((k) => k !== 'pageId');
+      if (updatableKeys.length === 0) {
+        return sendBadRequest(res, 'At least one SEO page field must be provided for update');
+      }
+
+      for (const key of suppliedKeys) {
+        if (PROTO_POLLUTION_KEYS.has(key)) {
+          return sendBadRequest(res, `Forbidden prototype pollution key: "${key}"`);
+        }
+        if (key === 'createdAt' || key === 'updatedAt') {
+          return sendBadRequest(res, `${key} is server-generated and cannot be provided in CMS input`);
+        }
+        if (!ALLOWED_SEO_PAGE_SET.has(key)) {
+          return sendBadRequest(res, `Unknown page SEO field: "${key}"`);
+        }
+      }
+
+      if (
+        Object.prototype.hasOwnProperty.call(rawPage, 'pageId') &&
+        rawPage.pageId !== undefined &&
+        rawPage.pageId !== pageId
+      ) {
+        return sendBadRequest(res, 'pageId in request body does not match route parameter');
+      }
+
+      let savedPage = null;
+      let savedDefaults = null;
+      const testFailureIndex = getTestFailureIndex(req);
+
+      try {
+        await executeTransaction(
+          [
+            {
+              type: 'writeJson',
+              fileName: 'seo.json',
+              data: (existingSeo) => {
+                if (!isPlainJsonObject(existingSeo) || !validateSeoConfig(existingSeo).isValid) {
+                  const err = new Error('SEO store is invalid');
+                  err.code = 'STORE_INTEGRITY_UNAVAILABLE';
+                  throw err;
+                }
+
+                const existingPages = existingSeo.pages || {};
+                if (!Object.prototype.hasOwnProperty.call(existingPages, pageId)) {
+                  const err = new Error('SEO page not found');
+                  err.code = 'PAGE_NOT_FOUND';
+                  throw err;
+                }
+
+                const existingPage = existingPages[pageId];
+                const currentETag = computeSeoPageETag(existingPage);
+                if (currentETag !== ifMatch.etag) {
+                  const err = new Error('If-Match ETag precondition failed');
+                  err.code = 'PRECONDITION_FAILED';
+                  throw err;
+                }
+
+                const serverNow = ensureMonotonicIsoTimestamp(
+                  existingPage.createdAt,
+                  ensureMonotonicIsoTimestamp(existingSeo.updatedAt, new Date().toISOString())
+                );
+                const updatedPage = buildUpdatedSeoPage(existingPage, rawPage, serverNow);
+                const pageVal = validateSeoPageRecord(updatedPage, { isCmsInput: false });
+                if (!pageVal.isValid) {
+                  const detail = (pageVal.errors || []).map((e) => e.message).join('; ');
+                  const err = new Error(detail || 'SEO page validation failed');
+                  err.code = 'SCHEMA_VALIDATION_FAILED';
+                  throw err;
+                }
+
+                const normalizedTargetPath = normalizeSeoPagePath(updatedPage.path);
+                for (const [otherId, otherRec] of Object.entries(existingPages)) {
+                  if (otherId === pageId) continue;
+                  if (otherRec && normalizeSeoPagePath(otherRec.path) === normalizedTargetPath) {
+                    const err = new Error(
+                      `SEO path "${normalizedTargetPath}" is already assigned to pageId "${otherId}"`
+                    );
+                    err.code = 'DUPLICATE_PATH';
+                    throw err;
+                  }
+                }
+
+                const nextPages = cloneSeoPagesMapPreservingOthers(existingPages, pageId);
+                nextPages[pageId] = updatedPage;
+
+                const nextSeo = {
+                  version: existingSeo.version,
+                  updatedAt: updatedPage.updatedAt,
+                  defaults: sanitizeSeoDefaultsForResponse(existingSeo.defaults),
+                  pages: nextPages,
+                };
+
+                const fullVal = validateSeoConfig(nextSeo);
+                if (!fullVal.isValid) {
+                  const detail = (fullVal.errors || []).map((e) => e.message).join('; ');
+                  const err = new Error(detail || 'SEO configuration validation failed');
+                  err.code = 'SCHEMA_VALIDATION_FAILED';
+                  throw err;
+                }
+
+                savedPage = updatedPage;
+                savedDefaults = nextSeo.defaults;
+                return nextSeo;
+              },
+            },
+          ],
+          {
+            ...(testFailureIndex >= 0 ? { _simulateMutationFailureAtIndex: testFailureIndex } : {}),
+            precondition: async (snapshotAccessor) => {
+              const seoSnap = snapshotAccessor.get('seo.json');
+              if (!seoSnap || !seoSnap.existed) {
+                const err = new Error('SEO store is unavailable');
+                err.code = 'STORE_INTEGRITY_UNAVAILABLE';
+                throw err;
+              }
+              const existingSeo = snapshotAccessor.getJson('seo.json');
+              if (!isPlainJsonObject(existingSeo) || !validateSeoConfig(existingSeo).isValid) {
+                const err = new Error('SEO store is invalid');
+                err.code = 'STORE_INTEGRITY_UNAVAILABLE';
+                throw err;
+              }
+              const existingPages = existingSeo.pages || {};
+              if (!Object.prototype.hasOwnProperty.call(existingPages, pageId)) {
+                const err = new Error('SEO page not found');
+                err.code = 'PAGE_NOT_FOUND';
+                throw err;
+              }
+              const existingPage = existingPages[pageId];
+              const currentETag = computeSeoPageETag(existingPage);
+              if (currentETag !== ifMatch.etag) {
+                const err = new Error('If-Match ETag precondition failed');
+                err.code = 'PRECONDITION_FAILED';
+                throw err;
+              }
+              const serverNow = ensureMonotonicIsoTimestamp(
+                existingPage.createdAt,
+                ensureMonotonicIsoTimestamp(existingSeo.updatedAt, new Date().toISOString())
+              );
+              const candidatePage = buildUpdatedSeoPage(existingPage, rawPage, serverNow);
+              const pageVal = validateSeoPageRecord(candidatePage, { isCmsInput: false });
+              if (!pageVal.isValid) {
+                const detail = (pageVal.errors || []).map((e) => e.message).join('; ');
+                const err = new Error(detail || 'SEO page validation failed');
+                err.code = 'SCHEMA_VALIDATION_FAILED';
+                throw err;
+              }
+              const normalizedTargetPath = normalizeSeoPagePath(candidatePage.path);
+              for (const [otherId, otherRec] of Object.entries(existingPages)) {
+                if (otherId === pageId) continue;
+                if (otherRec && normalizeSeoPagePath(otherRec.path) === normalizedTargetPath) {
+                  const err = new Error(
+                    `SEO path "${normalizedTargetPath}" is already assigned to pageId "${otherId}"`
+                  );
+                  err.code = 'DUPLICATE_PATH';
+                  throw err;
+                }
+              }
+            },
+          }
+        );
+      } catch (err) {
+        const code = err.code || err.originalError?.code;
+        if (code === 'PAGE_NOT_FOUND') {
+          return sendNotFound(res, 'SEO page record not found');
+        }
+        if (code === 'PRECONDITION_FAILED') {
+          return sendPreconditionFailed(res, 'Precondition failed: ETag mismatch');
+        }
+        if (code === 'DUPLICATE_PATH') {
+          return sendConflict(res, err?.originalError?.message || err?.message || 'SEO path conflict');
+        }
+        if (code === 'SCHEMA_VALIDATION_FAILED') {
+          return sendBadRequest(
+            res,
+            err?.originalError?.message || err?.message || 'SEO page validation failed'
+          );
+        }
+        console.error('[CMS Server] Failed to update SEO page:', err?.code || 'STORE_WRITE_ERROR');
+        return sendInternalError(res, 'Failed to update SEO page record');
+      }
+
+      if (!savedPage || !savedDefaults) {
+        return sendInternalError(res, 'Failed to update SEO page record');
+      }
+
+      const sanitizedPage = sanitizeSeoPageForResponse(savedPage);
+      const newETag = computeSeoPageETag(savedPage);
+      const effective = resolveEffectiveSeo(savedPage, savedDefaults, savedPage.path);
+
+      res.writeHead(200, {
+        'Content-Type': 'application/json; charset=utf-8',
+        'Cache-Control': 'no-store',
+        'X-Content-Type-Options': 'nosniff',
+        ETag: newETag,
+      });
+      return res.end(
+        JSON.stringify({
+          success: true,
+          page: sanitizedPage,
+          effective,
+        })
+      );
+    }
+
+    // 7h. DELETE /api/cms/seo/pages/:pageId - Delete a page-level SEO record
+    if (req.method === 'DELETE' && rawRequestPath.startsWith(SEO_PAGE_ROUTE_PREFIX)) {
+      const session = requireAuth(req, res);
+      if (!session) {
+        req.resume();
+        return;
+      }
+
+      if (!requireCsrf(req, res, session)) {
+        req.resume();
+        return;
+      }
+
+      const pathResult = parseSeoPagePath(rawRequestPath);
+      if (pathResult.status === 'not_found') {
+        req.resume();
+        return sendNotFound(res);
+      }
+      if (!pathResult.valid || !pathResult.pageId) {
+        req.resume();
+        return sendBadRequest(res, pathResult.error || 'Invalid SEO pageId');
+      }
+
+      const pageId = pathResult.pageId;
+
+      const bodyCheck = await readDeleteBody(req, res, MAX_AUTH_BODY);
+      if (!bodyCheck.ok) return;
+
+      const ifMatch = parseIfMatch(req);
+      if (ifMatch.status === 'missing') {
+        return sendPreconditionRequired(res, ifMatch.error || 'If-Match header is required');
+      }
+      if (ifMatch.status === 'invalid') {
+        return sendBadRequest(res, ifMatch.error || 'Invalid If-Match header');
+      }
+
+      const testFailureIndex = getTestFailureIndex(req);
+
+      try {
+        await executeTransaction(
+          [
+            {
+              type: 'writeJson',
+              fileName: 'seo.json',
+              data: (existingSeo) => {
+                if (!isPlainJsonObject(existingSeo) || !validateSeoConfig(existingSeo).isValid) {
+                  const err = new Error('SEO store is invalid');
+                  err.code = 'STORE_INTEGRITY_UNAVAILABLE';
+                  throw err;
+                }
+
+                const existingPages = existingSeo.pages || {};
+                if (!Object.prototype.hasOwnProperty.call(existingPages, pageId)) {
+                  const err = new Error('SEO page not found');
+                  err.code = 'PAGE_NOT_FOUND';
+                  throw err;
+                }
+
+                const existingPage = existingPages[pageId];
+                const currentETag = computeSeoPageETag(existingPage);
+                if (currentETag !== ifMatch.etag) {
+                  const err = new Error('If-Match ETag precondition failed');
+                  err.code = 'PRECONDITION_FAILED';
+                  throw err;
+                }
+
+                const serverNow = ensureMonotonicIsoTimestamp(
+                  existingSeo.updatedAt,
+                  new Date().toISOString()
+                );
+
+                const nextSeo = {
+                  version: existingSeo.version,
+                  updatedAt: serverNow,
+                  defaults: sanitizeSeoDefaultsForResponse(existingSeo.defaults),
+                  pages: cloneSeoPagesMapPreservingOthers(existingPages, pageId),
+                };
+
+                const fullVal = validateSeoConfig(nextSeo);
+                if (!fullVal.isValid) {
+                  const detail = (fullVal.errors || []).map((e) => e.message).join('; ');
+                  const err = new Error(detail || 'SEO configuration validation failed');
+                  err.code = 'SCHEMA_VALIDATION_FAILED';
+                  throw err;
+                }
+
+                return nextSeo;
+              },
+            },
+          ],
+          {
+            ...(testFailureIndex >= 0 ? { _simulateMutationFailureAtIndex: testFailureIndex } : {}),
+            precondition: async (snapshotAccessor) => {
+              const seoSnap = snapshotAccessor.get('seo.json');
+              if (!seoSnap || !seoSnap.existed) {
+                const err = new Error('SEO store is unavailable');
+                err.code = 'STORE_INTEGRITY_UNAVAILABLE';
+                throw err;
+              }
+              const existingSeo = snapshotAccessor.getJson('seo.json');
+              if (!isPlainJsonObject(existingSeo) || !validateSeoConfig(existingSeo).isValid) {
+                const err = new Error('SEO store is invalid');
+                err.code = 'STORE_INTEGRITY_UNAVAILABLE';
+                throw err;
+              }
+              const existingPages = existingSeo.pages || {};
+              if (!Object.prototype.hasOwnProperty.call(existingPages, pageId)) {
+                const err = new Error('SEO page not found');
+                err.code = 'PAGE_NOT_FOUND';
+                throw err;
+              }
+              const currentETag = computeSeoPageETag(existingPages[pageId]);
+              if (currentETag !== ifMatch.etag) {
+                const err = new Error('If-Match ETag precondition failed');
+                err.code = 'PRECONDITION_FAILED';
+                throw err;
+              }
+            },
+          }
+        );
+      } catch (err) {
+        const code = err.code || err.originalError?.code;
+        if (code === 'PAGE_NOT_FOUND') {
+          return sendNotFound(res, 'SEO page record not found');
+        }
+        if (code === 'PRECONDITION_FAILED') {
+          return sendPreconditionFailed(res, 'Precondition failed: ETag mismatch');
+        }
+        console.error('[CMS Server] Failed to delete SEO page:', err?.code || 'STORE_WRITE_ERROR');
+        return sendInternalError(res, 'Failed to delete SEO page record');
+      }
+
+      res.writeHead(200, {
+        'Content-Type': 'application/json; charset=utf-8',
+        'Cache-Control': 'no-store',
+        'X-Content-Type-Options': 'nosniff',
+      });
+      return res.end(
+        JSON.stringify({
+          success: true,
+          deleted: true,
+          pageId,
+        })
+      );
+    }
+
     // Return 404 for all other routes
     return sendNotFound(res);
   } catch (err) {
@@ -7318,6 +8907,24 @@ const server = http.createServer(async (req, res) => {
 server.on('error', (err) => {
   console.error('[CMS Server] Server error:', err?.message || 'Unknown server error');
 });
+
+if (process.env.AINOVEX_CMS_TEST_ROOT !== undefined) {
+  const rawTestRoot = String(process.env.AINOVEX_CMS_TEST_ROOT).trim();
+  if (!rawTestRoot) {
+    throw new Error('AINOVEX_CMS_TEST_ROOT cannot be empty');
+  }
+  const resolvedTmpDir = fs.realpathSync(os.tmpdir());
+  const tmpPrefix = resolvedTmpDir.endsWith(path.sep) ? resolvedTmpDir : resolvedTmpDir + path.sep;
+  const resolvedTestRoot = path.resolve(rawTestRoot);
+  const canonicalTestRoot = fs.existsSync(resolvedTestRoot)
+    ? fs.realpathSync(resolvedTestRoot)
+    : resolvedTestRoot;
+  if (!canonicalTestRoot.startsWith(tmpPrefix) || canonicalTestRoot === resolvedTmpDir) {
+    throw new Error('AINOVEX_CMS_TEST_ROOT must resolve strictly inside the OS temporary directory');
+  }
+  defaultStorageEngine.projectRoot = canonicalTestRoot;
+  defaultStorageEngine.backupDir = path.join(canonicalTestRoot, '.backups');
+}
 
 // Generate startup OTP
 const startupOtp = generateOtp();
@@ -7400,12 +9007,286 @@ function resetAuthStateForTesting() {
 }
 
 /**
+ * Starts an HTTP server with scoped startup error/listening listeners.
+ * Removes the startup error listener once listening (or on synchronous throw)
+ * so repeated test start/stop cycles never leak or accumulate listeners.
+ */
+async function startServerForTesting(targetServer = server, port = PORT, host = HOST) {
+  if (targetServer.listening) {
+    return false;
+  }
+  await new Promise((resolve, reject) => {
+    let settled = false;
+    const onListening = () => {
+      if (settled) return;
+      settled = true;
+      targetServer.off('listening', onListening);
+      targetServer.off('error', onError);
+      resolve();
+    };
+    const onError = (err) => {
+      if (settled) return;
+      settled = true;
+      targetServer.off('listening', onListening);
+      targetServer.off('error', onError);
+      reject(err);
+    };
+    targetServer.on('listening', onListening);
+    targetServer.on('error', onError);
+    try {
+      targetServer.listen(port, host);
+    } catch (err) {
+      if (!settled) {
+        settled = true;
+        targetServer.off('listening', onListening);
+        targetServer.off('error', onError);
+        reject(err);
+      }
+    }
+  });
+  return true;
+}
+
+function isPathStrictlyInsideTempDir(targetPath) {
+  if (!targetPath || typeof targetPath !== 'string') return false;
+  const canonicalTmp = fs.realpathSync(os.tmpdir());
+  const tmpPrefix = canonicalTmp.endsWith(path.sep) ? canonicalTmp : canonicalTmp + path.sep;
+  const resolved = path.resolve(targetPath);
+  const canonicalTarget = fs.existsSync(resolved) ? fs.realpathSync(resolved) : resolved;
+  return canonicalTarget.startsWith(tmpPrefix) && canonicalTarget !== canonicalTmp;
+}
+
+async function captureRealContentSnapshot(realRoot) {
+  const canonicalRoot = path.resolve(realRoot);
+  const contentDir = path.join(canonicalRoot, 'content');
+  const articlesDir = path.join(contentDir, 'articles');
+  const backupDir = path.join(canonicalRoot, '.backups');
+
+  const trackedFiles = [
+    resolveSecureJsonPath('articles.json', canonicalRoot),
+    resolveSecureJsonPath('categories.json', canonicalRoot),
+    resolveSecureJsonPath('tools.json', canonicalRoot),
+    resolveSecureJsonPath('settings.json', canonicalRoot),
+    resolveSecureJsonPath('ads.json', canonicalRoot),
+    resolveSecureJsonPath('seo.json', canonicalRoot),
+  ];
+
+  if (fs.existsSync(articlesDir)) {
+    const mdEntries = await fs.promises.readdir(articlesDir);
+    for (const entry of mdEntries.sort()) {
+      if (entry.endsWith('.md')) {
+        trackedFiles.push(path.join(articlesDir, entry));
+      }
+    }
+  }
+
+  const files = await Promise.all(
+    trackedFiles.map(async (filePath) => {
+      const bytes = await fs.promises.readFile(filePath);
+      const stat = await fs.promises.stat(filePath);
+      return {
+        filePath,
+        sha256: crypto.createHash('sha256').update(bytes).digest('hex'),
+        size: bytes.length,
+        mtimeMs: stat.mtimeMs,
+      };
+    })
+  );
+
+  const backupsExisted = fs.existsSync(backupDir);
+  let backupEntries = [];
+  if (backupsExisted) {
+    const names = (await fs.promises.readdir(backupDir)).sort();
+    backupEntries = await Promise.all(
+      names.map(async (name) => {
+        const fullPath = path.join(backupDir, name);
+        const stat = await fs.promises.lstat(fullPath);
+        const bytes = stat.isFile() ? await fs.promises.readFile(fullPath) : Buffer.alloc(0);
+        return {
+          name,
+          size: stat.size,
+          mtimeMs: stat.mtimeMs,
+          sha256: crypto.createHash('sha256').update(bytes).digest('hex'),
+        };
+      })
+    );
+  }
+
+  return {
+    realRoot: canonicalRoot,
+    files,
+    backupsExisted,
+    backupEntries,
+  };
+}
+
+async function verifyRealContentSnapshot(snapshot) {
+  const contentDir = path.join(snapshot.realRoot, 'content');
+  const articlesDir = path.join(contentDir, 'articles');
+  const backupDir = path.join(snapshot.realRoot, '.backups');
+
+  const expectedMdSet = new Set(
+    snapshot.files
+      .filter((f) => path.dirname(f.filePath) === articlesDir)
+      .map((f) => path.basename(f.filePath))
+  );
+  const actualMdEntries = fs.existsSync(articlesDir)
+    ? (await fs.promises.readdir(articlesDir)).filter((e) => e.endsWith('.md')).sort()
+    : [];
+  const sameMdFileList =
+    actualMdEntries.length === expectedMdSet.size &&
+    actualMdEntries.every((name) => expectedMdSet.has(name));
+
+  let allFilesUnchanged = sameMdFileList;
+  const changedFiles = [];
+
+  for (const snap of snapshot.files) {
+    if (!fs.existsSync(snap.filePath)) {
+      allFilesUnchanged = false;
+      changedFiles.push(`${snap.filePath} (missing)`);
+      continue;
+    }
+    const bytesAfter = await fs.promises.readFile(snap.filePath);
+    const statAfter = await fs.promises.stat(snap.filePath);
+    const shaAfter = crypto.createHash('sha256').update(bytesAfter).digest('hex');
+    if (shaAfter !== snap.sha256 || statAfter.mtimeMs !== snap.mtimeMs) {
+      allFilesUnchanged = false;
+      changedFiles.push(snap.filePath);
+    }
+  }
+
+  const backupsExistsAfter = fs.existsSync(backupDir);
+  let backupsUnchanged = backupsExistsAfter === snapshot.backupsExisted;
+  if (backupsUnchanged && backupsExistsAfter) {
+    const namesAfter = (await fs.promises.readdir(backupDir)).sort();
+    if (namesAfter.length !== snapshot.backupEntries.length) {
+      backupsUnchanged = false;
+    } else {
+      for (let i = 0; i < namesAfter.length; i++) {
+        const prev = snapshot.backupEntries[i];
+        if (namesAfter[i] !== prev.name) {
+          backupsUnchanged = false;
+          break;
+        }
+        const fullPath = path.join(backupDir, namesAfter[i]);
+        const stat = await fs.promises.lstat(fullPath);
+        const bytes = stat.isFile() ? await fs.promises.readFile(fullPath) : Buffer.alloc(0);
+        const sha = crypto.createHash('sha256').update(bytes).digest('hex');
+        if (stat.size !== prev.size || stat.mtimeMs !== prev.mtimeMs || sha !== prev.sha256) {
+          backupsUnchanged = false;
+          break;
+        }
+      }
+    }
+  }
+
+  return {
+    ok: allFilesUnchanged && backupsUnchanged,
+    allFilesUnchanged,
+    backupsUnchanged,
+    changedFiles,
+  };
+}
+
+async function createIsolatedTestProjectRoot(prefix = 'ainovex-cms-test-', sourceRoot) {
+  if (!sourceRoot || typeof sourceRoot !== 'string') {
+    throw new Error('Explicit sourceRoot is required for isolated test project creation');
+  }
+  const canonicalSourceRoot = path.resolve(sourceRoot);
+  const sourceContentDir = path.join(canonicalSourceRoot, 'content');
+  if (!fs.existsSync(sourceContentDir)) {
+    throw new Error('Source content directory does not exist for test fixture isolation');
+  }
+
+  const rawTempRoot = await fs.promises.mkdtemp(path.join(os.tmpdir(), prefix));
+  const tempRoot = await fs.promises.realpath(rawTempRoot);
+  if (!isPathStrictlyInsideTempDir(tempRoot) || tempRoot === canonicalSourceRoot) {
+    try {
+      await fs.promises.rm(rawTempRoot, { recursive: true, force: true });
+    } catch {}
+    throw new Error('Refusing to initialize test root outside OS temporary directory');
+  }
+
+  const tempContentDir = path.join(tempRoot, 'content');
+  const tempArticlesDir = path.join(tempContentDir, 'articles');
+  const tempBackupDir = path.join(tempRoot, '.backups');
+
+  try {
+    await fs.promises.mkdir(tempArticlesDir, { recursive: true });
+
+    const requiredJsonFixtures = [
+      'articles.json',
+      'categories.json',
+      'tools.json',
+      'settings.json',
+      'ads.json',
+      'seo.json',
+    ];
+    for (const fileName of requiredJsonFixtures) {
+      const srcPath = resolveSecureJsonPath(fileName, canonicalSourceRoot);
+      const dstPath = path.join(tempContentDir, fileName);
+      await fs.promises.copyFile(srcPath, dstPath);
+    }
+
+    const sourceArticlesDir = path.join(sourceContentDir, 'articles');
+    if (fs.existsSync(sourceArticlesDir)) {
+      const entries = await fs.promises.readdir(sourceArticlesDir, { withFileTypes: true });
+      for (const entry of entries) {
+        if (entry.isFile() && entry.name.endsWith('.md')) {
+          await fs.promises.copyFile(
+            path.join(sourceArticlesDir, entry.name),
+            path.join(tempArticlesDir, entry.name)
+          );
+        }
+      }
+    }
+  } catch (err) {
+    try {
+      await fs.promises.rm(tempRoot, { recursive: true, force: true });
+    } catch {}
+    throw err;
+  }
+
+  const articleMdPath = (slug) => path.join(tempArticlesDir, `${slug}.md`);
+
+  const cleanup = async (restoreProjectRoot = null, restoreBackupDir = null) => {
+    if (restoreProjectRoot) {
+      defaultStorageEngine.projectRoot = restoreProjectRoot;
+    }
+    if (restoreBackupDir) {
+      defaultStorageEngine.backupDir = restoreBackupDir;
+    }
+    if (!isPathStrictlyInsideTempDir(tempRoot) || tempRoot === canonicalSourceRoot) {
+      throw new Error('Refusing to delete non-temporary directory during test cleanup');
+    }
+    await fs.promises.rm(tempRoot, { recursive: true, force: true });
+  };
+
+  return {
+    tempRoot,
+    tempContentDir,
+    tempArticlesDir,
+    tempBackupDir,
+    articlesJsonPath: path.join(tempContentDir, 'articles.json'),
+    categoriesJsonPath: path.join(tempContentDir, 'categories.json'),
+    toolsJsonPath: path.join(tempContentDir, 'tools.json'),
+    settingsJsonPath: path.join(tempContentDir, 'settings.json'),
+    adsJsonPath: path.join(tempContentDir, 'ads.json'),
+    articleMdPath,
+    cleanup,
+  };
+}
+
+/**
  * Automated Test Suite for Task 34: Strict If-Match Parser, 412/428 Responders & Regression.
  */
 async function runAutomatedTests() {
   console.log('\n================================================================');
   console.log(' [CMS Test Suite] Task 34 — Strict If-Match & Precondition Tests');
   console.log('================================================================\n');
+
+  const realProjectRoot = defaultStorageEngine.projectRoot;
+  const realContentSnapshotBefore = await captureRealContentSnapshot(realProjectRoot);
 
   let totalCount = 0;
   let passCount = 0;
@@ -7605,22 +9486,26 @@ async function runAutomatedTests() {
   // --------------------------------------------------------------------------
   console.log('\n--- 3. Regression Tests ---');
 
+  const origProjectRootSuite = defaultStorageEngine.projectRoot;
+  const origBackupDirSuite = defaultStorageEngine.backupDir;
+  const suiteIso = await createIsolatedTestProjectRoot('ainovex-cms-suite-', realProjectRoot);
   let serverStarted = false;
-  if (!server.listening) {
-    await new Promise((resolve, reject) => {
-      server.listen(PORT, HOST, () => {
-        serverStarted = true;
-        resolve();
-      });
-      server.on('error', reject);
-    });
-  }
-
-  const originalArticlesStore = await fs.promises.readFile('content/articles.json', 'utf8');
-  const originalCategoriesStore = await fs.promises.readFile('content/categories.json', 'utf8');
   const task43CreatedMdFiles = [];
 
   try {
+    defaultStorageEngine.projectRoot = suiteIso.tempRoot;
+    defaultStorageEngine.backupDir = suiteIso.tempBackupDir;
+    serverStarted = await startServerForTesting();
+
+    const originalArticlesStore = await fs.promises.readFile(suiteIso.articlesJsonPath, 'utf8');
+    const originalCategoriesStore = await fs.promises.readFile(suiteIso.categoriesJsonPath, 'utf8');
+
+    testAssert(
+      isPathStrictlyInsideTempDir(defaultStorageEngine.projectRoot) &&
+        defaultStorageEngine.projectRoot !== realProjectRoot &&
+        defaultStorageEngine.backupDir === suiteIso.tempBackupDir,
+      'Suite Isolation: Storage engine rooted strictly inside isolated temporary project root'
+    );
     // 3.1 Health Endpoint
     const healthRes = await fetch(`http://${HOST}:${PORT}/api/cms/health`);
     testAssert(healthRes.status === 200, 'Health endpoint: HTTP status is 200');
@@ -8137,11 +10022,11 @@ async function runAutomatedTests() {
     testAssert(missingContentPutRes.status === 400, 'Scenario 15 (Missing content field): Returns HTTP 400 Bad Request');
 
     // 16. Precondition failure causes no mutation and no backup creation
-    const articlesJsonBefore = await fs.promises.readFile('content/articles.json', 'utf8');
-    const mdBefore = await fs.promises.readFile(`content/articles/${testPutSlug}.md`, 'utf8');
+    const articlesJsonBefore = await fs.promises.readFile(suiteIso.articlesJsonPath, 'utf8');
+    const mdBefore = await fs.promises.readFile(suiteIso.articleMdPath(testPutSlug), 'utf8');
     let backupsBefore = [];
     try {
-      backupsBefore = await fs.promises.readdir('.backups');
+      backupsBefore = await fs.promises.readdir(suiteIso.tempBackupDir);
     } catch {}
 
     const failedPrecondRes = await fetch(targetArticleUrl, {
@@ -8159,11 +10044,11 @@ async function runAutomatedTests() {
     });
     testAssert(failedPrecondRes.status === 412, 'Scenario 16: Returns 412 on precondition failure');
 
-    const articlesJsonAfter = await fs.promises.readFile('content/articles.json', 'utf8');
-    const mdAfter = await fs.promises.readFile(`content/articles/${testPutSlug}.md`, 'utf8');
+    const articlesJsonAfter = await fs.promises.readFile(suiteIso.articlesJsonPath, 'utf8');
+    const mdAfter = await fs.promises.readFile(suiteIso.articleMdPath(testPutSlug), 'utf8');
     let backupsAfter = [];
     try {
-      backupsAfter = await fs.promises.readdir('.backups');
+      backupsAfter = await fs.promises.readdir(suiteIso.tempBackupDir);
     } catch {}
 
     testAssert(articlesJsonBefore === articlesJsonAfter, 'Scenario 16: articles.json is unmodified after precondition failure');
@@ -8209,7 +10094,7 @@ async function runAutomatedTests() {
     currentETag = winnerRes.headers.get('etag');
 
     // 18. Markdown write failure causes complete transaction rollback
-    const rollbackPreArticles = await fs.promises.readFile('content/articles.json', 'utf8');
+    const rollbackPreArticles = await fs.promises.readFile(suiteIso.articlesJsonPath, 'utf8');
     const rollbackRes = await fetch(targetArticleUrl, {
       method: 'PUT',
       headers: {
@@ -8225,11 +10110,11 @@ async function runAutomatedTests() {
       }),
     });
     testAssert(rollbackRes.status === 500, 'Scenario 18 (Simulated write failure): Returns HTTP 500');
-    const rollbackPostArticles = await fs.promises.readFile('content/articles.json', 'utf8');
+    const rollbackPostArticles = await fs.promises.readFile(suiteIso.articlesJsonPath, 'utf8');
     testAssert(rollbackPreArticles === rollbackPostArticles, 'Scenario 18: articles.json is completely rolled back to exact pre-transaction state');
 
     // 19. Other article data remains intact
-    const parsedArticlesStore = JSON.parse(await fs.promises.readFile('content/articles.json', 'utf8'));
+    const parsedArticlesStore = JSON.parse(await fs.promises.readFile(suiteIso.articlesJsonPath, 'utf8'));
     const otherArticle = parsedArticlesStore.find((a) => a && a.slug === 'best-free-ai-tools-2026');
     testAssert(Boolean(otherArticle), 'Scenario 19: Second article found in store');
     testAssert(otherArticle.slug === 'best-free-ai-tools-2026', 'Scenario 19: Other article slug preserved');
@@ -8239,7 +10124,7 @@ async function runAutomatedTests() {
     // 20. Backup retention limit maintained
     let allBackups = [];
     try {
-      allBackups = await fs.promises.readdir('.backups');
+      allBackups = await fs.promises.readdir(suiteIso.tempBackupDir);
     } catch {}
     const articlesJsonBackups = allBackups.filter((b) => b.startsWith('articles.json.') && b.endsWith('.bak'));
     testAssert(articlesJsonBackups.length <= 20, 'Scenario 20 (Backup retention limit): Retains at most 20 backups per key');
@@ -8289,10 +10174,10 @@ async function runAutomatedTests() {
     testAssert(Boolean(finalETag) && finalETag !== roundtripGetETag, 'Scenario 22: Second PUT yields fresh distinct ETag');
 
     // Restore original state for test clean-up
-    await fs.promises.writeFile('content/articles.json', originalArticlesStore, 'utf8');
-    await fs.promises.writeFile(`content/articles/${testPutSlug}.md`, originalMarkdown, 'utf8');
+    await fs.promises.writeFile(suiteIso.articlesJsonPath, originalArticlesStore, 'utf8');
+    await fs.promises.writeFile(suiteIso.articleMdPath(testPutSlug), originalMarkdown, 'utf8');
     try {
-      await fs.promises.rm('.backups', { recursive: true, force: true });
+      await fs.promises.rm(suiteIso.tempBackupDir, { recursive: true, force: true });
     } catch {}
 
     // 23. Existing GET, POST, authentication and CSRF regression tests remain intact
@@ -8304,7 +10189,7 @@ async function runAutomatedTests() {
     console.log('\n--- 5. Task 38 — Secure Article DELETE API Implementation Tests ---');
 
     async function createFixtureArticle(fixtureSlug, isPublished = false) {
-      const currentStore = JSON.parse(await fs.promises.readFile('content/articles.json', 'utf8'));
+      const currentStore = JSON.parse(await fs.promises.readFile(suiteIso.articlesJsonPath, 'utf8'));
       const fixtureMeta = {
         id: `fixture-uuid-${fixtureSlug}`,
         slug: fixtureSlug,
@@ -8326,8 +10211,8 @@ async function runAutomatedTests() {
       };
       const fixtureMarkdown = `# Fixture: ${fixtureSlug}\n\nContent for fixture testing.`;
       const updatedStore = [...currentStore.filter((a) => a && a.slug !== fixtureSlug), fixtureMeta];
-      await fs.promises.writeFile('content/articles.json', JSON.stringify(updatedStore, null, 2), 'utf8');
-      await fs.promises.writeFile(`content/articles/${fixtureSlug}.md`, fixtureMarkdown, 'utf8');
+      await fs.promises.writeFile(suiteIso.articlesJsonPath, JSON.stringify(updatedStore, null, 2), 'utf8');
+      await fs.promises.writeFile(suiteIso.articleMdPath(fixtureSlug), fixtureMarkdown, 'utf8');
 
       // Fetch fresh ETag via GET
       const res = await fetch(`http://${HOST}:${PORT}/api/cms/articles/${fixtureSlug}`, {
@@ -8339,12 +10224,12 @@ async function runAutomatedTests() {
 
     async function cleanupFixtureArticle(fixtureSlug) {
       try {
-        const currentStore = JSON.parse(await fs.promises.readFile('content/articles.json', 'utf8'));
+        const currentStore = JSON.parse(await fs.promises.readFile(suiteIso.articlesJsonPath, 'utf8'));
         const filtered = currentStore.filter((a) => a && a.slug !== fixtureSlug);
-        await fs.promises.writeFile('content/articles.json', JSON.stringify(filtered, null, 2), 'utf8');
+        await fs.promises.writeFile(suiteIso.articlesJsonPath, JSON.stringify(filtered, null, 2), 'utf8');
       } catch {}
       try {
-        await fs.promises.unlink(`content/articles/${fixtureSlug}.md`);
+        await fs.promises.unlink(suiteIso.articleMdPath(fixtureSlug));
       } catch {}
     }
 
@@ -8368,9 +10253,9 @@ async function runAutomatedTests() {
     const draftDelBody = await draftDelRes.json();
     testAssert(draftDelBody.success === true && draftDelBody.deleted === true && draftDelBody.slug === draftSlug, 'Scenario 1: Success payload has success: true, deleted: true, and matching slug');
     testAssert(draftDelBody.message === 'Article deleted successfully', 'Scenario 1: Success message matches specification');
-    const articlesAfterDraftDel = JSON.parse(await fs.promises.readFile('content/articles.json', 'utf8'));
+    const articlesAfterDraftDel = JSON.parse(await fs.promises.readFile(suiteIso.articlesJsonPath, 'utf8'));
     testAssert(!articlesAfterDraftDel.some((a) => a && a.slug === draftSlug), 'Scenario 1: Draft article removed from articles.json');
-    testAssert(!fs.existsSync(`content/articles/${draftSlug}.md`), 'Scenario 1: Draft Markdown file deleted');
+    testAssert(!fs.existsSync(suiteIso.articleMdPath(draftSlug)), 'Scenario 1: Draft Markdown file deleted');
 
     // 2. Successful published article deletion when another published article exists
     const pubSlug = 'test-pub-deletion-fixture';
@@ -8388,15 +10273,15 @@ async function runAutomatedTests() {
     testAssert(pubDelRes.status === 200, 'Scenario 2 (Published deletion): Returns HTTP 200 OK when multiple published articles exist');
     const pubDelBody = await pubDelRes.json();
     testAssert(pubDelBody.success === true && pubDelBody.deleted === true && pubDelBody.slug === pubSlug, 'Scenario 2: Response confirms deletion');
-    const articlesAfterPubDel = JSON.parse(await fs.promises.readFile('content/articles.json', 'utf8'));
+    const articlesAfterPubDel = JSON.parse(await fs.promises.readFile(suiteIso.articlesJsonPath, 'utf8'));
     const remainingPubCount = articlesAfterPubDel.filter((a) => a && a.isPublished === true).length;
     testAssert(remainingPubCount >= 1, 'Scenario 2: At least one published article remains after deletion');
     testAssert(!articlesAfterPubDel.some((a) => a && a.slug === pubSlug), 'Scenario 2: Target published article removed from store');
-    testAssert(!fs.existsSync(`content/articles/${pubSlug}.md`), 'Scenario 2: Target Markdown file deleted');
+    testAssert(!fs.existsSync(suiteIso.articleMdPath(pubSlug)), 'Scenario 2: Target Markdown file deleted');
 
     // 3. Last published article deletion -> 409
     const soleSlug = 'test-sole-published-article';
-    const preSoleArticles = await fs.promises.readFile('content/articles.json', 'utf8');
+    const preSoleArticles = await fs.promises.readFile(suiteIso.articlesJsonPath, 'utf8');
     const soleMeta = {
       id: 'fixture-sole-uuid',
       slug: soleSlug,
@@ -8416,8 +10301,8 @@ async function runAutomatedTests() {
       metaTitle: 'Sole Meta Title',
       metaDescription: 'Sole Meta Description',
     };
-    await fs.promises.writeFile('content/articles.json', JSON.stringify([soleMeta], null, 2), 'utf8');
-    await fs.promises.writeFile(`content/articles/${soleSlug}.md`, '# Sole Published Article\n\nSole article content.', 'utf8');
+    await fs.promises.writeFile(suiteIso.articlesJsonPath, JSON.stringify([soleMeta], null, 2), 'utf8');
+    await fs.promises.writeFile(suiteIso.articleMdPath(soleSlug), '# Sole Published Article\n\nSole article content.', 'utf8');
 
     const soleGetRes = await fetch(`http://${HOST}:${PORT}/api/cms/articles/${soleSlug}`, {
       headers: { Cookie: freshCookie },
@@ -8438,14 +10323,14 @@ async function runAutomatedTests() {
     testAssert(soleDelRes.headers.get('content-type')?.includes('application/json'), 'Scenario 3: Content-Type is application/json');
     testAssert(soleDelRes.headers.get('cache-control') === 'no-store', 'Scenario 3: Cache-Control is no-store');
     testAssert(soleDelRes.headers.get('x-content-type-options') === 'nosniff', 'Scenario 3: X-Content-Type-Options is nosniff');
-    const soleArticlesStore = JSON.parse(await fs.promises.readFile('content/articles.json', 'utf8'));
+    const soleArticlesStore = JSON.parse(await fs.promises.readFile(suiteIso.articlesJsonPath, 'utf8'));
     testAssert(soleArticlesStore.some((a) => a && a.slug === soleSlug), 'Scenario 3: Last published article preserved in articles.json');
-    testAssert(fs.existsSync(`content/articles/${soleSlug}.md`), 'Scenario 3: Last published markdown file preserved on disk');
+    testAssert(fs.existsSync(suiteIso.articleMdPath(soleSlug)), 'Scenario 3: Last published markdown file preserved on disk');
 
     // Restore pre-sole state
-    await fs.promises.writeFile('content/articles.json', preSoleArticles, 'utf8');
+    await fs.promises.writeFile(suiteIso.articlesJsonPath, preSoleArticles, 'utf8');
     try {
-      await fs.promises.unlink(`content/articles/${soleSlug}.md`);
+      await fs.promises.unlink(suiteIso.articleMdPath(soleSlug));
     } catch {}
 
     // 4. Missing If-Match -> 428
@@ -8631,9 +10516,9 @@ async function runAutomatedTests() {
 
     // 13, 14, 15. Exact atomic mutations and non-target isolation
     const isolationFixture = await createFixtureArticle('test-isolation-del-fixture', false);
-    const articlesBeforeIso = JSON.parse(await fs.promises.readFile('content/articles.json', 'utf8'));
+    const articlesBeforeIso = JSON.parse(await fs.promises.readFile(suiteIso.articlesJsonPath, 'utf8'));
     const otherArticleBefore = articlesBeforeIso.find((a) => a && a.slug === 'best-free-ai-tools-2026');
-    const otherMarkdownBefore = await fs.promises.readFile('content/articles/best-free-ai-tools-2026.md', 'utf8');
+    const otherMarkdownBefore = await fs.promises.readFile(suiteIso.articleMdPath('best-free-ai-tools-2026'), 'utf8');
 
     const isoDelRes = await fetch(`http://${HOST}:${PORT}/api/cms/articles/test-isolation-del-fixture`, {
       method: 'DELETE',
@@ -8646,17 +10531,17 @@ async function runAutomatedTests() {
     testAssert(isoDelRes.status === 200, 'Scenario 13,14,15: Deletion succeeds');
 
     // 13. Only target article removed from articles.json
-    const articlesAfterIso = JSON.parse(await fs.promises.readFile('content/articles.json', 'utf8'));
+    const articlesAfterIso = JSON.parse(await fs.promises.readFile(suiteIso.articlesJsonPath, 'utf8'));
     testAssert(!articlesAfterIso.some((a) => a && a.slug === 'test-isolation-del-fixture'), 'Scenario 13: Only target article removed from articles.json');
     testAssert(articlesAfterIso.length === articlesBeforeIso.length - 1, 'Scenario 13: Exact count reduced by 1');
 
     // 14. Associated Markdown file deleted
-    const mdExistsAfter = fs.existsSync('content/articles/test-isolation-del-fixture.md');
+    const mdExistsAfter = fs.existsSync(suiteIso.articleMdPath('test-isolation-del-fixture'));
     testAssert(!mdExistsAfter, 'Scenario 14: Associated Markdown file deleted from filesystem');
 
     // 15. Other articles intact
     const otherArticleAfter = articlesAfterIso.find((a) => a && a.slug === 'best-free-ai-tools-2026');
-    const otherMarkdownAfter = await fs.promises.readFile('content/articles/best-free-ai-tools-2026.md', 'utf8');
+    const otherMarkdownAfter = await fs.promises.readFile(suiteIso.articleMdPath('best-free-ai-tools-2026'), 'utf8');
     testAssert(JSON.stringify(otherArticleBefore) === JSON.stringify(otherArticleAfter), 'Scenario 15: Other article metadata completely unchanged');
     testAssert(otherMarkdownBefore === otherMarkdownAfter, 'Scenario 15: Other article Markdown content completely unchanged');
 
@@ -8665,7 +10550,7 @@ async function runAutomatedTests() {
     const backupFixture = await createFixtureArticle(backupTestSlug, false);
     let backupsBeforeDel = [];
     try {
-      backupsBeforeDel = await fs.promises.readdir('.backups');
+      backupsBeforeDel = await fs.promises.readdir(suiteIso.tempBackupDir);
     } catch {}
 
     const backupDelRes = await fetch(`http://${HOST}:${PORT}/api/cms/articles/${backupTestSlug}`, {
@@ -8679,7 +10564,7 @@ async function runAutomatedTests() {
     testAssert(backupDelRes.status === 200, 'Scenario 16: Deletion for backup verification succeeds');
     let backupsAfterDel = [];
     try {
-      backupsAfterDel = await fs.promises.readdir('.backups');
+      backupsAfterDel = await fs.promises.readdir(suiteIso.tempBackupDir);
     } catch {}
     testAssert(backupsAfterDel.length > backupsBeforeDel.length, 'Scenario 16: New backups created during successful deletion');
     const hasArticleBackup = backupsAfterDel.some((b) => b.startsWith('articles.json.'));
@@ -8689,7 +10574,7 @@ async function runAutomatedTests() {
     // 17. Backup retention limit maintained
     let allCurrentBackups = [];
     try {
-      allCurrentBackups = await fs.promises.readdir('.backups');
+      allCurrentBackups = await fs.promises.readdir(suiteIso.tempBackupDir);
     } catch {}
     const articlesJsonBackupsCount = allCurrentBackups.filter((b) => b.startsWith('articles.json.') && b.endsWith('.bak')).length;
     testAssert(articlesJsonBackupsCount <= 20, 'Scenario 17 (Backup retention limit): articles.json backups count <= 20');
@@ -8697,10 +10582,10 @@ async function runAutomatedTests() {
     // 18. Stale ETag causes no mutation and no backup
     const noMutateSlug = 'test-no-mutate-stale';
     await createFixtureArticle(noMutateSlug, false);
-    const jsonBeforeStale = await fs.promises.readFile('content/articles.json', 'utf8');
-    const mdBeforeStale = await fs.promises.readFile(`content/articles/${noMutateSlug}.md`, 'utf8');
+    const jsonBeforeStale = await fs.promises.readFile(suiteIso.articlesJsonPath, 'utf8');
+    const mdBeforeStale = await fs.promises.readFile(suiteIso.articleMdPath(noMutateSlug), 'utf8');
     let backupsBeforeStale = [];
-    try { backupsBeforeStale = await fs.promises.readdir('.backups'); } catch {}
+    try { backupsBeforeStale = await fs.promises.readdir(suiteIso.tempBackupDir); } catch {}
 
     const staleRes18 = await fetch(`http://${HOST}:${PORT}/api/cms/articles/${noMutateSlug}`, {
       method: 'DELETE',
@@ -8711,10 +10596,10 @@ async function runAutomatedTests() {
       },
     });
     testAssert(staleRes18.status === 412, 'Scenario 18: Returns 412 on stale ETag');
-    const jsonAfterStale = await fs.promises.readFile('content/articles.json', 'utf8');
-    const mdAfterStale = await fs.promises.readFile(`content/articles/${noMutateSlug}.md`, 'utf8');
+    const jsonAfterStale = await fs.promises.readFile(suiteIso.articlesJsonPath, 'utf8');
+    const mdAfterStale = await fs.promises.readFile(suiteIso.articleMdPath(noMutateSlug), 'utf8');
     let backupsAfterStale = [];
-    try { backupsAfterStale = await fs.promises.readdir('.backups'); } catch {}
+    try { backupsAfterStale = await fs.promises.readdir(suiteIso.tempBackupDir); } catch {}
     testAssert(jsonBeforeStale === jsonAfterStale, 'Scenario 18: articles.json is completely unmodified after 412');
     testAssert(mdBeforeStale === mdAfterStale, 'Scenario 18: Markdown file is completely unmodified after 412');
     testAssert(backupsBeforeStale.length === backupsAfterStale.length, 'Scenario 18: Zero backups created on stale ETag precondition failure');
@@ -8723,8 +10608,8 @@ async function runAutomatedTests() {
     // 19. Markdown deletion failure causes rollback
     const rollbackSlug1 = 'test-rollback-md-failure';
     const rollbackFixture1 = await createFixtureArticle(rollbackSlug1, false);
-    const jsonBeforeRb1 = await fs.promises.readFile('content/articles.json', 'utf8');
-    const mdBeforeRb1 = await fs.promises.readFile(`content/articles/${rollbackSlug1}.md`, 'utf8');
+    const jsonBeforeRb1 = await fs.promises.readFile(suiteIso.articlesJsonPath, 'utf8');
+    const mdBeforeRb1 = await fs.promises.readFile(suiteIso.articleMdPath(rollbackSlug1), 'utf8');
 
     const rollbackRes1 = await fetch(`http://${HOST}:${PORT}/api/cms/articles/${rollbackSlug1}`, {
       method: 'DELETE',
@@ -8736,8 +10621,8 @@ async function runAutomatedTests() {
       },
     });
     testAssert(rollbackRes1.status === 500, 'Scenario 19 (Simulated markdown delete failure): Returns HTTP 500');
-    const jsonAfterRb1 = await fs.promises.readFile('content/articles.json', 'utf8');
-    const mdAfterRb1 = await fs.promises.readFile(`content/articles/${rollbackSlug1}.md`, 'utf8');
+    const jsonAfterRb1 = await fs.promises.readFile(suiteIso.articlesJsonPath, 'utf8');
+    const mdAfterRb1 = await fs.promises.readFile(suiteIso.articleMdPath(rollbackSlug1), 'utf8');
     testAssert(jsonBeforeRb1 === jsonAfterRb1, 'Scenario 19: articles.json rolled back to exact pre-transaction state');
     testAssert(mdBeforeRb1 === mdAfterRb1, 'Scenario 19: Markdown file preserved after rollback');
     await cleanupFixtureArticle(rollbackSlug1);
@@ -8745,8 +10630,8 @@ async function runAutomatedTests() {
     // 20. Metadata write failure causes rollback
     const rollbackSlug2 = 'test-rollback-write-failure';
     const rollbackFixture2 = await createFixtureArticle(rollbackSlug2, false);
-    const jsonBeforeRb2 = await fs.promises.readFile('content/articles.json', 'utf8');
-    const mdBeforeRb2 = await fs.promises.readFile(`content/articles/${rollbackSlug2}.md`, 'utf8');
+    const jsonBeforeRb2 = await fs.promises.readFile(suiteIso.articlesJsonPath, 'utf8');
+    const mdBeforeRb2 = await fs.promises.readFile(suiteIso.articleMdPath(rollbackSlug2), 'utf8');
 
     const rollbackRes2 = await fetch(`http://${HOST}:${PORT}/api/cms/articles/${rollbackSlug2}`, {
       method: 'DELETE',
@@ -8758,8 +10643,8 @@ async function runAutomatedTests() {
       },
     });
     testAssert(rollbackRes2.status === 500, 'Scenario 20 (Simulated write failure): Returns HTTP 500');
-    const jsonAfterRb2 = await fs.promises.readFile('content/articles.json', 'utf8');
-    const mdAfterRb2 = await fs.promises.readFile(`content/articles/${rollbackSlug2}.md`, 'utf8');
+    const jsonAfterRb2 = await fs.promises.readFile(suiteIso.articlesJsonPath, 'utf8');
+    const mdAfterRb2 = await fs.promises.readFile(suiteIso.articleMdPath(rollbackSlug2), 'utf8');
     testAssert(jsonBeforeRb2 === jsonAfterRb2, 'Scenario 20: articles.json rolled back to exact pre-transaction state');
     testAssert(mdBeforeRb2 === mdAfterRb2, 'Scenario 20: Markdown file preserved after rollback');
     await cleanupFixtureArticle(rollbackSlug2);
@@ -8913,7 +10798,7 @@ async function runAutomatedTests() {
 
     // 6.1 POST valid category succeeds & categories.json read-only (no backup, unchanged mtime/inode)
     const postValidSlug = 'task43-valid-post-article';
-    task43CreatedMdFiles.push(`content/articles/${postValidSlug}.md`);
+    task43CreatedMdFiles.push(suiteIso.articleMdPath(postValidSlug));
     const catBytesBeforePost = await fs.promises.readFile(catFilePath);
     const catStatBeforePost = await fs.promises.stat(catFilePath);
     await new Promise((r) => setTimeout(r, 20));
@@ -8948,19 +10833,19 @@ async function runAutomatedTests() {
       'Task 43 (POST valid category): Returns server-generated ID, category metadata, and strips contentPath'
     );
 
-    const storeAfterValidPost = JSON.parse(await fs.promises.readFile('content/articles.json', 'utf8'));
+    const storeAfterValidPost = JSON.parse(await fs.promises.readFile(suiteIso.articlesJsonPath, 'utf8'));
     const storedPostArticle = storeAfterValidPost.find((a) => a && a.slug === postValidSlug);
     testAssert(
       Boolean(storedPostArticle) &&
         storedPostArticle.contentPath === `content/articles/${postValidSlug}.md` &&
-        fs.existsSync(`content/articles/${postValidSlug}.md`),
+        fs.existsSync(suiteIso.articleMdPath(postValidSlug)),
       'Task 43 (POST valid category): Persists canonical contentPath and Markdown file'
     );
 
     const catBytesAfterPost = await fs.promises.readFile(catFilePath);
     const catStatAfterPost = await fs.promises.stat(catFilePath);
     let backupsAfterPost = [];
-    try { backupsAfterPost = await fs.promises.readdir('.backups'); } catch {}
+    try { backupsAfterPost = await fs.promises.readdir(suiteIso.tempBackupDir); } catch {}
     testAssert(
       catBytesBeforePost.equals(catBytesAfterPost) &&
         catStatBeforePost.mtimeMs === catStatAfterPost.mtimeMs &&
@@ -8982,15 +10867,15 @@ async function runAutomatedTests() {
     testAssert(postDupRes.status === 409, 'Task 43 (POST duplicate slug): Returns HTTP 409 Conflict');
 
     // Clean up postValidSlug before continuing
-    await fs.promises.writeFile('content/articles.json', originalArticlesStore, 'utf8');
-    try { await fs.promises.unlink(`content/articles/${postValidSlug}.md`); } catch {}
+    await fs.promises.writeFile(suiteIso.articlesJsonPath, originalArticlesStore, 'utf8');
+    try { await fs.promises.unlink(suiteIso.articleMdPath(postValidSlug)); } catch {}
 
     // 6.3 POST unknown category rejected (400) with zero file mutations and zero backups
     const unknownPostSlug = 'task43-unknown-cat-post';
-    task43CreatedMdFiles.push(`content/articles/${unknownPostSlug}.md`);
-    const articlesBeforeUnknownPost = await fs.promises.readFile('content/articles.json', 'utf8');
+    task43CreatedMdFiles.push(suiteIso.articleMdPath(unknownPostSlug));
+    const articlesBeforeUnknownPost = await fs.promises.readFile(suiteIso.articlesJsonPath, 'utf8');
     let backupsBeforeUnknownPost = [];
-    try { backupsBeforeUnknownPost = await fs.promises.readdir('.backups'); } catch {}
+    try { backupsBeforeUnknownPost = await fs.promises.readdir(suiteIso.tempBackupDir); } catch {}
 
     const postUnknownCatRes = await fetch(`http://${HOST}:${PORT}/api/cms/articles`, {
       method: 'POST',
@@ -9002,20 +10887,20 @@ async function runAutomatedTests() {
       body: JSON.stringify(makePostArticlePayload(unknownPostSlug, 'non-existent-category-task43')),
     });
     testAssert(postUnknownCatRes.status === 400, 'Task 43 (POST unknown category): Returns HTTP 400 Bad Request');
-    const articlesAfterUnknownPost = await fs.promises.readFile('content/articles.json', 'utf8');
+    const articlesAfterUnknownPost = await fs.promises.readFile(suiteIso.articlesJsonPath, 'utf8');
     let backupsAfterUnknownPost = [];
-    try { backupsAfterUnknownPost = await fs.promises.readdir('.backups'); } catch {}
+    try { backupsAfterUnknownPost = await fs.promises.readdir(suiteIso.tempBackupDir); } catch {}
     testAssert(
       articlesBeforeUnknownPost === articlesAfterUnknownPost &&
-        !fs.existsSync(`content/articles/${unknownPostSlug}.md`) &&
+        !fs.existsSync(suiteIso.articleMdPath(unknownPostSlug)) &&
         backupsBeforeUnknownPost.length === backupsAfterUnknownPost.length,
       'Task 43 (POST unknown category): Zero file mutations and zero backups created'
     );
 
     // 6.4 POST rollback on simulated Markdown write failure preserves articles.json and leaves no orphan md
     const rbPostSlug = 'task43-post-rollback-test';
-    task43CreatedMdFiles.push(`content/articles/${rbPostSlug}.md`);
-    const articlesBeforeRbPost = await fs.promises.readFile('content/articles.json', 'utf8');
+    task43CreatedMdFiles.push(suiteIso.articleMdPath(rbPostSlug));
+    const articlesBeforeRbPost = await fs.promises.readFile(suiteIso.articlesJsonPath, 'utf8');
     const rbPostRes = await fetch(`http://${HOST}:${PORT}/api/cms/articles`, {
       method: 'POST',
       headers: {
@@ -9027,9 +10912,9 @@ async function runAutomatedTests() {
       body: JSON.stringify(makePostArticlePayload(rbPostSlug, 'business')),
     });
     testAssert(rbPostRes.status === 500, 'Task 43 (POST simulated write failure): Returns HTTP 500');
-    const articlesAfterRbPost = await fs.promises.readFile('content/articles.json', 'utf8');
+    const articlesAfterRbPost = await fs.promises.readFile(suiteIso.articlesJsonPath, 'utf8');
     testAssert(
-      articlesBeforeRbPost === articlesAfterRbPost && !fs.existsSync(`content/articles/${rbPostSlug}.md`),
+      articlesBeforeRbPost === articlesAfterRbPost && !fs.existsSync(suiteIso.articleMdPath(rbPostSlug)),
       'Task 43 (POST rollback): articles.json rolled back and Markdown file not left on disk'
     );
 
@@ -9065,7 +10950,7 @@ async function runAutomatedTests() {
     const catBytesAfterPut = await fs.promises.readFile(catFilePath);
     const catStatAfterPut = await fs.promises.stat(catFilePath);
     let backupsAfterPut = [];
-    try { backupsAfterPut = await fs.promises.readdir('.backups'); } catch {}
+    try { backupsAfterPut = await fs.promises.readdir(suiteIso.tempBackupDir); } catch {}
     testAssert(
       catBytesBeforePut.equals(catBytesAfterPut) &&
         catStatBeforePut.mtimeMs === catStatAfterPut.mtimeMs &&
@@ -9075,10 +10960,10 @@ async function runAutomatedTests() {
     );
 
     // 6.6 PUT unknown category rejected (400) with metadata & Markdown unchanged
-    const articlesBeforeUnknownPut = await fs.promises.readFile('content/articles.json', 'utf8');
-    const mdBeforeUnknownPut = await fs.promises.readFile(`content/articles/${putTargetSlug}.md`, 'utf8');
+    const articlesBeforeUnknownPut = await fs.promises.readFile(suiteIso.articlesJsonPath, 'utf8');
+    const mdBeforeUnknownPut = await fs.promises.readFile(suiteIso.articleMdPath(putTargetSlug), 'utf8');
     let backupsBeforeUnknownPut = [];
-    try { backupsBeforeUnknownPut = await fs.promises.readdir('.backups'); } catch {}
+    try { backupsBeforeUnknownPut = await fs.promises.readdir(suiteIso.tempBackupDir); } catch {}
 
     const putUnknownCatRes = await fetch(putTargetUrl, {
       method: 'PUT',
@@ -9094,10 +10979,10 @@ async function runAutomatedTests() {
       }),
     });
     testAssert(putUnknownCatRes.status === 400, 'Task 43 (PUT unknown category): Returns HTTP 400 Bad Request');
-    const articlesAfterUnknownPut = await fs.promises.readFile('content/articles.json', 'utf8');
-    const mdAfterUnknownPut = await fs.promises.readFile(`content/articles/${putTargetSlug}.md`, 'utf8');
+    const articlesAfterUnknownPut = await fs.promises.readFile(suiteIso.articlesJsonPath, 'utf8');
+    const mdAfterUnknownPut = await fs.promises.readFile(suiteIso.articleMdPath(putTargetSlug), 'utf8');
     let backupsAfterUnknownPut = [];
-    try { backupsAfterUnknownPut = await fs.promises.readdir('.backups'); } catch {}
+    try { backupsAfterUnknownPut = await fs.promises.readdir(suiteIso.tempBackupDir); } catch {}
     testAssert(
       articlesBeforeUnknownPut === articlesAfterUnknownPut &&
         mdBeforeUnknownPut === mdAfterUnknownPut &&
@@ -9110,7 +10995,7 @@ async function runAutomatedTests() {
     //     POST must wait for the lock (not fail on stale pre-lock snapshot) and then succeed with 201.
     const postRaceCatSlug = 'task43-locked-post-cat';
     const postRaceArtSlug = 'task43-race-post-added-cat';
-    task43CreatedMdFiles.push(`content/articles/${postRaceArtSlug}.md`);
+    task43CreatedMdFiles.push(suiteIso.articleMdPath(postRaceArtSlug));
     let signalCatPostEntered;
     const catPostLockEntered = new Promise((resolve) => { signalCatPostEntered = resolve; });
     let releaseCatPostLock;
@@ -9176,8 +11061,8 @@ async function runAutomatedTests() {
     );
 
     // Clean up postRaceArtSlug
-    await fs.promises.writeFile('content/articles.json', originalArticlesStore, 'utf8');
-    try { await fs.promises.unlink(`content/articles/${postRaceArtSlug}.md`); } catch {}
+    await fs.promises.writeFile(suiteIso.articlesJsonPath, originalArticlesStore, 'utf8');
+    try { await fs.promises.unlink(suiteIso.articleMdPath(postRaceArtSlug)); } catch {}
 
     // 6.8 Lock blocking & concurrent category addition race for PUT
     const putRaceCatSlug = 'task43-locked-put-cat';
@@ -9254,7 +11139,7 @@ async function runAutomatedTests() {
     // 6.9 Concurrent category removal race: category exists pre-lock, removed under lock before POST/PUT acquire lock
     //     Must reject both POST and PUT with 400 (never use stale pre-lock read!)
     const removeRacePostSlug = 'task43-removed-cat-post-race';
-    task43CreatedMdFiles.push(`content/articles/${removeRacePostSlug}.md`);
+    task43CreatedMdFiles.push(suiteIso.articleMdPath(removeRacePostSlug));
     const putDuringRemoveGet = await fetch(putTargetUrl, { headers: { Cookie: freshCookie } });
     const putDuringRemoveETag = putDuringRemoveGet.headers.get('etag');
 
@@ -9328,32 +11213,32 @@ async function runAutomatedTests() {
 
     releaseCatRemoveLock();
     const [, remPostRes, remPutRes] = await Promise.all([catRemoveTx, remPostPromise, remPutPromise]);
-    const storeAfterRemoveRace = JSON.parse(await fs.promises.readFile('content/articles.json', 'utf8'));
+    const storeAfterRemoveRace = JSON.parse(await fs.promises.readFile(suiteIso.articlesJsonPath, 'utf8'));
     testAssert(
       remPostRes.status === 400 &&
         remPutRes.status === 400 &&
         !storeAfterRemoveRace.some((a) => a && a.slug === removeRacePostSlug) &&
-        !fs.existsSync(`content/articles/${removeRacePostSlug}.md`) &&
+        !fs.existsSync(suiteIso.articleMdPath(removeRacePostSlug)) &&
         getActiveMutexCount() === 0,
       'Task 43 (Removal race): Both POST and PUT reject removed category using locked snapshot (400) with zero orphaned references'
     );
 
     // Restore original categories.json, articles.json, and markdown before fail-closed tests
     await fs.promises.writeFile(catFilePath, originalCategoriesStore, 'utf8');
-    await fs.promises.writeFile('content/articles.json', originalArticlesStore, 'utf8');
-    await fs.promises.writeFile(`content/articles/${putTargetSlug}.md`, originalMarkdown, 'utf8');
+    await fs.promises.writeFile(suiteIso.articlesJsonPath, originalArticlesStore, 'utf8');
+    await fs.promises.writeFile(suiteIso.articleMdPath(putTargetSlug), originalMarkdown, 'utf8');
 
     // 6.10 Fail-closed behavior when categories.json is malformed, invalid schema, empty, or missing
     const failClosedPostSlug = 'task43-fail-closed-post';
-    task43CreatedMdFiles.push(`content/articles/${failClosedPostSlug}.md`);
+    task43CreatedMdFiles.push(suiteIso.articleMdPath(failClosedPostSlug));
     const failClosedGet = await fetch(putTargetUrl, { headers: { Cookie: freshCookie } });
     const failClosedETag = failClosedGet.headers.get('etag');
 
     try {
       // Sub-case A: Malformed JSON in categories.json
       await fs.promises.writeFile(catFilePath, '{ malformed-json: [', 'utf8');
-      const articlesBeforeMalformed = await fs.promises.readFile('content/articles.json', 'utf8');
-      const mdBeforeMalformed = await fs.promises.readFile(`content/articles/${putTargetSlug}.md`, 'utf8');
+      const articlesBeforeMalformed = await fs.promises.readFile(suiteIso.articlesJsonPath, 'utf8');
+      const mdBeforeMalformed = await fs.promises.readFile(suiteIso.articleMdPath(putTargetSlug), 'utf8');
 
       const postMalformedRes = await fetch(`http://${HOST}:${PORT}/api/cms/articles`, {
         method: 'POST',
@@ -9380,9 +11265,9 @@ async function runAutomatedTests() {
       testAssert(
         postMalformedRes.status === 500 &&
           putMalformedRes.status === 500 &&
-          (await fs.promises.readFile('content/articles.json', 'utf8')) === articlesBeforeMalformed &&
-          (await fs.promises.readFile(`content/articles/${putTargetSlug}.md`, 'utf8')) === mdBeforeMalformed &&
-          !fs.existsSync(`content/articles/${failClosedPostSlug}.md`) &&
+          (await fs.promises.readFile(suiteIso.articlesJsonPath, 'utf8')) === articlesBeforeMalformed &&
+          (await fs.promises.readFile(suiteIso.articleMdPath(putTargetSlug), 'utf8')) === mdBeforeMalformed &&
+          !fs.existsSync(suiteIso.articleMdPath(failClosedPostSlug)) &&
           getActiveMutexCount() === 0,
         'Task 43 (Fail-closed malformed JSON): POST and PUT reject with 500 and leave all files unmodified'
       );
@@ -9440,8 +11325,8 @@ async function runAutomatedTests() {
           putEmptyRes.status === 500 &&
           postInvalidSchemaRes.status === 500 &&
           putInvalidSchemaRes.status === 500 &&
-          (await fs.promises.readFile('content/articles.json', 'utf8')) === articlesBeforeMalformed &&
-          !fs.existsSync(`content/articles/${failClosedPostSlug}.md`) &&
+          (await fs.promises.readFile(suiteIso.articlesJsonPath, 'utf8')) === articlesBeforeMalformed &&
+          !fs.existsSync(suiteIso.articleMdPath(failClosedPostSlug)) &&
           getActiveMutexCount() === 0,
         'Task 43 (Fail-closed empty/invalid schema): POST and PUT reject with 500 with zero mutations'
       );
@@ -9473,9 +11358,9 @@ async function runAutomatedTests() {
       testAssert(
         postMissingRes.status === 500 &&
           putMissingRes.status === 500 &&
-          (await fs.promises.readFile('content/articles.json', 'utf8')) === articlesBeforeMalformed &&
-          (await fs.promises.readFile(`content/articles/${putTargetSlug}.md`, 'utf8')) === mdBeforeMalformed &&
-          !fs.existsSync(`content/articles/${failClosedPostSlug}.md`) &&
+          (await fs.promises.readFile(suiteIso.articlesJsonPath, 'utf8')) === articlesBeforeMalformed &&
+          (await fs.promises.readFile(suiteIso.articleMdPath(putTargetSlug), 'utf8')) === mdBeforeMalformed &&
+          !fs.existsSync(suiteIso.articleMdPath(failClosedPostSlug)) &&
           getActiveMutexCount() === 0,
         'Task 43 (Fail-closed missing categories.json): POST and PUT reject with 500 with zero mutations'
       );
@@ -9484,14 +11369,14 @@ async function runAutomatedTests() {
     }
 
     // Final clean-up of articles.json, categories.json, and test artifacts to restore pristine state
-    await fs.promises.writeFile('content/articles.json', originalArticlesStore, 'utf8');
-    await fs.promises.writeFile('content/categories.json', originalCategoriesStore, 'utf8');
-    await fs.promises.writeFile(`content/articles/${putTargetSlug}.md`, originalMarkdown, 'utf8');
+    await fs.promises.writeFile(suiteIso.articlesJsonPath, originalArticlesStore, 'utf8');
+    await fs.promises.writeFile(suiteIso.categoriesJsonPath, originalCategoriesStore, 'utf8');
+    await fs.promises.writeFile(suiteIso.articleMdPath(putTargetSlug), originalMarkdown, 'utf8');
     for (const mdFile of task43CreatedMdFiles) {
       try { await fs.promises.unlink(mdFile); } catch {}
     }
     try {
-      await fs.promises.rm('.backups', { recursive: true, force: true });
+      await fs.promises.rm(suiteIso.tempBackupDir, { recursive: true, force: true });
     } catch {}
 
     // --------------------------------------------------------------------------
@@ -9605,7 +11490,7 @@ async function runAutomatedTests() {
 
     // Restore baseline categories before validation, security, duplicate, and concurrency tests
     await fs.promises.writeFile(catFilePath, originalCategoriesStore, 'utf8');
-    try { await fs.promises.rm('.backups', { recursive: true, force: true }); } catch {}
+    try { await fs.promises.rm(suiteIso.tempBackupDir, { recursive: true, force: true }); } catch {}
 
     // 7.3 Validation error cases -> 400
     const postCategoryRequest = (bodyPayload, extraHeaders = {}) =>
@@ -9746,7 +11631,7 @@ async function runAutomatedTests() {
     // 7.5 Duplicate handling -> 409 + byte-for-byte unchanged + zero backups
     const catBytesBeforeDup = await fs.promises.readFile(catFilePath);
     let backupsBeforeDup = [];
-    try { backupsBeforeDup = await fs.promises.readdir('.backups'); } catch {}
+    try { backupsBeforeDup = await fs.promises.readdir(suiteIso.tempBackupDir); } catch {}
 
     const dupSlugRes = await postCategoryRequest(
       makeCategoryPayload({ name: 'Brand New Unique Name', slug: 'ai-writing' })
@@ -9760,7 +11645,7 @@ async function runAutomatedTests() {
 
     const catBytesAfterDup = await fs.promises.readFile(catFilePath);
     let backupsAfterDup = [];
-    try { backupsAfterDup = await fs.promises.readdir('.backups'); } catch {}
+    try { backupsAfterDup = await fs.promises.readdir(suiteIso.tempBackupDir); } catch {}
 
     testAssert(
       dupSlugRes.status === 409 &&
@@ -9849,7 +11734,7 @@ async function runAutomatedTests() {
     // 7.8 Regression: Article POST waits during Category POST and sees locked updated snapshot
     const regCatSlug = 'task45-lock-order-cat';
     const regArtSlug = 'task45-lock-order-article';
-    task43CreatedMdFiles.push(`content/articles/${regArtSlug}.md`);
+    task43CreatedMdFiles.push(suiteIso.articleMdPath(regArtSlug));
 
     let signalCatLockEntered;
     const catLockEntered = new Promise((resolve) => { signalCatLockEntered = resolve; });
@@ -9916,10 +11801,10 @@ async function runAutomatedTests() {
 
     // Clean up Task 45 test artifacts
     await fs.promises.writeFile(catFilePath, originalCategoriesStore, 'utf8');
-    await fs.promises.writeFile('content/articles.json', originalArticlesStore, 'utf8');
-    try { await fs.promises.unlink(`content/articles/${regArtSlug}.md`); } catch {}
+    await fs.promises.writeFile(suiteIso.articlesJsonPath, originalArticlesStore, 'utf8');
+    try { await fs.promises.unlink(suiteIso.articleMdPath(regArtSlug)); } catch {}
     try {
-      await fs.promises.rm('.backups', { recursive: true, force: true });
+      await fs.promises.rm(suiteIso.tempBackupDir, { recursive: true, force: true });
     } catch {}
 
     // --------------------------------------------------------------------------
@@ -10117,7 +12002,7 @@ async function runAutomatedTests() {
 
     // Restore original categories.json after boundary slug tests
     await fs.promises.writeFile(catFilePath, originalCategoriesStore, 'utf8');
-    try { await fs.promises.rm('.backups', { recursive: true, force: true }); } catch {}
+    try { await fs.promises.rm(suiteIso.tempBackupDir, { recursive: true, force: true }); } catch {}
 
     // 8.4 Unknown category -> 404
     const unknownCatRes = await fetch(`http://${HOST}:${PORT}/api/cms/categories/non-existent-category`, {
@@ -10263,15 +12148,15 @@ async function runAutomatedTests() {
 
     // Restore pristine state after Task 47 tests
     await fs.promises.writeFile(catFilePath, originalCategoriesStore, 'utf8');
-    try { await fs.promises.rm('.backups', { recursive: true, force: true }); } catch {}
+    try { await fs.promises.rm(suiteIso.tempBackupDir, { recursive: true, force: true }); } catch {}
 
     // --------------------------------------------------------------------------
     // 9. Task 48 — Category PUT API with If-Match & Atomic 3-File Transaction Tests
     // --------------------------------------------------------------------------
     console.log('\n--- 9. Task 48 — Category PUT API & Atomic 3-File Transaction Tests ---');
 
-    const originalToolsStore = await fs.promises.readFile('content/tools.json', 'utf8');
-    const originalSecondMd = await fs.promises.readFile('content/articles/best-free-ai-tools-2026.md', 'utf8');
+    const originalToolsStore = await fs.promises.readFile(suiteIso.toolsJsonPath, 'utf8');
+    const originalSecondMd = await fs.promises.readFile(suiteIso.articleMdPath('best-free-ai-tools-2026'), 'utf8');
     const toolsFilePath = resolveSecureJsonPath('tools.json', defaultStorageEngine.projectRoot);
     const articlesFilePath = resolveSecureJsonPath('articles.json', defaultStorageEngine.projectRoot);
 
@@ -10363,7 +12248,7 @@ async function runAutomatedTests() {
       let aiWritingETag = aiWritingDetailBefore.headers.get('etag');
       const articlesBeforePartial = JSON.parse(await fs.promises.readFile(articlesFilePath, 'utf8'));
       const toolsBeforePartial = JSON.parse(await fs.promises.readFile(toolsFilePath, 'utf8'));
-      const mdBeforePartial = await fs.promises.readFile('content/articles/best-ai-tools-bulk-product-catalog-enrichment.md', 'utf8');
+      const mdBeforePartial = await fs.promises.readFile(suiteIso.articleMdPath('best-ai-tools-bulk-product-catalog-enrichment'), 'utf8');
 
       const partialPutRes = await putCategoryRequest(
         'ai-writing',
@@ -10410,7 +12295,7 @@ async function runAutomatedTests() {
 
       const articlesAfterPartial = JSON.parse(await fs.promises.readFile(articlesFilePath, 'utf8'));
       const toolsAfterPartial = JSON.parse(await fs.promises.readFile(toolsFilePath, 'utf8'));
-      const mdAfterPartial = await fs.promises.readFile('content/articles/best-ai-tools-bulk-product-catalog-enrichment.md', 'utf8');
+      const mdAfterPartial = await fs.promises.readFile(suiteIso.articleMdPath('best-ai-tools-bulk-product-catalog-enrichment'), 'utf8');
       testAssert(
         JSON.stringify(articlesBeforePartial) === JSON.stringify(articlesAfterPartial) &&
           JSON.stringify(toolsBeforePartial) === JSON.stringify(toolsAfterPartial) &&
@@ -10514,7 +12399,7 @@ async function runAutomatedTests() {
       await fs.promises.writeFile(catFilePath, originalCategoriesStore, 'utf8');
       await fs.promises.writeFile(articlesFilePath, originalArticlesStore, 'utf8');
       await fs.promises.writeFile(toolsFilePath, originalToolsStore, 'utf8');
-      try { await fs.promises.rm('.backups', { recursive: true, force: true }); } catch {}
+      try { await fs.promises.rm(suiteIso.tempBackupDir, { recursive: true, force: true }); } catch {}
 
       // Fetch fresh valid ETag for 'business'
       const bizDetailRes = await fetch(`http://${HOST}:${PORT}/api/cms/categories/business`, {
@@ -10543,7 +12428,7 @@ async function runAutomatedTests() {
       const artBeforeDupPut = await fs.promises.readFile(articlesFilePath, 'utf8');
       const toolsBeforeDupPut = await fs.promises.readFile(toolsFilePath, 'utf8');
       let backupsBeforeDupPut = [];
-      try { backupsBeforeDupPut = await fs.promises.readdir('.backups'); } catch {}
+      try { backupsBeforeDupPut = await fs.promises.readdir(suiteIso.tempBackupDir); } catch {}
 
       const dupNamePutRes1 = await putCategoryRequest(
         'business',
@@ -10556,7 +12441,7 @@ async function runAutomatedTests() {
         { 'If-Match': bizETag }
       );
       let backupsAfterDupPut = [];
-      try { backupsAfterDupPut = await fs.promises.readdir('.backups'); } catch {}
+      try { backupsAfterDupPut = await fs.promises.readdir(suiteIso.tempBackupDir); } catch {}
 
       testAssert(
         dupNamePutRes1.status === 409 &&
@@ -10600,7 +12485,7 @@ async function runAutomatedTests() {
         { 'If-Match': `"${'a'.repeat(64)}"` }
       );
       let backupsAfterIfMatchFails = [];
-      try { backupsAfterIfMatchFails = await fs.promises.readdir('.backups'); } catch {}
+      try { backupsAfterIfMatchFails = await fs.promises.readdir(suiteIso.tempBackupDir); } catch {}
 
       testAssert(
         missingIfMatchCatRes.status === 428 &&
@@ -10750,7 +12635,7 @@ async function runAutomatedTests() {
       await fs.promises.writeFile(catFilePath, originalCategoriesStore, 'utf8');
       await fs.promises.writeFile(articlesFilePath, originalArticlesStore, 'utf8');
       await fs.promises.writeFile(toolsFilePath, originalToolsStore, 'utf8');
-      try { await fs.promises.rm('.backups', { recursive: true, force: true }); } catch {}
+      try { await fs.promises.rm(suiteIso.tempBackupDir, { recursive: true, force: true }); } catch {}
 
       // 9.9 Request body contract & field validation errors -> 400
       const bizDetail2 = await fetch(`http://${HOST}:${PORT}/api/cms/categories/business`, {
@@ -10814,11 +12699,11 @@ async function runAutomatedTests() {
         const failClosedPayload = { category: { name: 'Should Fail Closed', description: 'Fail closed test description.' } };
         const assertFailClosed = async (label) => {
           let bBefore = [];
-          try { bBefore = await fs.promises.readdir('.backups'); } catch {}
+          try { bBefore = await fs.promises.readdir(suiteIso.tempBackupDir); } catch {}
           const r = await putCategoryRequest('business', failClosedPayload, { 'If-Match': bizETag2 });
           const t = await r.text();
           let bAfter = [];
-          try { bAfter = await fs.promises.readdir('.backups'); } catch {}
+          try { bAfter = await fs.promises.readdir(suiteIso.tempBackupDir); } catch {}
           testAssert(
             r.status === 500 &&
               r.headers.get('cache-control') === 'no-store' &&
@@ -10908,7 +12793,7 @@ async function runAutomatedTests() {
       });
       const bizETagConcA = bizDetailConcA.headers.get('etag');
       const concArtSlug = 'task48-cat-put-art-post-race';
-      task43CreatedMdFiles.push(`content/articles/${concArtSlug}.md`);
+      task43CreatedMdFiles.push(suiteIso.articleMdPath(concArtSlug));
 
       const [concCatPutA, concArtPostA] = await Promise.all([
         putCategoryRequest(
@@ -10947,7 +12832,7 @@ async function runAutomatedTests() {
       await fs.promises.writeFile(catFilePath, originalCategoriesStore, 'utf8');
       await fs.promises.writeFile(articlesFilePath, originalArticlesStore, 'utf8');
       await fs.promises.writeFile(toolsFilePath, originalToolsStore, 'utf8');
-      try { await fs.promises.unlink(`content/articles/${concArtSlug}.md`); } catch {}
+      try { await fs.promises.unlink(suiteIso.articleMdPath(concArtSlug)); } catch {}
 
       // B. Explicit lock-blocking test: Category PUT holds lock -> Article PUT & Category POST wait until Category PUT finishes
       const bizGetForBlock = await fetch(`http://${HOST}:${PORT}/api/cms/categories/business`, {
@@ -11050,12 +12935,12 @@ async function runAutomatedTests() {
       await fs.promises.writeFile(articlesFilePath, originalArticlesStore, 'utf8');
       await fs.promises.writeFile(toolsFilePath, originalToolsStore, 'utf8');
       await fs.promises.writeFile(
-        `content/articles/best-ai-tools-bulk-product-catalog-enrichment.md`,
+        suiteIso.articleMdPath('best-ai-tools-bulk-product-catalog-enrichment'),
         originalMarkdown,
         'utf8'
       );
       await fs.promises.writeFile(
-        'content/articles/best-free-ai-tools-2026.md',
+        suiteIso.articleMdPath('best-free-ai-tools-2026'),
         originalSecondMd,
         'utf8'
       );
@@ -11126,7 +13011,7 @@ async function runAutomatedTests() {
       await fs.promises.writeFile(catFilePath, originalCategoriesStore, 'utf8');
       await fs.promises.writeFile(articlesFilePath, originalArticlesStore, 'utf8');
       await fs.promises.writeFile(toolsFilePath, originalToolsStore, 'utf8');
-      try { await fs.promises.rm('.backups', { recursive: true, force: true }); } catch {}
+      try { await fs.promises.rm(suiteIso.tempBackupDir, { recursive: true, force: true }); } catch {}
 
       // 9.13 Full regression check: Category GET/POST + Article GET/POST/PUT/DELETE
       const reg48CatList = await fetch(categoriesEndpoint, { headers: { Cookie: freshCookie } });
@@ -11188,17 +13073,17 @@ async function runAutomatedTests() {
       await fs.promises.writeFile(articlesFilePath, originalArticlesStore, 'utf8');
       await fs.promises.writeFile(toolsFilePath, originalToolsStore, 'utf8');
       await fs.promises.writeFile(
-        `content/articles/${putTargetSlug}.md`,
+        suiteIso.articleMdPath(putTargetSlug),
         originalMarkdown,
         'utf8'
       );
       await fs.promises.writeFile(
-        'content/articles/best-free-ai-tools-2026.md',
+        suiteIso.articleMdPath('best-free-ai-tools-2026'),
         originalSecondMd,
         'utf8'
       );
-      try { await fs.promises.unlink('content/articles/task48-reg-article.md'); } catch {}
-      try { await fs.promises.rm('.backups', { recursive: true, force: true }); } catch {}
+      try { await fs.promises.unlink(suiteIso.articleMdPath('task48-reg-article')); } catch {}
+      try { await fs.promises.rm(suiteIso.tempBackupDir, { recursive: true, force: true }); } catch {}
     }
 
     // --------------------------------------------------------------------------
@@ -11271,7 +13156,7 @@ async function runAutomatedTests() {
       const catsAfterDel = JSON.parse(await fs.promises.readFile(catFilePath, 'utf8'));
 
       let backupsAfterDel = [];
-      try { backupsAfterDel = await fs.promises.readdir('.backups'); } catch {}
+      try { backupsAfterDel = await fs.promises.readdir(suiteIso.tempBackupDir); } catch {}
 
       testAssert(
         delOthersRes.status === 200 &&
@@ -11325,7 +13210,7 @@ async function runAutomatedTests() {
       await fs.promises.writeFile(catFilePath, originalCategoriesStore, 'utf8');
       await fs.promises.writeFile(articlesFilePath, originalArticlesStore, 'utf8');
       await fs.promises.writeFile(toolsFilePath, originalToolsStore, 'utf8');
-      try { await fs.promises.rm('.backups', { recursive: true, force: true }); } catch {}
+      try { await fs.promises.rm(suiteIso.tempBackupDir, { recursive: true, force: true }); } catch {}
 
       // 10.2 Precondition checks: Missing (428), Malformed (400), Stale (412), Unknown (404), Last (409), References (409)
       const othersGet2 = await fetch(`http://${HOST}:${PORT}/api/cms/categories/others`, {
@@ -11368,7 +13253,7 @@ async function runAutomatedTests() {
       const bothRefDel = await deleteCategoryRequest('video-audio', { 'If-Match': videoETagForDel });
 
       let backupsAfterPrecondFails = [];
-      try { backupsAfterPrecondFails = await fs.promises.readdir('.backups'); } catch {}
+      try { backupsAfterPrecondFails = await fs.promises.readdir(suiteIso.tempBackupDir); } catch {}
 
       testAssert(
         missingIfMatchDel.status === 428 &&
@@ -11435,7 +13320,7 @@ async function runAutomatedTests() {
         void soleUnrefArts;
 
         let soleBackups = [];
-        try { soleBackups = await fs.promises.readdir('.backups'); } catch {}
+        try { soleBackups = await fs.promises.readdir(suiteIso.tempBackupDir); } catch {}
 
         testAssert(
           soleDelRes.status === 409 &&
@@ -11574,7 +13459,7 @@ async function runAutomatedTests() {
       );
 
       await fs.promises.writeFile(catFilePath, originalCategoriesStore, 'utf8');
-      try { await fs.promises.rm('.backups', { recursive: true, force: true }); } catch {}
+      try { await fs.promises.rm(suiteIso.tempBackupDir, { recursive: true, force: true }); } catch {}
 
       // Non-empty DELETE body -> 400, > 4 KB -> 413
       const nonEmptyBodyDel1 = await deleteCategoryRequest(
@@ -11606,7 +13491,7 @@ async function runAutomatedTests() {
       try {
         const assertDeleteFailClosed = async (label) => {
           let bBefore = [];
-          try { bBefore = await fs.promises.readdir('.backups'); } catch {}
+          try { bBefore = await fs.promises.readdir(suiteIso.tempBackupDir); } catch {}
           const cBefore = fs.existsSync(catFilePath) ? await fs.promises.readFile(catFilePath, 'utf8') : null;
           const aBefore = fs.existsSync(articlesFilePath) ? await fs.promises.readFile(articlesFilePath, 'utf8') : null;
           const tBefore = fs.existsSync(toolsFilePath) ? await fs.promises.readFile(toolsFilePath, 'utf8') : null;
@@ -11615,7 +13500,7 @@ async function runAutomatedTests() {
           const text = await r.text();
 
           let bAfter = [];
-          try { bAfter = await fs.promises.readdir('.backups'); } catch {}
+          try { bAfter = await fs.promises.readdir(suiteIso.tempBackupDir); } catch {}
           const cAfter = fs.existsSync(catFilePath) ? await fs.promises.readFile(catFilePath, 'utf8') : null;
           const aAfter = fs.existsSync(articlesFilePath) ? await fs.promises.readFile(articlesFilePath, 'utf8') : null;
           const tAfter = fs.existsSync(toolsFilePath) ? await fs.promises.readFile(toolsFilePath, 'utf8') : null;
@@ -11670,7 +13555,7 @@ async function runAutomatedTests() {
         await fs.promises.writeFile(catFilePath, originalCategoriesStore, 'utf8');
         await fs.promises.writeFile(articlesFilePath, originalArticlesStore, 'utf8');
         await fs.promises.writeFile(toolsFilePath, originalToolsStore, 'utf8');
-        try { await fs.promises.rm('.backups', { recursive: true, force: true }); } catch {}
+        try { await fs.promises.rm(suiteIso.tempBackupDir, { recursive: true, force: true }); } catch {}
       }
 
       // 10.5 Simulated mutation failure & rollback verification
@@ -11692,12 +13577,12 @@ async function runAutomatedTests() {
           getActiveMutexCount() === 0,
         'Task 50 (Rollback on mutation failure): Returns sanitized 500, restores categories.json byte-for-byte, leaves articles/tools untouched, and releases all mutexes'
       );
-      try { await fs.promises.rm('.backups', { recursive: true, force: true }); } catch {}
+      try { await fs.promises.rm(suiteIso.tempBackupDir, { recursive: true, force: true }); } catch {}
 
       // 10.6 Concurrency tests
       // A. Concurrent Category DELETE vs Article POST targeting same category ('others')
       const concArtDelSlug = 'task50-cat-del-art-post-race';
-      task43CreatedMdFiles.push(`content/articles/${concArtDelSlug}.md`);
+      task43CreatedMdFiles.push(suiteIso.articleMdPath(concArtDelSlug));
       const [raceCatDelA, raceArtPostA] = await Promise.all([
         deleteCategoryRequest('others', { 'If-Match': othersETag2 }),
         fetch(`http://${HOST}:${PORT}/api/cms/articles`, {
@@ -11728,7 +13613,7 @@ async function runAutomatedTests() {
 
       await fs.promises.writeFile(catFilePath, originalCategoriesStore, 'utf8');
       await fs.promises.writeFile(articlesFilePath, originalArticlesStore, 'utf8');
-      try { await fs.promises.unlink(`content/articles/${concArtDelSlug}.md`); } catch {}
+      try { await fs.promises.unlink(suiteIso.articleMdPath(concArtDelSlug)); } catch {}
 
       // B. Concurrent Category DELETE ('others') vs Article PUT (moving article to 'others')
       const artPutMoveUrl = `http://${HOST}:${PORT}/api/cms/articles/best-free-ai-tools-2026`;
@@ -11769,7 +13654,7 @@ async function runAutomatedTests() {
 
       await fs.promises.writeFile(catFilePath, originalCategoriesStore, 'utf8');
       await fs.promises.writeFile(articlesFilePath, originalArticlesStore, 'utf8');
-      await fs.promises.writeFile('content/articles/best-free-ai-tools-2026.md', originalSecondMd, 'utf8');
+      await fs.promises.writeFile(suiteIso.articleMdPath('best-free-ai-tools-2026'), originalSecondMd, 'utf8');
 
       // C. Concurrent Category DELETE vs Category POST
       const [raceCatDelC, raceCatPostC] = await Promise.all([
@@ -11840,7 +13725,7 @@ async function runAutomatedTests() {
       );
 
       await fs.promises.writeFile(catFilePath, originalCategoriesStore, 'utf8');
-      try { await fs.promises.rm('.backups', { recursive: true, force: true }); } catch {}
+      try { await fs.promises.rm(suiteIso.tempBackupDir, { recursive: true, force: true }); } catch {}
 
       // 10.7 Regression check: Category GET/POST/PUT/DELETE and Article GET/POST/PUT/DELETE
       const reg50CatPost = await postCategoryRequest(
@@ -11908,17 +13793,17 @@ async function runAutomatedTests() {
       await fs.promises.writeFile(articlesFilePath, originalArticlesStore, 'utf8');
       await fs.promises.writeFile(toolsFilePath, originalToolsStore, 'utf8');
       await fs.promises.writeFile(
-        `content/articles/${putTargetSlug}.md`,
+        suiteIso.articleMdPath(putTargetSlug),
         originalMarkdown,
         'utf8'
       );
       await fs.promises.writeFile(
-        'content/articles/best-free-ai-tools-2026.md',
+        suiteIso.articleMdPath('best-free-ai-tools-2026'),
         originalSecondMd,
         'utf8'
       );
-      try { await fs.promises.unlink('content/articles/task50-reg-article.md'); } catch {}
-      try { await fs.promises.rm('.backups', { recursive: true, force: true }); } catch {}
+      try { await fs.promises.unlink(suiteIso.articleMdPath('task50-reg-article')); } catch {}
+      try { await fs.promises.rm(suiteIso.tempBackupDir, { recursive: true, force: true }); } catch {}
     }
 
     // --------------------------------------------------------------------------
@@ -12263,7 +14148,7 @@ async function runAutomatedTests() {
     } finally {
       await fs.promises.writeFile(toolsFilePath, originalToolsStore, 'utf8');
       await fs.promises.writeFile(catFilePath, originalCategoriesStore, 'utf8');
-      try { await fs.promises.rm('.backups', { recursive: true, force: true }); } catch {}
+      try { await fs.promises.rm(suiteIso.tempBackupDir, { recursive: true, force: true }); } catch {}
     }
 
     // --------------------------------------------------------------------------
@@ -12320,7 +14205,7 @@ async function runAutomatedTests() {
       const catBytesAfterToolPost = await fs.promises.readFile(catFilePath);
       const catStatAfterToolPost = await fs.promises.stat(catFilePath);
       let backupsAfterToolPost = [];
-      try { backupsAfterToolPost = await fs.promises.readdir('.backups'); } catch {}
+      try { backupsAfterToolPost = await fs.promises.readdir(suiteIso.tempBackupDir); } catch {}
 
       testAssert(
         createToolRes.status === 201 &&
@@ -12421,13 +14306,13 @@ async function runAutomatedTests() {
 
       // Restore tools.json before negative/security tests
       await fs.promises.writeFile(toolsFilePath, originalToolsStore, 'utf8');
-      try { await fs.promises.rm('.backups', { recursive: true, force: true }); } catch {}
+      try { await fs.promises.rm(suiteIso.tempBackupDir, { recursive: true, force: true }); } catch {}
 
       // 11b.3 Duplicate slug -> 409 Conflict with zero mutations and zero backups
       const toolsBeforeDup56 = await fs.promises.readFile(toolsFilePath, 'utf8');
       const dupToolSlugRes = await postToolRequest(makeToolCreatePayload({ slug: 'chatgpt' }));
       let backupsAfterDup56 = [];
-      try { backupsAfterDup56 = await fs.promises.readdir('.backups'); } catch {}
+      try { backupsAfterDup56 = await fs.promises.readdir(suiteIso.tempBackupDir); } catch {}
       testAssert(
         dupToolSlugRes.status === 409 &&
           dupToolSlugRes.headers.get('cache-control') === 'no-store' &&
@@ -12442,7 +14327,7 @@ async function runAutomatedTests() {
         makeToolCreatePayload({ slug: 'unknown-cat-tool', category: 'non-existent-category' })
       );
       let backupsAfterUnknownCat56 = [];
-      try { backupsAfterUnknownCat56 = await fs.promises.readdir('.backups'); } catch {}
+      try { backupsAfterUnknownCat56 = await fs.promises.readdir(suiteIso.tempBackupDir); } catch {}
       testAssert(
         unknownCatToolPostRes.status === 400 &&
           unknownCatToolPostRes.headers.get('cache-control') === 'no-store' &&
@@ -12629,7 +14514,7 @@ async function runAutomatedTests() {
           const r = await postToolRequest(makeToolCreatePayload({ slug: 'fail-closed-tool' }));
           const text = await r.text();
           let backups = [];
-          try { backups = await fs.promises.readdir('.backups'); } catch {}
+          try { backups = await fs.promises.readdir(suiteIso.tempBackupDir); } catch {}
           testAssert(
             r.status === 500 &&
               r.headers.get('cache-control') === 'no-store' &&
@@ -12666,7 +14551,7 @@ async function runAutomatedTests() {
       } finally {
         await fs.promises.writeFile(catFilePath, originalCategoriesStore, 'utf8');
         await fs.promises.writeFile(toolsFilePath, originalToolsStore, 'utf8');
-        try { await fs.promises.rm('.backups', { recursive: true, force: true }); } catch {}
+        try { await fs.promises.rm(suiteIso.tempBackupDir, { recursive: true, force: true }); } catch {}
       }
 
       // 11b.9 Transaction rollback on simulated mutation failure & lock release
@@ -12687,7 +14572,7 @@ async function runAutomatedTests() {
           getActiveMutexCount() === 0,
         'Task 56 (Rollback on mutation failure): Returns sanitized 500, restores tools.json byte-for-byte, leaves categories.json untouched, and releases all locks'
       );
-      try { await fs.promises.rm('.backups', { recursive: true, force: true }); } catch {}
+      try { await fs.promises.rm(suiteIso.tempBackupDir, { recursive: true, force: true }); } catch {}
 
       // 11b.10 Concurrency & Race-Condition Tests
       // A. Lock blocking: Category write lock held while adding a new category; Tool POST must wait and see locked snapshot
@@ -12850,7 +14735,7 @@ async function runAutomatedTests() {
     } finally {
       await fs.promises.writeFile(toolsFilePath, originalToolsStore, 'utf8');
       await fs.promises.writeFile(catFilePath, originalCategoriesStore, 'utf8');
-      try { await fs.promises.rm('.backups', { recursive: true, force: true }); } catch {}
+      try { await fs.promises.rm(suiteIso.tempBackupDir, { recursive: true, force: true }); } catch {}
     }
 
     // --------------------------------------------------------------------------
@@ -12993,7 +14878,7 @@ async function runAutomatedTests() {
       const catBytesAfter58 = await fs.promises.readFile(catFilePath);
       const catStatAfter58 = await fs.promises.stat(catFilePath);
       let backupsAfterToolPut = [];
-      try { backupsAfterToolPut = await fs.promises.readdir('.backups'); } catch {}
+      try { backupsAfterToolPut = await fs.promises.readdir(suiteIso.tempBackupDir); } catch {}
 
       const toolsAfterFullPut = JSON.parse(await fs.promises.readFile(toolsFilePath, 'utf8'));
       const otherToolsBefore = parsedOriginalTools58.filter((t) => t.slug !== 'chatgpt');
@@ -13105,7 +14990,7 @@ async function runAutomatedTests() {
 
       // Restore tools.json before negative, ETag, security, rollback, and concurrency tests
       await fs.promises.writeFile(toolsFilePath, originalToolsStore, 'utf8');
-      try { await fs.promises.rm('.backups', { recursive: true, force: true }); } catch {}
+      try { await fs.promises.rm(suiteIso.tempBackupDir, { recursive: true, force: true }); } catch {}
 
       const freshChatgptGet = await fetch(`http://${HOST}:${PORT}/api/cms/tools/chatgpt`, {
         headers: { Cookie: freshCookie },
@@ -13153,7 +15038,7 @@ async function runAutomatedTests() {
         { 'If-Match': `"${'a'.repeat(64)}"` }
       );
       let backupsAfterIfMatch58 = [];
-      try { backupsAfterIfMatch58 = await fs.promises.readdir('.backups'); } catch {}
+      try { backupsAfterIfMatch58 = await fs.promises.readdir(suiteIso.tempBackupDir); } catch {}
 
       testAssert(
         missingIfMatchToolRes.status === 428 &&
@@ -13362,7 +15247,7 @@ async function runAutomatedTests() {
       );
 
       await fs.promises.writeFile(toolsFilePath, originalToolsStore, 'utf8');
-      try { await fs.promises.rm('.backups', { recursive: true, force: true }); } catch {}
+      try { await fs.promises.rm(suiteIso.tempBackupDir, { recursive: true, force: true }); } catch {}
 
       // 11c.8 Fail-closed on corrupt/empty/schema-invalid/missing categories.json and tools.json -> sanitized 500
       try {
@@ -13374,7 +15259,7 @@ async function runAutomatedTests() {
           );
           const text = await r.text();
           let backups = [];
-          try { backups = await fs.promises.readdir('.backups'); } catch {}
+          try { backups = await fs.promises.readdir(suiteIso.tempBackupDir); } catch {}
           testAssert(
             r.status === 500 &&
               r.headers.get('cache-control') === 'no-store' &&
@@ -13411,7 +15296,7 @@ async function runAutomatedTests() {
       } finally {
         await fs.promises.writeFile(catFilePath, originalCategoriesStore, 'utf8');
         await fs.promises.writeFile(toolsFilePath, originalToolsStore, 'utf8');
-        try { await fs.promises.rm('.backups', { recursive: true, force: true }); } catch {}
+        try { await fs.promises.rm(suiteIso.tempBackupDir, { recursive: true, force: true }); } catch {}
       }
 
       // 11c.9 Transaction rollback byte-for-byte restoration & lock release
@@ -13433,7 +15318,7 @@ async function runAutomatedTests() {
           getActiveMutexCount() === 0,
         'Task 58 (Rollback on mutation failure): Returns sanitized 500, restores tools.json byte-for-byte, leaves categories.json untouched, releases locks'
       );
-      try { await fs.promises.rm('.backups', { recursive: true, force: true }); } catch {}
+      try { await fs.promises.rm(suiteIso.tempBackupDir, { recursive: true, force: true }); } catch {}
 
       // 11c.10 Concurrency & Race-Condition Tests
       // A. Same slug concurrent PUT -> one 200, one 412
@@ -13587,7 +15472,7 @@ async function runAutomatedTests() {
     } finally {
       await fs.promises.writeFile(toolsFilePath, originalToolsStore, 'utf8');
       await fs.promises.writeFile(catFilePath, originalCategoriesStore, 'utf8');
-      try { await fs.promises.rm('.backups', { recursive: true, force: true }); } catch {}
+      try { await fs.promises.rm(suiteIso.tempBackupDir, { recursive: true, force: true }); } catch {}
     }
 
     // --------------------------------------------------------------------------
@@ -13629,7 +15514,7 @@ async function runAutomatedTests() {
       const catStatAfterDel60 = await fs.promises.stat(catFilePath);
       const toolsAfterDel60 = JSON.parse(await fs.promises.readFile(toolsFilePath, 'utf8'));
       let backupsAfterDel60 = [];
-      try { backupsAfterDel60 = await fs.promises.readdir('.backups'); } catch {}
+      try { backupsAfterDel60 = await fs.promises.readdir(suiteIso.tempBackupDir); } catch {}
 
       testAssert(
         delChatgptRes60.status === 200 &&
@@ -13681,7 +15566,7 @@ async function runAutomatedTests() {
 
       // Deleting the last remaining tool -> tools.json becomes [] (no LAST_TOOL restriction)
       await fs.promises.writeFile(toolsFilePath, originalToolsStore, 'utf8');
-      try { await fs.promises.rm('.backups', { recursive: true, force: true }); } catch {}
+      try { await fs.promises.rm(suiteIso.tempBackupDir, { recursive: true, force: true }); } catch {}
 
       const singleToolOnly = parsedOriginalTools60.filter((t) => t.slug === 'chatgpt');
       await fs.promises.writeFile(toolsFilePath, JSON.stringify(singleToolOnly, null, 2) + '\n', 'utf8');
@@ -13704,7 +15589,7 @@ async function runAutomatedTests() {
       // Restore pristine state before negative, security, rollback, and concurrency tests
       await fs.promises.writeFile(toolsFilePath, originalToolsStore, 'utf8');
       await fs.promises.writeFile(catFilePath, originalCategoriesStore, 'utf8');
-      try { await fs.promises.rm('.backups', { recursive: true, force: true }); } catch {}
+      try { await fs.promises.rm(suiteIso.tempBackupDir, { recursive: true, force: true }); } catch {}
 
       const freshToolGet60 = await fetch(`http://${HOST}:${PORT}/api/cms/tools/chatgpt`, {
         headers: { Cookie: freshCookie },
@@ -13770,7 +15655,7 @@ async function runAutomatedTests() {
       });
       const unknownToolText60 = await unknownToolDel60.text();
       let backupsAfterPrecond60 = [];
-      try { backupsAfterPrecond60 = await fs.promises.readdir('.backups'); } catch {}
+      try { backupsAfterPrecond60 = await fs.promises.readdir(suiteIso.tempBackupDir); } catch {}
 
       testAssert(
         missingIfMatchDel60.status === 428 &&
@@ -13858,7 +15743,7 @@ async function runAutomatedTests() {
       );
 
       await fs.promises.writeFile(toolsFilePath, originalToolsStore, 'utf8');
-      try { await fs.promises.rm('.backups', { recursive: true, force: true }); } catch {}
+      try { await fs.promises.rm(suiteIso.tempBackupDir, { recursive: true, force: true }); } catch {}
 
       // Empty whitespace body (200), non-empty body (400), oversized > 4KB body (413)
       const nonEmptyToolDel1 = await deleteToolRequest(
@@ -13893,7 +15778,7 @@ async function runAutomatedTests() {
       );
 
       await fs.promises.writeFile(toolsFilePath, originalToolsStore, 'utf8');
-      try { await fs.promises.rm('.backups', { recursive: true, force: true }); } catch {}
+      try { await fs.promises.rm(suiteIso.tempBackupDir, { recursive: true, force: true }); } catch {}
 
       // 11d.4 Fail-closed on corrupt/empty/schema-invalid/missing categories.json and tools.json -> sanitized 500
       try {
@@ -13901,7 +15786,7 @@ async function runAutomatedTests() {
           const r = await deleteToolRequest('chatgpt', { 'If-Match': baseToolETag60 });
           const text = await r.text();
           let backups = [];
-          try { backups = await fs.promises.readdir('.backups'); } catch {}
+          try { backups = await fs.promises.readdir(suiteIso.tempBackupDir); } catch {}
           testAssert(
             r.status === 500 &&
               r.headers.get('cache-control') === 'no-store' &&
@@ -13938,7 +15823,7 @@ async function runAutomatedTests() {
       } finally {
         await fs.promises.writeFile(catFilePath, originalCategoriesStore, 'utf8');
         await fs.promises.writeFile(toolsFilePath, originalToolsStore, 'utf8');
-        try { await fs.promises.rm('.backups', { recursive: true, force: true }); } catch {}
+        try { await fs.promises.rm(suiteIso.tempBackupDir, { recursive: true, force: true }); } catch {}
       }
 
       // 11d.5 Rollback on simulated mutation failure (x-test-simulate-failure-at-index: 0)
@@ -13961,7 +15846,7 @@ async function runAutomatedTests() {
           getActiveMutexCount() === 0,
         'Task 60 (Rollback on mutation failure): Returns sanitized 500, restores tools.json byte-for-byte, leaves categories.json untouched, releases locks'
       );
-      try { await fs.promises.rm('.backups', { recursive: true, force: true }); } catch {}
+      try { await fs.promises.rm(suiteIso.tempBackupDir, { recursive: true, force: true }); } catch {}
 
       // 11d.6 Concurrency tests
       // A. Same Tool, same ETag, two concurrent DELETEs -> one 200, one 404
@@ -14128,7 +16013,7 @@ async function runAutomatedTests() {
 
       await fs.promises.writeFile(catFilePath, originalCategoriesStore, 'utf8');
       await fs.promises.writeFile(toolsFilePath, originalToolsStore, 'utf8');
-      try { await fs.promises.rm('.backups', { recursive: true, force: true }); } catch {}
+      try { await fs.promises.rm(suiteIso.tempBackupDir, { recursive: true, force: true }); } catch {}
 
       // 11d.7 Regression check: Tool GET/POST/PUT/DELETE, Category API, and Article API all operate normally
       const reg60Post = await postToolRequest(
@@ -14168,7 +16053,7 @@ async function runAutomatedTests() {
       try {
         await fs.promises.writeFile(toolsFilePath, originalToolsStore, 'utf8');
         await fs.promises.writeFile(catFilePath, originalCategoriesStore, 'utf8');
-        try { await fs.promises.rm('.backups', { recursive: true, force: true }); } catch {}
+        try { await fs.promises.rm(suiteIso.tempBackupDir, { recursive: true, force: true }); } catch {}
 
         const parsedBaselineTools62 = JSON.parse(originalToolsStore);
         const baselineChatGpt62 = parsedBaselineTools62.find((t) => t.slug === 'chatgpt');
@@ -14213,8 +16098,8 @@ async function runAutomatedTests() {
         const toolsStatAfter62 = await fs.promises.stat(toolsFilePath);
         const catBytesAfter62 = await fs.promises.readFile(catFilePath);
         const catStatAfter62 = await fs.promises.stat(catFilePath);
-        const backupsExistAfterGet62 = fs.existsSync('.backups')
-          ? (await fs.promises.readdir('.backups')).length > 0
+        const backupsExistAfterGet62 = fs.existsSync(suiteIso.tempBackupDir)
+          ? (await fs.promises.readdir(suiteIso.tempBackupDir)).length > 0
           : false;
         testAssert(
           !backupsExistAfterGet62 &&
@@ -14461,7 +16346,7 @@ async function runAutomatedTests() {
       } finally {
         await fs.promises.writeFile(toolsFilePath, originalToolsStore, 'utf8');
         await fs.promises.writeFile(catFilePath, originalCategoriesStore, 'utf8');
-        try { await fs.promises.rm('.backups', { recursive: true, force: true }); } catch {}
+        try { await fs.promises.rm(suiteIso.tempBackupDir, { recursive: true, force: true }); } catch {}
       }
 
       // ------------------------------------------------------------------------
@@ -14472,7 +16357,7 @@ async function runAutomatedTests() {
       try {
         await fs.promises.writeFile(toolsFilePath, originalToolsStore, 'utf8');
         await fs.promises.writeFile(catFilePath, originalCategoriesStore, 'utf8');
-        try { await fs.promises.rm('.backups', { recursive: true, force: true }); } catch {}
+        try { await fs.promises.rm(suiteIso.tempBackupDir, { recursive: true, force: true }); } catch {}
 
         const parsedCats65 = JSON.parse(originalCategoriesStore);
         const aiWritingCat65 = parsedCats65.find((c) => c.slug === 'ai-writing');
@@ -14904,7 +16789,7 @@ async function runAutomatedTests() {
 
         await fs.promises.writeFile(catFilePath, originalCategoriesStore, 'utf8');
         await fs.promises.writeFile(toolsFilePath, originalToolsStore, 'utf8');
-        try { await fs.promises.rm('.backups', { recursive: true, force: true }); } catch {}
+        try { await fs.promises.rm(suiteIso.tempBackupDir, { recursive: true, force: true }); } catch {}
 
         // 11f.E Rollback on simulated mutation failure during clearing operation
         const chatgptBeforeRb65Get = await fetch(`http://${HOST}:${PORT}/api/cms/tools/chatgpt`, {
@@ -14944,12 +16829,12 @@ async function runAutomatedTests() {
       } finally {
         await fs.promises.writeFile(toolsFilePath, originalToolsStore, 'utf8');
         await fs.promises.writeFile(catFilePath, originalCategoriesStore, 'utf8');
-        try { await fs.promises.rm('.backups', { recursive: true, force: true }); } catch {}
+        try { await fs.promises.rm(suiteIso.tempBackupDir, { recursive: true, force: true }); } catch {}
       }
     } finally {
       await fs.promises.writeFile(toolsFilePath, originalToolsStore, 'utf8');
       await fs.promises.writeFile(catFilePath, originalCategoriesStore, 'utf8');
-      try { await fs.promises.rm('.backups', { recursive: true, force: true }); } catch {}
+      try { await fs.promises.rm(suiteIso.tempBackupDir, { recursive: true, force: true }); } catch {}
     }
 
     // --------------------------------------------------------------------------
@@ -14958,10 +16843,10 @@ async function runAutomatedTests() {
     console.log('\n--- 11g. Task 67 — GET Tools Collection Raw Path Matching Fix Tests ---');
 
     try {
-      try { await fs.promises.rm('.backups', { recursive: true, force: true }); } catch {}
+      try { await fs.promises.rm(suiteIso.tempBackupDir, { recursive: true, force: true }); } catch {}
       const toolsBefore67 = await fs.promises.readFile(toolsFilePath, 'utf8');
       const catsBefore67 = await fs.promises.readFile(catFilePath, 'utf8');
-      const artsBefore67 = await fs.promises.readFile('content/articles.json', 'utf8');
+      const artsBefore67 = await fs.promises.readFile(suiteIso.articlesJsonPath, 'utf8');
       const parsedToolsBefore67 = JSON.parse(toolsBefore67);
 
       // 11g.1 Valid paths (authenticated and unauthenticated)
@@ -15071,10 +16956,10 @@ async function runAutomatedTests() {
       );
 
       // 11g.3 Read-only GET requests create no backups or mutations, and active mutex count is 0
-      const backupsAfter67 = fs.existsSync('.backups') ? await fs.promises.readdir('.backups') : [];
+      const backupsAfter67 = fs.existsSync(suiteIso.tempBackupDir) ? await fs.promises.readdir(suiteIso.tempBackupDir) : [];
       const toolsAfter67 = await fs.promises.readFile(toolsFilePath, 'utf8');
       const catsAfter67 = await fs.promises.readFile(catFilePath, 'utf8');
-      const artsAfter67 = await fs.promises.readFile('content/articles.json', 'utf8');
+      const artsAfter67 = await fs.promises.readFile(suiteIso.articlesJsonPath, 'utf8');
 
       testAssert(
         backupsAfter67.length === 0 &&
@@ -15085,7 +16970,7 @@ async function runAutomatedTests() {
         'Task 67 (Read-only & Mutex check): GET requests create no backups or mutations and getActiveMutexCount() === 0'
       );
     } finally {
-      try { await fs.promises.rm('.backups', { recursive: true, force: true }); } catch {}
+      try { await fs.promises.rm(suiteIso.tempBackupDir, { recursive: true, force: true }); } catch {}
     }
 
     // --------------------------------------------------------------------------
@@ -15094,10 +16979,10 @@ async function runAutomatedTests() {
     console.log('\n--- 11h. Task 69 — Malformed URL & Absolute-Form Authority Validation ---');
 
     try {
-      try { await fs.promises.rm('.backups', { recursive: true, force: true }); } catch {}
+      try { await fs.promises.rm(suiteIso.tempBackupDir, { recursive: true, force: true }); } catch {}
       const toolsBefore69 = await fs.promises.readFile(toolsFilePath, 'utf8');
       const catsBefore69 = await fs.promises.readFile(catFilePath, 'utf8');
-      const artsBefore69 = await fs.promises.readFile('content/articles.json', 'utf8');
+      const artsBefore69 = await fs.promises.readFile(suiteIso.articlesJsonPath, 'utf8');
       const parsedToolsBefore69 = JSON.parse(toolsBefore69);
 
       function sendRawTargetRequest(method, rawTarget, headers = {}, bodyStr = null) {
@@ -15322,10 +17207,10 @@ async function runAutomatedTests() {
       );
 
       // 11h.5 Content integrity, backups, and mutex count check
-      const backupsAfter69 = fs.existsSync('.backups') ? await fs.promises.readdir('.backups') : [];
+      const backupsAfter69 = fs.existsSync(suiteIso.tempBackupDir) ? await fs.promises.readdir(suiteIso.tempBackupDir) : [];
       const toolsAfter69 = await fs.promises.readFile(toolsFilePath, 'utf8');
       const catsAfter69 = await fs.promises.readFile(catFilePath, 'utf8');
-      const artsAfter69 = await fs.promises.readFile('content/articles.json', 'utf8');
+      const artsAfter69 = await fs.promises.readFile(suiteIso.articlesJsonPath, 'utf8');
 
       testAssert(
         backupsAfter69.length === 0 &&
@@ -15336,7 +17221,7 @@ async function runAutomatedTests() {
         'Task 69 (Integrity & Mutex check): Zero backups, zero content mutations, and getActiveMutexCount() === 0'
       );
     } finally {
-      try { await fs.promises.rm('.backups', { recursive: true, force: true }); } catch {}
+      try { await fs.promises.rm(suiteIso.tempBackupDir, { recursive: true, force: true }); } catch {}
     }
 
     // --------------------------------------------------------------------------
@@ -15345,12 +17230,12 @@ async function runAutomatedTests() {
     console.log('\n--- 11i. Task 71 — Global Scheme-Relative URL Rejection Tests ---');
 
     try {
-      try { await fs.promises.rm('.backups', { recursive: true, force: true }); } catch {}
+      try { await fs.promises.rm(suiteIso.tempBackupDir, { recursive: true, force: true }); } catch {}
       const toolsBefore71 = await fs.promises.readFile(toolsFilePath, 'utf8');
       const catsBefore71 = await fs.promises.readFile(catFilePath, 'utf8');
-      const artsBefore71 = await fs.promises.readFile('content/articles.json', 'utf8');
-      const settingsBefore71 = await fs.promises.readFile('content/settings.json', 'utf8');
-      const adsBefore71 = await fs.promises.readFile('content/ads.json', 'utf8');
+      const artsBefore71 = await fs.promises.readFile(suiteIso.articlesJsonPath, 'utf8');
+      const settingsBefore71 = await fs.promises.readFile(suiteIso.settingsJsonPath, 'utf8');
+      const adsBefore71 = await fs.promises.readFile(suiteIso.adsJsonPath, 'utf8');
 
       function sendRawTarget71(method, rawTarget, headers = {}, bodyStr = null) {
         return new Promise((resolve, reject) => {
@@ -15504,12 +17389,12 @@ async function runAutomatedTests() {
       );
 
       // Verify content integrity, zero backups, and active mutex count === 0
-      const backupsAfter71 = fs.existsSync('.backups') ? await fs.promises.readdir('.backups') : [];
+      const backupsAfter71 = fs.existsSync(suiteIso.tempBackupDir) ? await fs.promises.readdir(suiteIso.tempBackupDir) : [];
       const toolsAfter71 = await fs.promises.readFile(toolsFilePath, 'utf8');
       const catsAfter71 = await fs.promises.readFile(catFilePath, 'utf8');
-      const artsAfter71 = await fs.promises.readFile('content/articles.json', 'utf8');
-      const settingsAfter71 = await fs.promises.readFile('content/settings.json', 'utf8');
-      const adsAfter71 = await fs.promises.readFile('content/ads.json', 'utf8');
+      const artsAfter71 = await fs.promises.readFile(suiteIso.articlesJsonPath, 'utf8');
+      const settingsAfter71 = await fs.promises.readFile(suiteIso.settingsJsonPath, 'utf8');
+      const adsAfter71 = await fs.promises.readFile(suiteIso.adsJsonPath, 'utf8');
 
       testAssert(
         backupsAfter71.length === 0 &&
@@ -15522,7 +17407,7 @@ async function runAutomatedTests() {
         'Task 71 (Integrity & Mutex check): Zero backups, zero content mutations across all stores, and getActiveMutexCount() === 0'
       );
     } finally {
-      try { await fs.promises.rm('.backups', { recursive: true, force: true }); } catch {}
+      try { await fs.promises.rm(suiteIso.tempBackupDir, { recursive: true, force: true }); } catch {}
     }
 
     // --------------------------------------------------------------------------
@@ -15531,12 +17416,12 @@ async function runAutomatedTests() {
     console.log('\n--- 11j. Task 72 — Cache-Control: no-store on Forbidden and Auth 405/415 Errors ---');
 
     try {
-      try { await fs.promises.rm('.backups', { recursive: true, force: true }); } catch {}
+      try { await fs.promises.rm(suiteIso.tempBackupDir, { recursive: true, force: true }); } catch {}
       const toolsBefore72 = await fs.promises.readFile(toolsFilePath, 'utf8');
       const catsBefore72 = await fs.promises.readFile(catFilePath, 'utf8');
-      const artsBefore72 = await fs.promises.readFile('content/articles.json', 'utf8');
-      const settingsBefore72 = await fs.promises.readFile('content/settings.json', 'utf8');
-      const adsBefore72 = await fs.promises.readFile('content/ads.json', 'utf8');
+      const artsBefore72 = await fs.promises.readFile(suiteIso.articlesJsonPath, 'utf8');
+      const settingsBefore72 = await fs.promises.readFile(suiteIso.settingsJsonPath, 'utf8');
+      const adsBefore72 = await fs.promises.readFile(suiteIso.adsJsonPath, 'utf8');
 
       const hasNoSensitiveLeak72 = (text) =>
         typeof text === 'string' &&
@@ -15739,12 +17624,12 @@ async function runAutomatedTests() {
       );
 
       // 11j.6 Content integrity, zero backups, and active mutex count === 0
-      const backupsAfter72 = fs.existsSync('.backups') ? await fs.promises.readdir('.backups') : [];
+      const backupsAfter72 = fs.existsSync(suiteIso.tempBackupDir) ? await fs.promises.readdir(suiteIso.tempBackupDir) : [];
       const toolsAfter72 = await fs.promises.readFile(toolsFilePath, 'utf8');
       const catsAfter72 = await fs.promises.readFile(catFilePath, 'utf8');
-      const artsAfter72 = await fs.promises.readFile('content/articles.json', 'utf8');
-      const settingsAfter72 = await fs.promises.readFile('content/settings.json', 'utf8');
-      const adsAfter72 = await fs.promises.readFile('content/ads.json', 'utf8');
+      const artsAfter72 = await fs.promises.readFile(suiteIso.articlesJsonPath, 'utf8');
+      const settingsAfter72 = await fs.promises.readFile(suiteIso.settingsJsonPath, 'utf8');
+      const adsAfter72 = await fs.promises.readFile(suiteIso.adsJsonPath, 'utf8');
 
       testAssert(
         backupsAfter72.length === 0 &&
@@ -15757,25 +17642,13 @@ async function runAutomatedTests() {
         'Task 72 (Integrity & Mutex check): Zero backups, zero content mutations, and getActiveMutexCount() === 0'
       );
     } finally {
-      try { await fs.promises.rm('.backups', { recursive: true, force: true }); } catch {}
+      try { await fs.promises.rm(suiteIso.tempBackupDir, { recursive: true, force: true }); } catch {}
     }
   } finally {
-    // Guaranteed final cleanup
-    try {
-      await fs.promises.writeFile('content/articles.json', originalArticlesStore, 'utf8');
-    } catch {}
-    try {
-      await fs.promises.writeFile('content/categories.json', originalCategoriesStore, 'utf8');
-    } catch {}
-    try {
-      await fs.promises.writeFile('content/tools.json', originalToolsStore, 'utf8');
-    } catch {}
-    for (const mdFile of task43CreatedMdFiles) {
-      try { await fs.promises.unlink(mdFile); } catch {}
-    }
     if (serverStarted) {
       await new Promise((resolve) => server.close(resolve));
     }
+    await suiteIso.cleanup(origProjectRootSuite, origBackupDirSuite);
   }
 
   // --------------------------------------------------------------------------
@@ -15917,7 +17790,7 @@ async function runAutomatedTests() {
   );
 
   // Verify real tools.json entries produce valid deterministic ETags
-  const rawToolsStore = await fs.promises.readFile('content/tools.json', 'utf8');
+  const rawToolsStore = await fs.promises.readFile(resolveSecureJsonPath('tools.json', realProjectRoot), 'utf8');
   const parsedToolsStore = JSON.parse(rawToolsStore);
   const allRealToolsValid =
     Array.isArray(parsedToolsStore) &&
@@ -16152,10 +18025,7 @@ async function runAutomatedTests() {
   // --------------------------------------------------------------------------
   console.log('\n--- 13. Task 62 — Production Test-Hook Hardening (Normal Runtime) ---');
 
-  const normBackupTools = await fs.promises.readFile('content/tools.json', 'utf8');
-  const normBackupCategories = await fs.promises.readFile('content/categories.json', 'utf8');
-  const normBackupArticles = await fs.promises.readFile('content/articles.json', 'utf8');
-  try { await fs.promises.rm('.backups', { recursive: true, force: true }); } catch {}
+  const task62Iso = await createIsolatedTestProjectRoot('ainovex-task62-', realProjectRoot);
 
   let normalChild = null;
   try {
@@ -16171,6 +18041,10 @@ async function runAutomatedTests() {
 
       normalChild = spawn(process.execPath, ['scripts/cms-server.mjs'], {
         stdio: ['ignore', 'pipe', 'pipe'],
+        env: {
+          ...process.env,
+          AINOVEX_CMS_TEST_ROOT: task62Iso.tempRoot,
+        },
       });
 
       normalChild.stdout.on('data', (chunk) => {
@@ -16312,7 +18186,7 @@ async function runAutomatedTests() {
       },
     });
 
-    const normBackupFiles = fs.existsSync('.backups') ? await fs.promises.readdir('.backups') : [];
+    const normBackupFiles = fs.existsSync(task62Iso.tempBackupDir) ? await fs.promises.readdir(task62Iso.tempBackupDir) : [];
     const normToolBackups = normBackupFiles.filter((f) => f.startsWith('tools.json.'));
     const normCatBackups = normBackupFiles.filter((f) => f.startsWith('categories.json.'));
     const normArtBackups = normBackupFiles.filter((f) => f.startsWith('articles.json.'));
@@ -16330,11 +18204,11 @@ async function runAutomatedTests() {
 
     testAssert(
       normToolBackups.length === 4 && normCatBackups.length === 3 && normArtBackups.length === 1,
-      'Task 62 (Normal runtime zero intentional 500 / zero backup churn): Exactly 1 normal pre-write backup per real write target (no rollback/churn)',
+      'Task 62 (Normal runtime zero intentional 500 / zero backup churn): Exactly 1 normal pre-write backup per isolated write target (no rollback/churn)',
       `backups=[tools:${normToolBackups.length},cats:${normCatBackups.length},arts:${normArtBackups.length}]`
     );
   } finally {
-    if (normalChild && !normalChild.killed) {
+    if (normalChild && normalChild.exitCode === null && normalChild.signalCode === null) {
       await new Promise((resolve) => {
         const killTimer = setTimeout(() => {
           try { normalChild.kill('SIGKILL'); } catch {}
@@ -16344,13 +18218,13 @@ async function runAutomatedTests() {
           clearTimeout(killTimer);
           resolve();
         });
-        try { normalChild.kill('SIGTERM'); } catch { resolve(); }
+        try { normalChild.kill('SIGTERM'); } catch {
+          clearTimeout(killTimer);
+          resolve();
+        }
       });
     }
-    try { await fs.promises.writeFile('content/tools.json', normBackupTools, 'utf8'); } catch {}
-    try { await fs.promises.writeFile('content/categories.json', normBackupCategories, 'utf8'); } catch {}
-    try { await fs.promises.writeFile('content/articles.json', normBackupArticles, 'utf8'); } catch {}
-    try { await fs.promises.rm('.backups', { recursive: true, force: true }); } catch {}
+    await task62Iso.cleanup();
   }
 
   // --------------------------------------------------------------------------
@@ -16650,8 +18524,8 @@ async function runAutomatedTests() {
   );
 
   // 14.8 Real settings.json and ads.json compatibility (without printing values)
-  const realSettingsObj = JSON.parse(await fs.promises.readFile('content/settings.json', 'utf8'));
-  const realAdsObj = JSON.parse(await fs.promises.readFile('content/ads.json', 'utf8'));
+  const realSettingsObj = JSON.parse(await fs.promises.readFile(resolveSecureJsonPath('settings.json', realProjectRoot), 'utf8'));
+  const realAdsObj = JSON.parse(await fs.promises.readFile(resolveSecureJsonPath('ads.json', realProjectRoot), 'utf8'));
   const realSettingsETag = computeSettingsETag(realSettingsObj);
   const realAdsETag = computeAdsETag(realAdsObj);
   testAssert(
@@ -16760,6 +18634,21 @@ async function runAutomatedTests() {
   // 25. Task 107 — OTP Refresh & Authentication Lifecycle Hardening Tests
   // --------------------------------------------------------------------------
   await runTask107Tests(testAssert);
+
+  // --------------------------------------------------------------------------
+  // 26. Task 110 — Test Isolation, Cleanup & Listener Leak Regression Tests
+  // --------------------------------------------------------------------------
+  await runTask110Tests(testAssert);
+
+  const finalSnapshotCheck = await verifyRealContentSnapshot(realContentSnapshotBefore);
+  testAssert(
+    finalSnapshotCheck.ok &&
+      finalSnapshotCheck.allFilesUnchanged &&
+      finalSnapshotCheck.backupsUnchanged &&
+      getActiveMutexCount() === 0,
+    'Suite-Wide Isolation Integrity: All real content/*.json, content/articles/*.md, and .backups/ remain completely untouched after full test run',
+    finalSnapshotCheck.changedFiles.join(', ')
+  );
 
   console.log('\n================================================================');
   console.log(` [CMS Test Suite Summary] Total: ${totalCount} | Passed: ${passCount} | Failed: ${failCount}`);
@@ -16872,22 +18761,14 @@ async function runTask95Tests(externalAssert = null) {
   };
 
   let startedServerHere = false;
-  if (!server.listening) {
-    await new Promise((resolve, reject) => {
-      server.listen(PORT, HOST, () => {
-        startedServerHere = true;
-        resolve();
-      });
-      server.on('error', reject);
-    });
-  }
 
   try {
-    await fs.promises.writeFile(tempSettingsPath, JSON.stringify(baseSettingsFixture, null, 2) + '\n', 'utf8');
-    await fs.promises.writeFile(tempAdsPath, JSON.stringify(baseAdsFixture, null, 2) + '\n', 'utf8');
-
     defaultStorageEngine.projectRoot = tempRoot;
     defaultStorageEngine.backupDir = tempBackupDir;
+    startedServerHere = await startServerForTesting();
+
+    await fs.promises.writeFile(tempSettingsPath, JSON.stringify(baseSettingsFixture, null, 2) + '\n', 'utf8');
+    await fs.promises.writeFile(tempAdsPath, JSON.stringify(baseAdsFixture, null, 2) + '\n', 'utf8');
 
     // Authenticate fresh session
     const task95Otp = resetAuthStateForTesting();
@@ -17421,15 +19302,6 @@ async function runTask96Tests(externalAssert = null) {
   };
 
   let startedServerHere = false;
-  if (!server.listening) {
-    await new Promise((resolve, reject) => {
-      server.listen(PORT, HOST, () => {
-        startedServerHere = true;
-        resolve();
-      });
-      server.on('error', reject);
-    });
-  }
 
   const sendRawPutSettings = (headers = {}, bodyStr = '') =>
     new Promise((resolve, reject) => {
@@ -17489,11 +19361,12 @@ async function runTask96Tests(externalAssert = null) {
     !text.includes('at ');
 
   try {
-    await fs.promises.writeFile(tempSettingsPath, JSON.stringify(baseSettingsFixture, null, 2) + '\n', 'utf8');
-    await fs.promises.writeFile(tempAdsPath, JSON.stringify(baseAdsFixture, null, 2) + '\n', 'utf8');
-
     defaultStorageEngine.projectRoot = tempRoot;
     defaultStorageEngine.backupDir = tempBackupDir;
+    startedServerHere = await startServerForTesting();
+
+    await fs.promises.writeFile(tempSettingsPath, JSON.stringify(baseSettingsFixture, null, 2) + '\n', 'utf8');
+    await fs.promises.writeFile(tempAdsPath, JSON.stringify(baseAdsFixture, null, 2) + '\n', 'utf8');
 
     // Authenticate session
     const task96Otp = resetAuthStateForTesting();
@@ -18281,15 +20154,6 @@ async function runTask98Tests(externalAssert = null) {
   };
 
   let startedServerHere = false;
-  if (!server.listening) {
-    await new Promise((resolve, reject) => {
-      server.listen(PORT, HOST, () => {
-        startedServerHere = true;
-        resolve();
-      });
-      server.on('error', reject);
-    });
-  }
 
   const sendRawPutAds = (headers = {}, bodyStr = '') =>
     new Promise((resolve, reject) => {
@@ -18342,6 +20206,7 @@ async function runTask98Tests(externalAssert = null) {
     !text.includes('scripts/cms-server.mjs');
 
   try {
+    startedServerHere = await startServerForTesting();
     await fs.promises.writeFile(tempAdsPath, JSON.stringify(baseAdsFixture, null, 2) + '\n', 'utf8');
 
     defaultStorageEngine.projectRoot = tempRoot;
@@ -19294,24 +21159,16 @@ async function runTask100Tests(externalAssert = null) {
   const baseSecondaryMd = `# Task 100 Beta (${secondarySlug})\n\nBody marker: Version-0\n`;
 
   let startedServerHere = false;
-  if (!server.listening) {
-    await new Promise((resolve, reject) => {
-      server.listen(PORT, HOST, () => {
-        startedServerHere = true;
-        resolve();
-      });
-      server.on('error', reject);
-    });
-  }
 
   try {
+    defaultStorageEngine.projectRoot = tempRoot;
+    defaultStorageEngine.backupDir = tempBackupDir;
+    startedServerHere = await startServerForTesting();
+
     await fs.promises.writeFile(tempCategoriesPath, JSON.stringify(baseCategoriesFixture, null, 2) + '\n', 'utf8');
     await fs.promises.writeFile(tempArticlesPath, JSON.stringify(baseArticlesFixture, null, 2) + '\n', 'utf8');
     await fs.promises.writeFile(primaryMdPath, basePrimaryMd, 'utf8');
     await fs.promises.writeFile(secondaryMdPath, baseSecondaryMd, 'utf8');
-
-    defaultStorageEngine.projectRoot = tempRoot;
-    defaultStorageEngine.backupDir = tempBackupDir;
 
     const task100Otp = resetAuthStateForTesting();
     const loginRes = await fetch(`http://${HOST}:${PORT}/api/auth/verify`, {
@@ -20016,15 +21873,6 @@ async function runTask101Tests(externalAssert = null) {
   );
 
   let startedServerHere = false;
-  if (!server.listening) {
-    await new Promise((resolve, reject) => {
-      server.listen(PORT, HOST, () => {
-        startedServerHere = true;
-        resolve();
-      });
-      server.on('error', reject);
-    });
-  }
 
   function sendRawSessionReq(method, rawTarget, headers = {}, bodyStr = null) {
     return new Promise((resolve, reject) => {
@@ -20063,6 +21911,7 @@ async function runTask101Tests(externalAssert = null) {
   try {
     defaultStorageEngine.projectRoot = tempRoot;
     defaultStorageEngine.backupDir = tempBackupDir;
+    startedServerHere = await startServerForTesting();
 
     const sessionEndpointUrl = `http://${HOST}:${PORT}/api/auth/session`;
 
@@ -20671,15 +22520,6 @@ async function runTask102Tests(externalAssert = null) {
   );
 
   let startedServerHere = false;
-  if (!server.listening) {
-    await new Promise((resolve, reject) => {
-      server.listen(PORT, HOST, () => {
-        startedServerHere = true;
-        resolve();
-      });
-      server.on('error', reject);
-    });
-  }
 
   const REQUEST_TIMEOUT_MS = 1500;
 
@@ -20825,6 +22665,7 @@ async function runTask102Tests(externalAssert = null) {
   try {
     defaultStorageEngine.projectRoot = tempRoot;
     defaultStorageEngine.backupDir = tempBackupDir;
+    startedServerHere = await startServerForTesting();
 
     const establishSession = async () => {
       const otp = resetAuthStateForTesting();
@@ -21239,15 +23080,6 @@ async function runTask103Tests(externalAssert = null) {
   );
 
   let startedServerHere = false;
-  if (!server.listening) {
-    await new Promise((resolve, reject) => {
-      server.listen(PORT, HOST, () => {
-        startedServerHere = true;
-        resolve();
-      });
-      server.on('error', reject);
-    });
-  }
 
   const REQUEST_TIMEOUT_MS = 1500;
 
@@ -21405,6 +23237,7 @@ async function runTask103Tests(externalAssert = null) {
   }
 
   try {
+    startedServerHere = await startServerForTesting();
     const establishSession = async () => {
       const otp = resetAuthStateForTesting();
       const loginRes = await fetch(`http://${HOST}:${PORT}/api/auth/verify`, {
@@ -21977,15 +23810,7 @@ async function runTask104Tests(externalAssert = null) {
     defaultStorageEngine.projectRoot = tempRoot;
     defaultStorageEngine.backupDir = path.join(tempRoot, '.backups');
 
-    if (!server.listening) {
-      await new Promise((resolve, reject) => {
-        server.listen(PORT, HOST, () => {
-          startedServerHere = true;
-          resolve();
-        });
-        server.on('error', reject);
-      });
-    }
+    startedServerHere = await startServerForTesting();
 
     const otp = resetAuthStateForTesting();
     const loginRes = await fetch(`http://${HOST}:${PORT}/api/auth/verify`, {
@@ -22590,15 +24415,7 @@ async function runTask105Tests(externalAssert = null) {
     defaultStorageEngine.projectRoot = tempRoot;
     defaultStorageEngine.backupDir = path.join(tempRoot, '.backups');
 
-    if (!server.listening) {
-      await new Promise((resolve, reject) => {
-        server.listen(PORT, HOST, () => {
-          startedServerHere = true;
-          resolve();
-        });
-        server.on('error', reject);
-      });
-    }
+    startedServerHere = await startServerForTesting();
 
     const otp = resetAuthStateForTesting();
     const loginRes = await fetch(`http://${HOST}:${PORT}/api/auth/verify`, {
@@ -23078,15 +24895,7 @@ async function runTask106Tests(externalAssert = null) {
     defaultStorageEngine.projectRoot = tempRoot;
     defaultStorageEngine.backupDir = path.join(tempRoot, '.backups');
 
-    if (!server.listening) {
-      await new Promise((resolve, reject) => {
-        server.listen(PORT, HOST, () => {
-          startedServerHere = true;
-          resolve();
-        });
-        server.on('error', reject);
-      });
-    }
+    startedServerHere = await startServerForTesting();
 
     const otp = resetAuthStateForTesting();
     const loginRes = await fetch(`http://${HOST}:${PORT}/api/auth/verify`, {
@@ -23599,15 +25408,6 @@ async function runTask107Tests(externalAssert = null) {
   );
 
   let startedServerHere = false;
-  if (!server.listening) {
-    await new Promise((resolve, reject) => {
-      server.listen(PORT, HOST, () => {
-        startedServerHere = true;
-        resolve();
-      });
-      server.on('error', reject);
-    });
-  }
 
   const REQUEST_TIMEOUT_MS = 1500;
   const capturedBanners = [];
@@ -23701,6 +25501,7 @@ async function runTask107Tests(externalAssert = null) {
   try {
     defaultStorageEngine.projectRoot = tempRoot;
     defaultStorageEngine.backupDir = path.join(tempRoot, '.backups');
+    startedServerHere = await startServerForTesting();
 
     // 25.1 Establish initial authenticated session without restarting server
     const initialOtp = resetAuthStateForTesting();
@@ -24209,6 +26010,319 @@ async function runTask107Tests(externalAssert = null) {
   return true;
 }
 
+/**
+ * Focused regression test suite for Task 110:
+ * Proves CMS test mutations are strictly confined to isolated temporary project roots,
+ * real workspace articles and backups remain untouched, temporary directories clean up
+ * on both success and failure, invalid isolation roots fail closed, repeated server
+ * start/stop cycles do not accumulate error listeners, and startup errors still reject.
+ */
+async function runTask110Tests(externalAssert = null) {
+  let localTotal = 0;
+  let localPass = 0;
+  let localFail = 0;
+
+  const assertFn =
+    typeof externalAssert === 'function'
+      ? externalAssert
+      : (condition, name, details = '') => {
+          localTotal++;
+          if (condition) {
+            localPass++;
+            console.log(`  ✓ [PASS] ${name}`);
+          } else {
+            localFail++;
+            console.error(`  ✗ [FAIL] ${name}${details ? ` -> ${details}` : ''}`);
+          }
+        };
+
+  console.log('\n--- 26. Task 110 — Test Isolation & Error Listener Leak Regression Tests ---');
+
+  const realRoot = defaultStorageEngine.projectRoot;
+  const origProjectRoot = defaultStorageEngine.projectRoot;
+  const origBackupDir = defaultStorageEngine.backupDir;
+  const realSnapshotBefore = await captureRealContentSnapshot(realRoot);
+
+  // 26.1 Isolated mutation test: PUT corrupted/target article + POST + DELETE happen strictly inside tempRoot
+  const iso = await createIsolatedTestProjectRoot('ainovex-task110-', realRoot);
+  let startedServerHere = false;
+  try {
+    defaultStorageEngine.projectRoot = iso.tempRoot;
+    defaultStorageEngine.backupDir = iso.tempBackupDir;
+    startedServerHere = await startServerForTesting();
+
+    const otp = resetAuthStateForTesting();
+    const loginRes = await fetch(`http://${HOST}:${PORT}/api/auth/verify`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Connection: 'close' },
+      body: JSON.stringify({ otp }),
+    });
+    const sessionCookie = (loginRes.headers.get('set-cookie') || '').split(';')[0];
+    const loginJson = await loginRes.json();
+    const csrfToken = loginJson?.csrfToken || '';
+
+    const targetSlug = 'best-ai-tools-bulk-product-catalog-enrichment';
+    const getRes = await fetch(`http://${HOST}:${PORT}/api/cms/articles/${targetSlug}`, {
+      headers: { Cookie: sessionCookie, Connection: 'close' },
+    });
+    const targetETag = getRes.headers.get('etag');
+
+    const putRes = await fetch(`http://${HOST}:${PORT}/api/cms/articles/${targetSlug}`, {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json',
+        Cookie: sessionCookie,
+        'X-CSRF-Token': csrfToken,
+        'If-Match': targetETag,
+        Connection: 'close',
+      },
+      body: JSON.stringify({
+        article: {
+          title: 'Task 110 Isolated Title Update',
+        },
+        content: '# Task 110 Isolated Markdown\n\nWritten strictly inside temporary root.\n',
+      }),
+    });
+
+    const tempPostSlug = 'task110-isolated-created-article';
+    const postRes = await fetch(`http://${HOST}:${PORT}/api/cms/articles`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Cookie: sessionCookie,
+        'X-CSRF-Token': csrfToken,
+        Connection: 'close',
+      },
+      body: JSON.stringify({
+        article: {
+          slug: tempPostSlug,
+          title: 'Task 110 Isolated Created Article',
+          excerpt: 'Valid excerpt for isolated temporary POST test.',
+          category: 'business',
+          author: 'Md Shamim',
+          publishedAt: '2026-11-10',
+          updatedAt: '2026-11-10',
+          isPublished: false,
+          featuredImage: '/images/articles/best-free-ai-tools-2026.webp',
+          imageAlt: 'Task 110 alt',
+          readingTime: '2 min read',
+          tags: ['Isolation'],
+          metaTitle: 'Task 110 Meta Title',
+          metaDescription: 'Task 110 meta description for isolated test.',
+        },
+        content: '# Task 110 Created Article\n\nBody.\n',
+      }),
+    });
+    const postETag = postRes.headers.get('etag');
+
+    const delRes = await fetch(`http://${HOST}:${PORT}/api/cms/articles/${tempPostSlug}`, {
+      method: 'DELETE',
+      headers: {
+        Cookie: sessionCookie,
+        'X-CSRF-Token': csrfToken,
+        'If-Match': postETag,
+        Connection: 'close',
+      },
+    });
+
+    const tempTargetMdAfter = await fs.promises.readFile(iso.articleMdPath(targetSlug), 'utf8');
+    const tempBackups = fs.existsSync(iso.tempBackupDir)
+      ? await fs.promises.readdir(iso.tempBackupDir)
+      : [];
+
+    assertFn(
+      loginRes.status === 200 &&
+        putRes.status === 200 &&
+        postRes.status === 201 &&
+        delRes.status === 200 &&
+        tempTargetMdAfter.includes('Task 110 Isolated Markdown') &&
+        !fs.existsSync(iso.articleMdPath(tempPostSlug)) &&
+        tempBackups.some((b) => b.startsWith('articles.json.')) &&
+        tempBackups.some((b) => b.startsWith(`article_${targetSlug}.md.`)),
+      'Task 110 (Isolated mutations): Article PUT/POST/DELETE and backups execute inside temporary project root',
+      `statuses=[login:${loginRes.status},put:${putRes.status},post:${postRes.status},del:${delRes.status}], backups=${tempBackups.length}`
+    );
+  } finally {
+    resetAuthStateForTesting();
+    if (startedServerHere) {
+      await new Promise((resolve) => server.close(resolve));
+    }
+    await iso.cleanup(origProjectRoot, origBackupDir);
+  }
+
+  const realSnapshotAfter = await verifyRealContentSnapshot(realSnapshotBefore);
+  assertFn(
+    realSnapshotAfter.ok &&
+      realSnapshotAfter.allFilesUnchanged &&
+      realSnapshotAfter.backupsUnchanged &&
+      !fs.existsSync(iso.tempRoot) &&
+      defaultStorageEngine.projectRoot === origProjectRoot &&
+      defaultStorageEngine.backupDir === origBackupDir,
+    'Task 110 (Real content untouched & success cleanup): Real workspace articles, content/*.json, and .backups/ are byte-for-byte unchanged, tempRoot is deleted, and storage engine paths are restored',
+    realSnapshotAfter.changedFiles.join(', ')
+  );
+
+  // 26.2 Cleanup guaranteed on test failure / exception throw
+  const failIso = await createIsolatedTestProjectRoot('ainovex-task110-fail-', realRoot);
+  let threwExpected = false;
+  try {
+    defaultStorageEngine.projectRoot = failIso.tempRoot;
+    defaultStorageEngine.backupDir = failIso.tempBackupDir;
+    throw new Error('Simulated Task 110 test failure');
+  } catch (err) {
+    threwExpected = err.message === 'Simulated Task 110 test failure';
+  } finally {
+    await failIso.cleanup(origProjectRoot, origBackupDir);
+  }
+
+  assertFn(
+    threwExpected &&
+      !fs.existsSync(failIso.tempRoot) &&
+      defaultStorageEngine.projectRoot === origProjectRoot &&
+      defaultStorageEngine.backupDir === origBackupDir,
+    'Task 110 (Failure cleanup): Temporary directory is removed and storage engine paths are restored even when a test throws'
+  );
+
+  // 26.3 Fail-closed isolation root validation (never silently falls back to real project root)
+  const runInvalidTestRootChild = (badValue) =>
+    new Promise((resolve) => {
+      const child = spawn(process.execPath, ['scripts/cms-server.mjs'], {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        env: {
+          ...process.env,
+          NODE_ENV: 'test-no-listen',
+          AINOVEX_CMS_TEST_ROOT: badValue,
+        },
+      });
+      let stderrBuf = '';
+      const timer = setTimeout(() => {
+        try { child.kill('SIGKILL'); } catch {}
+        resolve({ code: -1, stderr: stderrBuf });
+      }, 5000);
+      child.stderr.on('data', (c) => {
+        stderrBuf += c.toString('utf8');
+      });
+      child.once('exit', (code) => {
+        clearTimeout(timer);
+        resolve({ code, stderr: stderrBuf });
+      });
+    });
+
+  const [invalidRealRootChild, emptyTestRootChild] = await Promise.all([
+    runInvalidTestRootChild(realRoot),
+    runInvalidTestRootChild(''),
+  ]);
+  let missingSourceThrew = false;
+  try {
+    await createIsolatedTestProjectRoot(
+      'ainovex-task110-missing-',
+      path.join(os.tmpdir(), `missing-source-root-${Date.now()}-${process.pid}`)
+    );
+  } catch {
+    missingSourceThrew = true;
+  }
+
+  assertFn(
+    invalidRealRootChild.code !== 0 &&
+      emptyTestRootChild.code !== 0 &&
+      missingSourceThrew,
+    'Task 110 (Fail-closed root guards): Rejects real project root, empty AINOVEX_CMS_TEST_ROOT, and missing sourceRoot without falling back'
+  );
+
+  // 26.4 Repeated start/stop cycles accumulate zero error or listening listeners and emit no MaxListenersExceededWarning
+  const errListenersBeforeCycles = server.listenerCount('error');
+  const listeningListenersBeforeCycles = server.listenerCount('listening');
+  const maxListenerWarnings = [];
+  const onProcessWarning = (warning) => {
+    if (warning && warning.name === 'MaxListenersExceededWarning') {
+      maxListenerWarnings.push(warning.message || String(warning));
+    }
+  };
+  process.on('warning', onProcessWarning);
+
+  let cycleLeakDetected = false;
+  let allCyclesClean = true;
+  try {
+    for (let i = 0; i < 15; i++) {
+      const didStart = await startServerForTesting(server, PORT, HOST);
+      if (!didStart || !server.listening) {
+        allCyclesClean = false;
+      }
+      if (
+        server.listenerCount('error') !== errListenersBeforeCycles ||
+        server.listenerCount('listening') !== listeningListenersBeforeCycles
+      ) {
+        cycleLeakDetected = true;
+      }
+      await new Promise((resolve) => server.close(resolve));
+      if (
+        server.listenerCount('error') !== errListenersBeforeCycles ||
+        server.listenerCount('listening') !== listeningListenersBeforeCycles
+      ) {
+        cycleLeakDetected = true;
+      }
+    }
+  } finally {
+    process.off('warning', onProcessWarning);
+    if (server.listening) {
+      await new Promise((resolve) => server.close(resolve));
+    }
+  }
+
+  assertFn(
+    allCyclesClean &&
+      !cycleLeakDetected &&
+      server.listenerCount('error') === errListenersBeforeCycles &&
+      server.listenerCount('listening') === listeningListenersBeforeCycles &&
+      maxListenerWarnings.length === 0,
+    'Task 110 (Listener leak regression): 15 repeated server start/stop cycles accumulate zero error/listening listeners and zero MaxListenersExceededWarning events',
+    `errBefore=${errListenersBeforeCycles}, errAfter=${server.listenerCount('error')}, warnings=${maxListenerWarnings.length}`
+  );
+
+  // 26.5 Startup errors still reject cleanly and leave zero lingering listeners
+  const blocker = net.createServer();
+  const failingServer = http.createServer((_req, res) => res.end('ok'));
+  const failingErrBefore = failingServer.listenerCount('error');
+  const failingLisBefore = failingServer.listenerCount('listening');
+  let rejectedCode = null;
+  try {
+    const blockedPort = await new Promise((resolve, reject) => {
+      blocker.once('error', reject);
+      blocker.listen(0, HOST, () => resolve(blocker.address().port));
+    });
+
+    try {
+      await startServerForTesting(failingServer, blockedPort, HOST);
+    } catch (err) {
+      rejectedCode = err?.code || 'ERR_UNKNOWN';
+    }
+  } finally {
+    if (failingServer.listening) {
+      await new Promise((resolve) => failingServer.close(resolve));
+    }
+    if (blocker.listening) {
+      await new Promise((resolve) => blocker.close(resolve));
+    }
+  }
+
+  assertFn(
+    rejectedCode === 'EADDRINUSE' &&
+      failingServer.listenerCount('error') === failingErrBefore &&
+      failingServer.listenerCount('listening') === failingLisBefore,
+    'Task 110 (Startup error reporting): EADDRINUSE rejects cleanly while cleaning up scoped startup listeners',
+    `code=${rejectedCode}, errListeners=${failingServer.listenerCount('error')}/${failingErrBefore}, listeningListeners=${failingServer.listenerCount('listening')}/${failingLisBefore}`
+  );
+
+  if (!externalAssert) {
+    console.log('\n================================================================');
+    console.log(` [Task 110 Focused Suite Summary] Total: ${localTotal} | Passed: ${localPass} | Failed: ${localFail}`);
+    console.log('================================================================\n');
+    return localFail === 0;
+  }
+
+  return true;
+}
+
 // Auto-run test suite if executed directly with --test flag
 if (process.argv.includes('--test')) {
   const runner = process.argv.includes('--task96')
@@ -24231,7 +26345,9 @@ if (process.argv.includes('--test')) {
                     ? runTask106Tests
                     : process.argv.includes('--task107')
                       ? runTask107Tests
-                      : runAutomatedTests;
+                      : process.argv.includes('--task110')
+                        ? runTask110Tests
+                        : runAutomatedTests;
   runner()
     .then((success) => {
       process.exit(success ? 0 : 1);
@@ -24321,7 +26437,23 @@ export {
   buildUpdatedTool,
   buildUpdatedSettings,
   buildUpdatedAds,
+  SEO_ROUTE_PREFIX,
+  SEO_PAGE_ROUTE_PREFIX,
+  parseSeoPagePath,
+  sanitizeSeoDefaultsForResponse,
+  sanitizeSeoPageForResponse,
+  sanitizeSeoConfigForResponse,
+  computeSeoDefaultsETag,
+  computeSeoDefaultsEtag,
+  computeSeoPageETag,
+  computeSeoPageEtag,
+  computeSeoConfigETag,
+  computeSeoConfigEtag,
+  buildUpdatedSeoDefaults,
+  buildCreatedSeoPage,
+  buildUpdatedSeoPage,
   getTestFailureIndex,
+  startServerForTesting,
   runTask95Tests,
   runTask96Tests,
   runTask98Tests,
@@ -24333,6 +26465,7 @@ export {
   runTask105Tests,
   runTask106Tests,
   runTask107Tests,
+  runTask110Tests,
   runAutomatedTests,
 };
 

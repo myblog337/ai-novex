@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { INDEXABLE_STATIC_PATHS, isIndexable, categoryHasContent } from '../src/config/indexing.js';
+import { collectAuthors } from '../src/utils/authors.js';
 import { isValidHttpOriginUrl } from './lib/validators.mjs';
 
 const root = process.cwd();
@@ -41,7 +42,13 @@ for (const route of INDEXABLE_STATIC_PATHS) {
   }
 }
 
-// Include every published article and categories with at least one published article.
+// Include every published article, valid author profile, and category with at least one published article.
+for (const author of collectAuthors(articles)) {
+  const route = `/author/${author.slug}/`;
+  if (isIndexable(route, context)) {
+    entries.set(toLoc(route), newest(author.articles));
+  }
+}
 for (const article of articles) {
   const route = `/blog/${article.slug}/`;
   if (isIndexable(route, context)) entries.set(toLoc(route), dateOf(article));

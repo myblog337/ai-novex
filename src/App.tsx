@@ -26,6 +26,7 @@ import defaultArticles from '../content/articles.json';
 import defaultSettings from '../content/settings.json';
 import { SITE_URL } from './config/site';
 import { isIndexable, categoryTitle } from './config/indexing.js';
+import { findAuthorBySlug } from './utils/authors.js';
 
 // Content is bundled at build time (read-only site): no runtime API requests are needed.
 const CATEGORIES = defaultCategories as Category[];
@@ -162,9 +163,17 @@ function AppContent() {
     } else if (normPath === '/affiliate-disclosure') {
       title = 'Affiliate & Monetization Disclosure | AINOVEX';
       description = 'Read the AINOVEX affiliate and advertising disclosure. Learn how our site remains free for readers through transparent monetization and integrity.';
-    } else if (normPath === '/author/md-shamim') {
-      title = 'Md Shamim - Lead Researcher & Editor | AINOVEX';
-      description = 'Read the editorial profile and guides by Md Shamim, lead researcher and editor at AINOVEX specializing in AI tools and catalog enrichment.';
+    } else if (normPath.startsWith('/author/')) {
+      const slug = normPath.slice('/author/'.length);
+      const foundAuthor = !slug.includes('/') ? findAuthorBySlug(slug, articles) : null;
+      if (foundAuthor) {
+        title = foundAuthor.seoTitle;
+        description = foundAuthor.seoDescription;
+      } else {
+        title = 'Author Not Found | AINOVEX';
+        description = 'The author profile you are looking for does not exist. Browse our AI tools directory, tutorials, and guides on AINOVEX.';
+        notFound = true;
+      }
     } else {
       // Unknown route
       title = 'Page Not Found | AINOVEX';
@@ -254,8 +263,27 @@ function AppContent() {
     viewContent = <LegalView page="editorial" onNavigate={navigate} />;
   } else if (normPath === '/affiliate-disclosure') {
     viewContent = <LegalView page="affiliate" onNavigate={navigate} />;
-  } else if (normPath === '/author/md-shamim') {
-    viewContent = <AuthorView slug="md-shamim" articles={articles} onNavigate={navigate} />;
+  } else if (normPath.startsWith('/author/')) {
+    const slug = normPath.slice('/author/'.length);
+    const foundAuthor = !slug.includes('/') ? findAuthorBySlug(slug, articles) : null;
+    if (foundAuthor) {
+      viewContent = <AuthorView slug={foundAuthor.slug} articles={articles} onNavigate={navigate} />;
+    } else {
+      viewContent = (
+        <div className="max-w-2xl mx-auto px-4 py-24 text-center">
+          <h1 className="text-4xl font-extrabold text-slate-900 dark:text-white mb-3">404 - Author Not Found</h1>
+          <p className="text-sm text-slate-500 dark:text-slate-400 mb-6">
+            The author profile you are looking for does not exist or has no published articles.
+          </p>
+          <button
+            onClick={() => navigate('/blog/')}
+            className="px-6 py-2.5 rounded-full bg-blue-600 hover:bg-blue-500 text-white font-semibold text-xs shadow-md shadow-blue-600/30"
+          >
+            Browse Blog Articles
+          </button>
+        </div>
+      );
+    }
   } else {
     // 404 Not Found fallback
     viewContent = (

@@ -4,6 +4,8 @@
 //
 // To change what search engines may index, edit ONLY this file.
 
+import { authorHasContent } from '../utils/authors.js';
+
 export const INDEXABLE_STATIC_PATHS = new Set([
   '/',
   '/blog',
@@ -12,7 +14,6 @@ export const INDEXABLE_STATIC_PATHS = new Set([
   '/about',
   '/contact',
   '/editorial-policy',
-  '/author/md-shamim',
 ]);
 
 /** Remove ?query, #hash and trailing slashes. "/" stays "/". */
@@ -45,6 +46,11 @@ export function isIndexable(path, { articles = [], categories = [] } = {}) {
   if (p.startsWith('/category/')) {
     const slug = p.slice('/category/'.length);
     return categoryHasContent(slug, categories, articles);
+  }
+  if (p.startsWith('/author/')) {
+    const slug = p.slice('/author/'.length);
+    if (!slug || slug.includes('/')) return false;
+    return authorHasContent(slug, articles);
   }
   return false;
 }
