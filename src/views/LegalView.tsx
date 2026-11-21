@@ -1,5 +1,5 @@
 import React from 'react';
-import { Breadcrumbs } from '../components/Breadcrumbs';
+import { Breadcrumbs, BreadcrumbItem } from '../components/Breadcrumbs';
 import { SITE_URL } from '../config/site';
 import settings from '../../content/settings.json';
 import {
@@ -12,19 +12,29 @@ import {
 interface LegalViewProps {
   page: 'privacy' | 'terms' | 'editorial' | 'affiliate';
   onNavigate: (path: string) => void;
+  breadcrumbs?: BreadcrumbItem[];
+  breadcrumbEnabled?: boolean;
 }
 
-export const LegalView: React.FC<LegalViewProps> = ({ page, onNavigate }) => {
+export const LegalView: React.FC<LegalViewProps> = ({
+  page,
+  onNavigate,
+  breadcrumbs,
+  breadcrumbEnabled = true,
+}) => {
   const CONTACT_EMAIL: string = settings.contactEmail || '';
   if (!CONTACT_EMAIL) {
     console.error('[LegalView] "contactEmail" is missing or empty in content/settings.json');
   }
   const legal = getLegalContent({ siteUrl: SITE_URL, contactEmail: CONTACT_EMAIL, strict: false });
   const lastUpdatedLabel = formatLegalDate();
+  const effectiveBreadcrumbs =
+    breadcrumbs !== undefined ? breadcrumbs : [{ label: LEGAL_BREADCRUMBS[page] }];
+  const showBreadcrumbs = breadcrumbEnabled !== false && effectiveBreadcrumbs.length > 0;
 
   return (
     <div className="max-w-4xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
-      <Breadcrumbs items={[{ label: LEGAL_BREADCRUMBS[page] }]} onNavigate={onNavigate} />
+      {showBreadcrumbs && <Breadcrumbs items={effectiveBreadcrumbs} onNavigate={onNavigate} />}
 
       <div className="py-6 border-b border-slate-200 dark:border-slate-800/80 mb-8">
         <h1 className="text-3xl sm:text-4xl font-extrabold text-slate-900 dark:text-white tracking-tight mb-2">

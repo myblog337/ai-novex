@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { Calendar, Clock, Share2, Check, Tag, AlertCircle, RefreshCw, ArrowLeft } from 'lucide-react';
 import { Article } from '../types';
-import { Breadcrumbs } from '../components/Breadcrumbs';
+import { Breadcrumbs, BreadcrumbItem } from '../components/Breadcrumbs';
 import { getArticleAuthorProfile, DEFAULT_EDITORIAL_TEAM_NAME } from '../utils/authors.js';
 
 function getResponsiveSrcSet(imgPath: string): string {
@@ -20,6 +20,8 @@ interface ArticleDetailViewProps {
   slug: string;
   onNavigate: (path: string) => void;
   allArticles: Article[];
+  breadcrumbs?: BreadcrumbItem[];
+  breadcrumbEnabled?: boolean;
 }
 
 // Markdown sources are bundled lazily (one chunk per article) instead of being fetched from an API.
@@ -169,6 +171,8 @@ export const ArticleDetailView: React.FC<ArticleDetailViewProps> = ({
   slug,
   onNavigate,
   allArticles,
+  breadcrumbs,
+  breadcrumbEnabled = true,
 }) => {
   const article = allArticles.find((a) => a.slug === slug) || null;
   const initialHtml = prerendered && prerendered.slug === slug ? prerendered.html : '';
@@ -286,16 +290,17 @@ export const ArticleDetailView: React.FC<ArticleDetailViewProps> = ({
     .sort((x, y) => Number(y.category === article.category) - Number(x.category === article.category))
     .slice(0, 2);
 
+  const defaultBreadcrumbs: BreadcrumbItem[] = [
+    { label: 'Blog', path: '/blog/' },
+    { label: article.categoryName || article.category, path: `/category/${article.category}/` },
+    { label: article.title },
+  ];
+  const effectiveBreadcrumbs = breadcrumbs !== undefined ? breadcrumbs : defaultBreadcrumbs;
+  const showBreadcrumbs = breadcrumbEnabled !== false && effectiveBreadcrumbs.length > 0;
+
   return (
     <article className="max-w-4xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
-      <Breadcrumbs
-        items={[
-          { label: 'Blog', path: '/blog/' },
-          { label: article.categoryName || article.category, path: `/category/${article.category}/` },
-          { label: article.title },
-        ]}
-        onNavigate={onNavigate}
-      />
+      {showBreadcrumbs && <Breadcrumbs items={effectiveBreadcrumbs} onNavigate={onNavigate} />}
 
       {/* Header */}
       <div className="py-6 border-b border-slate-200 dark:border-slate-800/80 mb-8">

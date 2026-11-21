@@ -1,7 +1,7 @@
 import React, { useState, useMemo } from 'react';
 import { Search, Sparkles, ArrowRight, Star } from 'lucide-react';
 import { Tool, Category } from '../types';
-import { Breadcrumbs } from '../components/Breadcrumbs';
+import { Breadcrumbs, BreadcrumbItem } from '../components/Breadcrumbs';
 
 interface ToolsViewProps {
   tools: Tool[];
@@ -9,6 +9,8 @@ interface ToolsViewProps {
   initialQuery?: string;
   onNavigate: (path: string) => void;
   onSelectTool: (tool: Tool) => void;
+  breadcrumbs?: BreadcrumbItem[];
+  breadcrumbEnabled?: boolean;
 }
 
 export const ToolsView: React.FC<ToolsViewProps> = ({
@@ -17,6 +19,8 @@ export const ToolsView: React.FC<ToolsViewProps> = ({
   initialQuery = '',
   onNavigate,
   onSelectTool,
+  breadcrumbs,
+  breadcrumbEnabled = true,
 }) => {
   const [search, setSearch] = useState(initialQuery);
   const [selectedCategory, setSelectedCategory] = useState<string>('all');
@@ -45,9 +49,13 @@ export const ToolsView: React.FC<ToolsViewProps> = ({
     });
   }, [tools, search, selectedCategory, selectedPricing, sortBy]);
 
+  const effectiveBreadcrumbs =
+    breadcrumbs !== undefined ? breadcrumbs : [{ label: 'AI Tools Directory' }];
+  const showBreadcrumbs = breadcrumbEnabled !== false && effectiveBreadcrumbs.length > 0;
+
   return (
     <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
-      <Breadcrumbs items={[{ label: 'AI Tools Directory' }]} onNavigate={onNavigate} />
+      {showBreadcrumbs && <Breadcrumbs items={effectiveBreadcrumbs} onNavigate={onNavigate} />}
 
       {/* Header Banner */}
       <div className="py-6 text-center max-w-3xl mx-auto">

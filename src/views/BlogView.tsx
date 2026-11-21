@@ -1,7 +1,7 @@
 import React, { useState, useMemo } from 'react';
 import { Search, Calendar, Clock, ArrowRight, BookOpen } from 'lucide-react';
 import { Article, Category } from '../types';
-import { Breadcrumbs } from '../components/Breadcrumbs';
+import { Breadcrumbs, BreadcrumbItem } from '../components/Breadcrumbs';
 import { getAuthorDisplayName } from '../utils/authors.js';
 
 interface BlogViewProps {
@@ -9,6 +9,8 @@ interface BlogViewProps {
   categories: Category[];
   onSelectArticle: (slug: string) => void;
   onNavigate: (path: string) => void;
+  breadcrumbs?: BreadcrumbItem[];
+  breadcrumbEnabled?: boolean;
 }
 
 export const BlogView: React.FC<BlogViewProps> = ({
@@ -16,6 +18,8 @@ export const BlogView: React.FC<BlogViewProps> = ({
   categories,
   onSelectArticle,
   onNavigate,
+  breadcrumbs,
+  breadcrumbEnabled = true,
 }) => {
   const [search, setSearch] = useState('');
   const [selectedCategory, setSelectedCategory] = useState('all');
@@ -37,9 +41,12 @@ export const BlogView: React.FC<BlogViewProps> = ({
     });
   }, [published, search, selectedCategory]);
 
+  const effectiveBreadcrumbs = breadcrumbs !== undefined ? breadcrumbs : [{ label: 'Blog' }];
+  const showBreadcrumbs = breadcrumbEnabled !== false && effectiveBreadcrumbs.length > 0;
+
   return (
     <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
-      <Breadcrumbs items={[{ label: 'Blog & Articles' }]} onNavigate={onNavigate} />
+      {showBreadcrumbs && <Breadcrumbs items={effectiveBreadcrumbs} onNavigate={onNavigate} />}
 
       {/* Banner */}
       <div className="py-6 text-center max-w-3xl mx-auto">

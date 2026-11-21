@@ -19,6 +19,29 @@ import {
 } from './lib/validators.mjs';
 import { isInsideAuthorizedDirectory } from './lib/storage.mjs';
 import { collectAuthors, getArticleAuthorProfile, DEFAULT_EDITORIAL_TEAM_NAME } from '../src/utils/authors.js';
+import {
+  ALLOWED_OG_TYPES,
+  ALLOWED_TWITTER_CARDS,
+  DEFAULT_SEO_TITLE,
+  DEFAULT_SITE_NAME,
+  escapeJsonLd,
+  isSafeAssetOrUrl,
+  isSafeHttpUrl,
+  isSafeStructuredData,
+  isValidSeoPathFormat,
+  normalizeRoutePath,
+  resolvePageSeo,
+} from '../src/utils/pageSeo.js';
+
+const CONTROL_CHAR_REGEX = /[\u0000-\u001F\u007F-\u009F]/g;
+const TWITTER_HANDLE_REGEX = /^@[a-zA-Z0-9_]{1,30}$/;
+const ARTICLE_META_PROPERTIES = new Set([
+  'article:published_time',
+  'article:modified_time',
+  'article:author',
+  'article:section',
+  'article:tag',
+]);
 
 const esc = (v) =>
   String(v ?? '')
@@ -27,6 +50,493 @@ const esc = (v) =>
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#39;');
+
+function cleanMetaText(value, maxLen = 500) {
+  if (typeof value !== 'string') return '';
+  const cleaned = value.replace(CONTROL_CHAR_REGEX, ' ').replace(/\s+/g, ' ').trim();
+  if (!cleaned) return '';
+  return cleaned.length > maxLen ? cleaned.slice(0, maxLen) : cleaned;
+}
+
+function getSafeHttpUrlOrEmpty(value) {
+  if (typeof value !== 'string') return '';
+  const trimmed = value.trim();
+  return isSafeHttpUrl(trimmed) ? trimmed : '';
+}
+
+function inferImageMimeType(urlStr) {
+  try {
+    const pathname = new URL(urlStr).pathname.toLowerCase();
+    if (pathname.endsWith('.png')) return 'image/png';
+    if (pathname.endsWith('.webp')) return 'image/webp';
+    if (pathname.endsWith('.jpg') || pathname.endsWith('.jpeg')) return 'image/jpeg';
+    if (pathname.endsWith('.gif')) return 'image/gif';
+    if (pathname.endsWith('.avif')) return 'image/avif';
+    if (pathname.endsWith('.svg')) return 'image/svg+xml';
+  } catch {
+    return '';
+  }
+  return '';
+}
+
+function getTagAttr(attrsStr, attrName) {
+  const re = new RegExp(`(?:^|\\s)${attrName}\\s*=\\s*(?:"([^"]*)"|'([^']*)'|([^\\s"'=<>` + '`' + `]+))`, 'i');
+  const m = attrsStr.match(re);
+  if (!m) return null;
+  return (m[1] ?? m[2] ?? m[3] ?? '').trim();
+}
+
+function removeSpanCleanly(str, start, end) {
+  let lineStart = start;
+  while (lineStart > 0 && (str[lineStart - 1] === ' ' || str[lineStart - 1] === '\t')) {
+    lineStart--;
+  }
+  const isAtLineStart = lineStart === 0 || str[lineStart - 1] === '\n';
+  let lineEnd = end;
+  while (lineEnd < str.length && (str[lineEnd] === ' ' || str[lineEnd] === '\t')) {
+    lineEnd++;
+  }
+  if (isAtLineStart && lineEnd < str.length && (str[lineEnd] === '\n' || str.slice(lineEnd, lineEnd + 2) === '\r\n')) {
+    const nlLen = str[lineEnd] === '\r' ? 2 : 1;
+    return { removeStart: lineStart, removeEnd: lineEnd + nlLen };
+  }
+  return { removeStart: start, removeEnd: end };
+}
+
+function findMetaInsertionPoint(headInner) {
+  const tokenRegex = /<(script|style)\b[^>]*>[\s\S]*?<\/\1>|<(meta|link)\b[^>]*>/gi;
+  let firstScriptOrStyleStart = -1;
+  let lastMetaOrLinkEnd = -1;
+  let m;
+  while ((m = tokenRegex.exec(headInner)) !== null) {
+    if (m[1]) {
+      if (firstScriptOrStyleStart === -1) {
+        firstScriptOrStyleStart = m.index;
+      }
+      break;
+    }
+    if (m[2]) {
+      lastMetaOrLinkEnd = m.index + m[0].length;
+    }
+  }
+  return { lastMetaOrLinkEnd, firstScriptOrStyleStart };
+}
+
+function insertHeadTags(headInner, tags) {
+  const list = tags.filter(Boolean);
+  if (list.length === 0) return headInner;
+  const block = list.join('\n    ');
+  const { lastMetaOrLinkEnd, firstScriptOrStyleStart } = findMetaInsertionPoint(headInner);
+  if (lastMetaOrLinkEnd !== -1) {
+    return `${headInner.slice(0, lastMetaOrLinkEnd)}\n    ${block}${headInner.slice(lastMetaOrLinkEnd)}`;
+  }
+  if (firstScriptOrStyleStart !== -1) {
+    return `${headInner.slice(0, firstScriptOrStyleStart)}${block}\n    ${headInner.slice(firstScriptOrStyleStart)}`;
+  }
+  return `${headInner}\n    ${block}\n  `;
+}
+
+function upsertHeadTitle(headInner, titleText) {
+  const titleTag = `<title>${esc(titleText)}</title>`;
+  const tokenRegex = /<(script|style)\b[^>]*>[\s\S]*?<\/\1>|<title\b[^>]*>[\s\S]*?<\/title>/gi;
+  const matches = [];
+  let m;
+  while ((m = tokenRegex.exec(headInner)) !== null) {
+    if (!m[1]) {
+      matches.push({ start: m.index, end: m.index + m[0].length });
+    }
+  }
+  if (matches.length === 0) {
+    const viewportMatch = headInner.match(/<meta\b[^>]*\bname\s*=\s*["']viewport["'][^>]*>/i);
+    if (viewportMatch) {
+      const insertAt = viewportMatch.index + viewportMatch[0].length;
+      return `${headInner.slice(0, insertAt)}\n    ${titleTag}${headInner.slice(insertAt)}`;
+    }
+    return `\n    ${titleTag}${headInner}`;
+  }
+  let out = headInner;
+  for (let i = matches.length - 1; i >= 0; i--) {
+    const { start, end } = matches[i];
+    if (i === 0) {
+      out = `${out.slice(0, start)}${titleTag}${out.slice(end)}`;
+    } else {
+      const { removeStart, removeEnd } = removeSpanCleanly(out, start, end);
+      out = `${out.slice(0, removeStart)}${out.slice(removeEnd)}`;
+    }
+  }
+  return out;
+}
+
+function upsertHeadTag(headInner, tagKind, matchFn, newTagHtml) {
+  const tokenRegex = /<(script|style)\b[^>]*>[\s\S]*?<\/\1>|<(meta|link)\b([^>]*)>/gi;
+  const matches = [];
+  let m;
+  while ((m = tokenRegex.exec(headInner)) !== null) {
+    if (m[1]) continue;
+    const foundKind = m[2].toLowerCase();
+    if (foundKind === tagKind && matchFn(m[3])) {
+      matches.push({ start: m.index, end: m.index + m[0].length });
+    }
+  }
+  if (matches.length === 0) {
+    return newTagHtml ? insertHeadTags(headInner, [newTagHtml]) : headInner;
+  }
+  let out = headInner;
+  for (let i = matches.length - 1; i >= 0; i--) {
+    const { start, end } = matches[i];
+    if (i === 0 && newTagHtml) {
+      out = `${out.slice(0, start)}${newTagHtml}${out.slice(end)}`;
+    } else {
+      const { removeStart, removeEnd } = removeSpanCleanly(out, start, end);
+      out = `${out.slice(0, removeStart)}${out.slice(removeEnd)}`;
+    }
+  }
+  return out;
+}
+
+function removeHeadTags(headInner, tagKind, matchFn) {
+  return upsertHeadTag(headInner, tagKind, matchFn, '');
+}
+
+const matchMetaAttr = (attr, key) => (attrsStr) => {
+  const val = getTagAttr(attrsStr, attr);
+  return val !== null && val.toLowerCase() === key.toLowerCase();
+};
+
+const matchCanonicalLink = (attrsStr) => {
+  const rel = getTagAttr(attrsStr, 'rel');
+  return rel !== null && rel.toLowerCase().split(/\s+/).includes('canonical');
+};
+
+const matchImagePreloadLink = (attrsStr) => {
+  const rel = getTagAttr(attrsStr, 'rel');
+  const asVal = getTagAttr(attrsStr, 'as');
+  return (
+    rel !== null &&
+    rel.toLowerCase().split(/\s+/).includes('preload') &&
+    asVal !== null &&
+    asVal.toLowerCase() === 'image'
+  );
+};
+
+function syncHeadJsonLdScript(headInner, jsonLd) {
+  const scriptRegex = /<script\b([^>]*)>[\s\S]*?<\/script>/gi;
+  const matches = [];
+  let m;
+  while ((m = scriptRegex.exec(headInner)) !== null) {
+    const typeVal = getTagAttr(m[1], 'type');
+    if (typeVal !== null && typeVal.toLowerCase() === 'application/ld+json') {
+      matches.push({ start: m.index, end: m.index + m[0].length });
+    }
+  }
+
+  const isValidLd =
+    Boolean(jsonLd) &&
+    typeof jsonLd === 'object' &&
+    !Array.isArray(jsonLd) &&
+    isSafeStructuredData(jsonLd, 10, 65536);
+
+  let serialized = '';
+  if (isValidLd) {
+    try {
+      serialized = escapeJsonLd(jsonLd);
+    } catch {
+      serialized = '';
+    }
+  }
+
+  if (!serialized) {
+    if (matches.length === 0) return headInner;
+    let out = headInner;
+    for (let i = matches.length - 1; i >= 0; i--) {
+      const { removeStart, removeEnd } = removeSpanCleanly(out, matches[i].start, matches[i].end);
+      out = `${out.slice(0, removeStart)}${out.slice(removeEnd)}`;
+    }
+    return out;
+  }
+
+  const scriptTag = `<script type="application/ld+json">\n    ${serialized}\n    </script>`;
+  if (matches.length === 0) {
+    const trimmedRight = headInner.replace(/[ \t]+$/, '');
+    const sep = trimmedRight.endsWith('\n') ? '' : '\n';
+    return `${trimmedRight}${sep}    ${scriptTag}\n  `;
+  }
+
+  let out = headInner;
+  for (let i = matches.length - 1; i >= 0; i--) {
+    const { start, end } = matches[i];
+    if (i === 0) {
+      out = `${out.slice(0, start)}${scriptTag}${out.slice(end)}`;
+    } else {
+      const { removeStart, removeEnd } = removeSpanCleanly(out, start, end);
+      out = `${out.slice(0, removeStart)}${out.slice(removeEnd)}`;
+    }
+  }
+  return out;
+}
+
+export function applyResolvedSeoToHtml(html, resolved, { preloadImage = null, getImageSizeFn = null } = {}) {
+  if (typeof html !== 'string' || !resolved || typeof resolved !== 'object') {
+    return html;
+  }
+
+  const headOpenMatch = html.match(/<head\b[^>]*>/i);
+  const headCloseIdx = html.search(/<\/head>/i);
+  if (!headOpenMatch || headCloseIdx === -1) {
+    return html;
+  }
+  const headStart = headOpenMatch.index + headOpenMatch[0].length;
+  if (headCloseIdx < headStart) {
+    return html;
+  }
+
+  let headInner = html.slice(headStart, headCloseIdx);
+
+  const title = cleanMetaText(resolved.title, 200) || DEFAULT_SEO_TITLE;
+  const description = cleanMetaText(resolved.description, 320);
+  const siteName = cleanMetaText(resolved.siteName, 100) || DEFAULT_SITE_NAME;
+  const isNotFound = Boolean(resolved.notFound);
+
+  const fallbackRobots = isNotFound
+    ? `noindex, ${resolved.nofollow ? 'nofollow' : 'follow'}`
+    : resolved.noindex
+      ? `noindex, ${resolved.nofollow ? 'nofollow' : 'follow'}`
+      : `index, ${resolved.nofollow ? 'nofollow' : 'follow'}, max-image-preview:large, max-snippet:-1, max-video-preview:-1`;
+  const robots = cleanMetaText(resolved.robotsContent, 160) || fallbackRobots;
+
+  const canonicalUrl = isNotFound ? '' : getSafeHttpUrlOrEmpty(resolved.canonicalUrl);
+  const ogUrl = isNotFound ? '' : getSafeHttpUrlOrEmpty(resolved.ogUrl);
+  const ogType = ALLOWED_OG_TYPES.has(resolved.ogType) ? resolved.ogType : 'website';
+  const ogTitle = cleanMetaText(resolved.ogTitle, 200) || title;
+  const ogDescription = cleanMetaText(resolved.ogDescription, 320) || description;
+  const ogImage = getSafeHttpUrlOrEmpty(resolved.ogImage);
+  const ogImageAlt = ogImage ? cleanMetaText(resolved.ogImageAlt, 300) : '';
+  const ogImageType = ogImage ? inferImageMimeType(ogImage) : '';
+
+  let ogSize = null;
+  if (ogImage && typeof getImageSizeFn === 'function') {
+    let localAssetPath = '';
+    if (
+      typeof resolved.ogImageRaw === 'string' &&
+      resolved.ogImageRaw.startsWith('/') &&
+      isSafeAssetOrUrl(resolved.ogImageRaw)
+    ) {
+      localAssetPath = resolved.ogImageRaw;
+    } else if (typeof resolved.baseUrl === 'string' && resolved.baseUrl) {
+      try {
+        const parsedImg = new URL(ogImage);
+        const parsedBase = new URL(resolved.baseUrl);
+        if (parsedImg.origin === parsedBase.origin) {
+          localAssetPath = parsedImg.pathname;
+        }
+      } catch {
+        localAssetPath = '';
+      }
+    }
+    if (localAssetPath) {
+      ogSize = getImageSizeFn(localAssetPath);
+    }
+  }
+
+  const twitterCard = ALLOWED_TWITTER_CARDS.has(resolved.twitterCard)
+    ? resolved.twitterCard
+    : 'summary_large_image';
+  const twitterTitle = cleanMetaText(resolved.twitterTitle, 200) || ogTitle;
+  const twitterDescription = cleanMetaText(resolved.twitterDescription, 320) || ogDescription;
+  const twitterImage = getSafeHttpUrlOrEmpty(resolved.twitterImage);
+  const twitterImageAlt = twitterImage ? cleanMetaText(resolved.twitterImageAlt, 300) : '';
+  const rawTwitterSite = cleanMetaText(resolved.twitterSite, 40);
+  const twitterSite = TWITTER_HANDLE_REGEX.test(rawTwitterSite) ? rawTwitterSite : '';
+
+  headInner = upsertHeadTitle(headInner, title);
+
+  headInner = upsertHeadTag(
+    headInner,
+    'meta',
+    matchMetaAttr('name', 'description'),
+    description ? `<meta name="description" content="${esc(description)}" />` : ''
+  );
+  headInner = upsertHeadTag(
+    headInner,
+    'meta',
+    matchMetaAttr('name', 'robots'),
+    `<meta name="robots" content="${esc(robots)}" />`
+  );
+  headInner = upsertHeadTag(
+    headInner,
+    'link',
+    matchCanonicalLink,
+    canonicalUrl ? `<link rel="canonical" href="${esc(canonicalUrl)}" />` : ''
+  );
+
+  // Open Graph metadata
+  headInner = upsertHeadTag(
+    headInner,
+    'meta',
+    matchMetaAttr('property', 'og:site_name'),
+    siteName ? `<meta property="og:site_name" content="${esc(siteName)}" />` : ''
+  );
+  headInner = upsertHeadTag(
+    headInner,
+    'meta',
+    matchMetaAttr('property', 'og:title'),
+    ogTitle ? `<meta property="og:title" content="${esc(ogTitle)}" />` : ''
+  );
+  headInner = upsertHeadTag(
+    headInner,
+    'meta',
+    matchMetaAttr('property', 'og:description'),
+    ogDescription ? `<meta property="og:description" content="${esc(ogDescription)}" />` : ''
+  );
+  headInner = upsertHeadTag(
+    headInner,
+    'meta',
+    matchMetaAttr('property', 'og:type'),
+    `<meta property="og:type" content="${esc(ogType)}" />`
+  );
+  headInner = upsertHeadTag(
+    headInner,
+    'meta',
+    matchMetaAttr('property', 'og:url'),
+    ogUrl ? `<meta property="og:url" content="${esc(ogUrl)}" />` : ''
+  );
+  headInner = upsertHeadTag(
+    headInner,
+    'meta',
+    matchMetaAttr('property', 'og:image'),
+    ogImage ? `<meta property="og:image" content="${esc(ogImage)}" />` : ''
+  );
+  headInner = upsertHeadTag(
+    headInner,
+    'meta',
+    matchMetaAttr('property', 'og:image:width'),
+    ogImage && ogSize && Number.isSafeInteger(ogSize.width) && ogSize.width > 0
+      ? `<meta property="og:image:width" content="${ogSize.width}" />`
+      : ''
+  );
+  headInner = upsertHeadTag(
+    headInner,
+    'meta',
+    matchMetaAttr('property', 'og:image:height'),
+    ogImage && ogSize && Number.isSafeInteger(ogSize.height) && ogSize.height > 0
+      ? `<meta property="og:image:height" content="${ogSize.height}" />`
+      : ''
+  );
+  headInner = upsertHeadTag(
+    headInner,
+    'meta',
+    matchMetaAttr('property', 'og:image:type'),
+    ogImage && ogImageType ? `<meta property="og:image:type" content="${esc(ogImageType)}" />` : ''
+  );
+  headInner = upsertHeadTag(
+    headInner,
+    'meta',
+    matchMetaAttr('property', 'og:image:alt'),
+    ogImage && ogImageAlt ? `<meta property="og:image:alt" content="${esc(ogImageAlt)}" />` : ''
+  );
+
+  // Twitter metadata
+  headInner = upsertHeadTag(
+    headInner,
+    'meta',
+    matchMetaAttr('name', 'twitter:card'),
+    `<meta name="twitter:card" content="${esc(twitterCard)}" />`
+  );
+  headInner = upsertHeadTag(
+    headInner,
+    'meta',
+    matchMetaAttr('name', 'twitter:title'),
+    twitterTitle ? `<meta name="twitter:title" content="${esc(twitterTitle)}" />` : ''
+  );
+  headInner = upsertHeadTag(
+    headInner,
+    'meta',
+    matchMetaAttr('name', 'twitter:description'),
+    twitterDescription ? `<meta name="twitter:description" content="${esc(twitterDescription)}" />` : ''
+  );
+  headInner = upsertHeadTag(
+    headInner,
+    'meta',
+    matchMetaAttr('name', 'twitter:image'),
+    twitterImage ? `<meta name="twitter:image" content="${esc(twitterImage)}" />` : ''
+  );
+  headInner = upsertHeadTag(
+    headInner,
+    'meta',
+    matchMetaAttr('name', 'twitter:image:alt'),
+    twitterImage && twitterImageAlt
+      ? `<meta name="twitter:image:alt" content="${esc(twitterImageAlt)}" />`
+      : ''
+  );
+  headInner = upsertHeadTag(
+    headInner,
+    'meta',
+    matchMetaAttr('name', 'twitter:site'),
+    twitterSite ? `<meta name="twitter:site" content="${esc(twitterSite)}" />` : ''
+  );
+
+  // Article-specific Open Graph tags (always strip stale/duplicate tags first)
+  headInner = removeHeadTags(headInner, 'meta', (attrsStr) => {
+    const prop = getTagAttr(attrsStr, 'property');
+    return prop !== null && ARTICLE_META_PROPERTIES.has(prop.toLowerCase());
+  });
+
+  if (!isNotFound && ogType === 'article' && resolved.articleMeta && typeof resolved.articleMeta === 'object') {
+    const articleTags = [];
+    const published = cleanMetaText(resolved.articleMeta.published, 64);
+    const modified = cleanMetaText(resolved.articleMeta.modified, 64);
+    const authorUrl = getSafeHttpUrlOrEmpty(resolved.articleMeta.authorUrl);
+    const section = cleanMetaText(resolved.articleMeta.section, 120);
+
+    if (published) articleTags.push(`<meta property="article:published_time" content="${esc(published)}" />`);
+    if (modified) articleTags.push(`<meta property="article:modified_time" content="${esc(modified)}" />`);
+    if (authorUrl) articleTags.push(`<meta property="article:author" content="${esc(authorUrl)}" />`);
+    if (section) articleTags.push(`<meta property="article:section" content="${esc(section)}" />`);
+
+    if (Array.isArray(resolved.articleMeta.tags)) {
+      const seenTags = new Set();
+      for (const rawTag of resolved.articleMeta.tags) {
+        const tag = cleanMetaText(rawTag, 100);
+        if (!tag || seenTags.has(tag)) continue;
+        seenTags.add(tag);
+        articleTags.push(`<meta property="article:tag" content="${esc(tag)}" />`);
+      }
+    }
+
+    if (articleTags.length > 0) {
+      headInner = insertHeadTags(headInner, articleTags);
+    }
+  }
+
+  // Preload LCP hero/featured image if specified (strip existing image preloads first to avoid duplicates)
+  headInner = removeHeadTags(headInner, 'link', matchImagePreloadLink);
+  if (
+    typeof preloadImage === 'string' &&
+    preloadImage.trim() &&
+    !CONTROL_CHAR_REGEX.test(preloadImage) &&
+    !/\s/.test(preloadImage.trim()) &&
+    isSafeAssetOrUrl(preloadImage.trim())
+  ) {
+    const cleanPreload = preloadImage.trim();
+    let p900 = cleanPreload;
+    let srcset = '';
+    if (cleanPreload.startsWith('/images/articles/') && cleanPreload.endsWith('.webp')) {
+      const base = cleanPreload.slice(0, -5);
+      p900 = `${base}-900w.webp`;
+      srcset = `${base}-600w.webp 600w, ${base}-900w.webp 900w, ${cleanPreload} 1200w`;
+    }
+    const srcsetAttr = srcset ? ` imagesrcset="${esc(srcset)}" imagesizes="(max-width: 640px) 100vw, 896px"` : '';
+    headInner = insertHeadTags(headInner, [
+      `<link rel="preload" as="image" href="${esc(p900)}"${srcsetAttr} fetchpriority="high" />`,
+    ]);
+  }
+
+  if ('jsonLd' in resolved) {
+    headInner = syncHeadJsonLdScript(headInner, isNotFound ? (resolved.jsonLd ?? null) : resolved.jsonLd);
+  }
+
+  return `${html.slice(0, headStart)}${headInner}${html.slice(headCloseIdx)}`;
+}
 
 export function renderToolDirectoryCard(t) {
   return `
@@ -93,6 +603,7 @@ if (
 const categories = readJson('categories.json', { optional: false, fallback: [] });
 const tools = readJson('tools.json', { optional: false, fallback: [] });
 const ads = readJson('ads.json', { optional: true, fallback: {} });
+const seoConfig = readJson('seo.json', { optional: true, fallback: null });
 
 const allowedArticlesDir = path.resolve(root, 'content', 'articles');
 const canonicalAllowedArticlesDir = fs.existsSync(allowedArticlesDir)
@@ -407,11 +918,29 @@ const renderFooter = () => `
   </div>
 </footer>`;
 
-// Breadcrumbs are rendered as plain visible HTML. The structured data for them is emitted ONCE as
-// JSON-LD (see createPageHtml) - using microdata AND JSON-LD produced duplicate BreadcrumbList markup.
-let pendingCrumbs = null; // picked up (and cleared) by the next createPageHtml() call
-const renderBreadcrumb = (crumbs) => {
-  pendingCrumbs = crumbs;
+// Breadcrumbs are rendered as plain visible HTML from resolved page SEO. Structured data for
+// BreadcrumbList is emitted ONCE inside the resolved JSON-LD @graph (via applyResolvedSeoToHtml).
+const renderResolvedBreadcrumb = (resolved) => {
+  if (!resolved || resolved.notFound || !resolved.breadcrumbEnabled) return '';
+  const crumbs = Array.isArray(resolved.breadcrumbs) ? resolved.breadcrumbs : [];
+  if (crumbs.length === 0) return '';
+
+  const itemsHtml = crumbs
+    .map((c, i) => {
+      const isLast = i === crumbs.length - 1;
+      const hasValidPath =
+        !isLast && typeof c.path === 'string' && c.path.trim() && isValidSeoPathFormat(c.path);
+      const safeHref = hasValidPath ? normalizeRoutePath(c.path) : '';
+      return `
+    <li class="text-slate-400 dark:text-slate-600" aria-hidden="true">
+      <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 18 6-6-6-6"></path></svg>
+    </li>
+    <li${isLast ? ' aria-current="page"' : ''}>
+      ${safeHref ? `<a href="${esc(safeHref)}" class="text-slate-500 hover:text-slate-900 dark:text-slate-400 dark:hover:text-white transition-colors cursor-pointer"><span>${esc(c.label)}</span></a>` : `<span class="font-semibold text-slate-800 dark:text-slate-200 truncate max-w-[200px] sm:max-w-md inline-block">${esc(c.label)}</span>`}
+    </li>`;
+    })
+    .join('');
+
   return `
 <nav aria-label="Breadcrumb" class="py-3 text-xs text-slate-500 dark:text-slate-400">
   <ol class="flex items-center flex-wrap gap-1.5">
@@ -420,64 +949,26 @@ const renderBreadcrumb = (crumbs) => {
         <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"></path><polyline points="9 22 9 12 15 12 15 22"></polyline></svg>
         <span>Home</span>
       </a>
-    </li>
-    ${crumbs.map((c, i) => `
-    <li class="text-slate-400 dark:text-slate-600" aria-hidden="true">
-      <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 18 6-6-6-6"></path></svg>
-    </li>
-    <li${i === crumbs.length - 1 ? ' aria-current="page"' : ''}>
-      ${c.path ? `<a href="${c.path.endsWith('/') ? c.path : c.path + '/'}" class="text-slate-500 hover:text-slate-900 dark:text-slate-400 dark:hover:text-white transition-colors cursor-pointer"><span>${esc(c.label)}</span></a>` : `<span class="font-semibold text-slate-800 dark:text-slate-200 truncate max-w-[200px] sm:max-w-md inline-block">${esc(c.label)}</span>`}
-    </li>`).join('')}
+    </li>${itemsHtml}
   </ol>
 </nav>`;
 };
 
-const siteDescriptionLd = 'Discover the best AI tools, in-depth software reviews, and practical guides on AINOVEX. Boost your productivity and work smarter with curated artificial intelligence.';
-const orgNode = {
-  '@type': 'Organization',
-  '@id': `${baseUrl}/#organization`,
-  name: 'AINOVEX',
-  url: `${baseUrl}/`,
-  logo: { '@type': 'ImageObject', '@id': `${baseUrl}/#logo`, url: `${baseUrl}/logo-512.png`, width: 512, height: 512 },
-};
-const websiteNode = {
-  '@type': 'WebSite',
-  '@id': `${baseUrl}/#website`,
-  url: `${baseUrl}/`,
-  name: 'AINOVEX',
-  description: siteDescriptionLd,
-  inLanguage: 'en-US',
-  publisher: { '@id': `${baseUrl}/#organization` },
-};
-
-const breadcrumbLd = (crumbs, pageUrl) => ({
-  '@type': 'BreadcrumbList',
-  '@id': `${pageUrl}#breadcrumb`,
-  itemListElement: [
-    { '@type': 'ListItem', position: 1, name: 'Home', item: `${baseUrl}/` },
-    ...crumbs.map((c, i) => ({
-      '@type': 'ListItem',
-      position: i + 2,
-      name: c.label,
-      item: c.path ? `${baseUrl}${c.path.endsWith('/') ? c.path : c.path + '/'}` : pageUrl,
-    })),
-  ],
-});
-
-function toAbsoluteUrl(img) {
-  if (!img) return '';
-  if (img.startsWith('http://') || img.startsWith('https://')) return img;
-  return `${baseUrl}${img.startsWith('/') ? '' : '/'}${img}`;
-}
-
 /** Read width/height of a local .webp/.png in /public without extra dependencies (null if unknown). */
 const imageSizeCache = new Map();
 function getImageSize(imgPath) {
-  if (!imgPath || /^https?:/i.test(imgPath)) return null;
-  if (imageSizeCache.has(imgPath)) return imageSizeCache.get(imgPath);
+  if (!imgPath || typeof imgPath !== 'string' || /^https?:/i.test(imgPath)) return null;
+  if (!isSafeAssetOrUrl(imgPath) || !imgPath.startsWith('/')) return null;
+  const cleanAssetPath = imgPath.split(/[?#]/)[0];
+  if (imageSizeCache.has(cleanAssetPath)) return imageSizeCache.get(cleanAssetPath);
   let size = null;
   try {
-    const buf = fs.readFileSync(path.join(root, 'public', imgPath));
+    const publicDir = path.resolve(root, 'public');
+    const candidate = path.resolve(publicDir, cleanAssetPath.slice(1));
+    if (!isInsideAuthorizedDirectory(publicDir, candidate)) {
+      return null;
+    }
+    const buf = fs.readFileSync(candidate);
     if (buf.toString('ascii', 0, 4) === 'RIFF' && buf.toString('ascii', 8, 12) === 'WEBP') {
       const kind = buf.toString('ascii', 12, 16);
       if (kind === 'VP8X') size = { width: 1 + buf.readUIntLE(24, 3), height: 1 + buf.readUIntLE(27, 3) };
@@ -492,126 +983,89 @@ function getImageSize(imgPath) {
   } catch {
     size = null;
   }
-  imageSizeCache.set(imgPath, size);
+  imageSizeCache.set(cleanAssetPath, size);
   return size;
 }
-const mimeOf = (img) => (/\.png(\?|$)/i.test(img) ? 'image/png' : /\.jpe?g(\?|$)/i.test(img) ? 'image/jpeg' : /\.webp(\?|$)/i.test(img) ? 'image/webp' : '');
 
-// JSON inside <script>: "<" must be escaped so content can never close the tag early.
-const safeJson = (obj) => JSON.stringify(obj, null, 2).replace(/</g, '\\u003c').replace(/\u2028/g, '\\u2028').replace(/\u2029/g, '\\u2029');
+const seoSettings = {
+  ...settings,
+  productionUrl: baseUrl,
+};
 
-function createPageHtml({ title, description, path: pagePath, image, imageAlt, ogType = 'website', jsonLd, contentHtml, indexable: isIdx, notFound = false, preloadImage = null, articleMeta = null }) {
-  const crumbs = pendingCrumbs;
-  pendingCrumbs = null;
-  const normPath = pagePath === '/' ? '/' : (pagePath.endsWith('/') ? pagePath : pagePath + '/');
-  const url = `${baseUrl}${normPath}`;
-  const ogImgRaw = image || defaultOgImage;
-  const ogImg = toAbsoluteUrl(ogImgRaw);
-  const ogSize = getImageSize(ogImgRaw);
-  const safeDesc = trimDesc(description);
-  const safeImgAlt = imageAlt || title;
-  const is404 = notFound;
-  // Indexing is decided in ONE place (src/config/indexing.js); callers may only pass a boolean computed from it.
-  const indexableFlag = is404 ? false : (isIdx ?? indexable(normPath));
-
-  let html = baseHtml;
-  // NOTE: every replacement below uses a function so "$&", "$1", "$'" inside titles/descriptions/content
-  // are inserted literally (a plain replacement string would interpret them as patterns).
-  const set = (re, text) => {
-    html = html.replace(re, () => text);
-  };
-
-  set(/<title>[^<]*<\/title>/i, `<title>${esc(title)}</title>`);
-  set(/<meta\s+name=["']description["'][^>]*>/i, `<meta name="description" content="${esc(safeDesc)}" />`);
-
-  if (is404) {
-    // 404 pages MUST have noindex and MUST NOT have a canonical tag
-    set(/<meta\s+name=["']robots["'][^>]*>/i, `<meta name="robots" content="noindex, follow" />`);
-    html = html.replace(/<link\s+rel=["']canonical["'][^>]*>\s*/gi, '');
-    html = html.replace(/<meta\s+property=["']og:url["'][^>]*>\s*/gi, '');
-  } else {
-    const robots = indexableFlag
-      ? 'index, follow, max-image-preview:large, max-snippet:-1, max-video-preview:-1'
-      : 'noindex, follow';
-    set(/<meta\s+name=["']robots["'][^>]*>/i, `<meta name="robots" content="${robots}" />`);
-    // Canonical always points to the direct 200 URL with trailing slash
-    if (/<link\s+rel=["']canonical["'][^>]*>/i.test(html)) {
-      set(/<link\s+rel=["']canonical["'][^>]*>/i, `<link rel="canonical" href="${esc(url)}" />`);
-    } else {
-      html = html.replace('</head>', () => `    <link rel="canonical" href="${esc(url)}" />\n  </head>`);
-    }
-    set(/<meta\s+property=["']og:url["'][^>]*>/i, `<meta property="og:url" content="${esc(url)}" />`);
-  }
-
-  // Open Graph (absolute URLs; image size is only declared when it is really known)
-  set(/<meta\s+property=["']og:title["'][^>]*>/i, `<meta property="og:title" content="${esc(title)}" />`);
-  set(/<meta\s+property=["']og:description["'][^>]*>/i, `<meta property="og:description" content="${esc(safeDesc)}" />`);
-  set(/<meta\s+property=["']og:type["'][^>]*>/i, `<meta property="og:type" content="${ogType}" />`);
-  set(/<meta\s+property=["']og:image["'][^>]*>/i, `<meta property="og:image" content="${esc(ogImg)}" />`);
-  set(/<meta\s+property=["']og:image:width["'][^>]*>\s*/i, ogSize ? `<meta property="og:image:width" content="${ogSize.width}" />\n    ` : '');
-  set(/<meta\s+property=["']og:image:height["'][^>]*>\s*/i, ogSize ? `<meta property="og:image:height" content="${ogSize.height}" />\n    ` : '');
-  set(/<meta\s+property=["']og:image:type["'][^>]*>\s*/i, mimeOf(ogImgRaw) ? `<meta property="og:image:type" content="${mimeOf(ogImgRaw)}" />\n    ` : '');
-  set(/<meta\s+property=["']og:image:alt["'][^>]*>/i, `<meta property="og:image:alt" content="${esc(safeImgAlt)}" />`);
-
-  // Twitter
-  set(/<meta\s+name=["']twitter:title["'][^>]*>/i, `<meta name="twitter:title" content="${esc(title)}" />`);
-  set(/<meta\s+name=["']twitter:description["'][^>]*>/i, `<meta name="twitter:description" content="${esc(safeDesc)}" />`);
-  set(/<meta\s+name=["']twitter:image["'][^>]*>/i, `<meta name="twitter:image" content="${esc(ogImg)}" />\n    <meta name="twitter:image:alt" content="${esc(safeImgAlt)}" />`);
-
-  // Article-only Open Graph tags (published/modified time, author, section, tags)
-  if (articleMeta) {
-    const tags = [
-      `<meta property="article:published_time" content="${esc(articleMeta.published)}" />`,
-      `<meta property="article:modified_time" content="${esc(articleMeta.modified)}" />`,
-      ...(articleMeta.authorUrl ? [`<meta property="article:author" content="${esc(articleMeta.authorUrl)}" />`] : []),
-      `<meta property="article:section" content="${esc(articleMeta.section)}" />`,
-      ...(articleMeta.tags || []).map((t) => `<meta property="article:tag" content="${esc(t)}" />`),
-    ].join('\n    ');
-    html = html.replace('</head>', () => `    ${tags}\n  </head>`);
-  }
-
-  // Preload LCP hero/featured image if specified
-  if (preloadImage) {
-    let p900 = preloadImage;
-    let srcset = '';
-    if (preloadImage.startsWith('/images/articles/') && preloadImage.endsWith('.webp')) {
-      const base = preloadImage.slice(0, -5);
-      p900 = `${base}-900w.webp`;
-      srcset = `${base}-600w.webp 600w, ${base}-900w.webp 900w, ${preloadImage} 1200w`;
-    }
-    const srcsetAttr = srcset ? ` imagesrcset="${esc(srcset)}" imagesizes="(max-width: 640px) 100vw, 896px"` : '';
-    html = html.replace('</head>', () => `    <link rel="preload" as="image" href="${esc(p900)}"${srcsetAttr} fetchpriority="high">\n  </head>`);
-  }
-
-  // Structured data: replace the template's schema, and add ONE BreadcrumbList (JSON-LD) when the page has crumbs.
-  let ld = jsonLd;
-  if (crumbs && crumbs.length) {
-    const bc = breadcrumbLd(crumbs, url);
-    if (!ld) ld = { '@context': 'https://schema.org', '@graph': [orgNode, websiteNode, bc] };
-    else if (Array.isArray(ld['@graph'])) {
-      if (!ld['@graph'].some((n) => n['@type'] === 'BreadcrumbList')) ld = { ...ld, '@graph': [...ld['@graph'], bc] };
-    } else {
-      const { '@context': ctxVal, ...node } = ld;
-      ld = { '@context': ctxVal || 'https://schema.org', '@graph': [node, bc] };
+const resolveStaticRouteSeo = (routePath, { wordCount = null, imageSize = null } = {}) => {
+  const targetPath = typeof routePath === 'string' && routePath.trim() ? routePath : '/';
+  try {
+    return resolvePageSeo({
+      path: targetPath,
+      seoConfig,
+      settings: seoSettings,
+      articles,
+      categories,
+      tools: [],
+      wordCount,
+      imageSize,
+    });
+  } catch (err) {
+    console.warn(`[postbuild] SEO resolution failed for "${targetPath}", falling back safely: ${err.message}`);
+    try {
+      return resolvePageSeo({
+        path: targetPath,
+        seoConfig: null,
+        settings: seoSettings,
+        articles,
+        categories,
+        tools: [],
+        wordCount,
+        imageSize,
+      });
+    } catch {
+      return resolvePageSeo({
+        path: '/',
+        seoConfig: null,
+        settings: { productionUrl: baseUrl },
+        articles: [],
+        categories: [],
+        tools: [],
+      });
     }
   }
-  if (ld) {
-    const jsonLdScript = `<script type="application/ld+json">\n    ${safeJson(ld)}\n    </script>`;
-    if (/<script\s+type=["']application\/ld\+json["']>[\s\S]*?<\/script>/i.test(html)) {
-      set(/<script\s+type=["']application\/ld\+json["']>[\s\S]*?<\/script>/i, jsonLdScript);
-    } else {
-      html = html.replace('</head>', () => `    ${jsonLdScript}\n  </head>`);
-    }
-  }
+};
 
-  // Inject content inside <div id="root">
+const overriddenCanonicalFiles = new Set();
+
+function createPageHtml({ seo, path: pagePath, contentHtml, preloadImage = null }) {
+  const resolved = seo || resolveStaticRouteSeo(pagePath || '/');
+  const url = resolved.pageUrl;
+  const is404 = Boolean(resolved.notFound);
+  const resolvedCanonical = is404 ? '' : getSafeHttpUrlOrEmpty(resolved.canonicalUrl);
+
+  let html = applyResolvedSeoToHtml(baseHtml, resolved, {
+    preloadImage,
+    getImageSizeFn: getImageSize,
+  });
+
+  // Inject content inside <div id="root"> (supports idempotent repeated runs)
   const fullBody = `${renderHeader()}<main id="main-content" class="min-h-[70vh]">${contentHtml}</main>${renderFooter()}`;
-  html = html.replace('<div id="root"></div>', () => `<div id="root">${fullBody}</div>`);
+  if (html.includes('<div id="root"></div>')) {
+    html = html.replace('<div id="root"></div>', () => `<div id="root">${fullBody}</div>`);
+  } else {
+    html = html.replace(
+      /<div id="root">[\s\S]*<\/div>(?=\s*(?:<script\b|<\/body>))/i,
+      () => `<div id="root">${fullBody}</div>`
+    );
+  }
 
-  return html;
+  return {
+    html,
+    hasCustomCanonical: Boolean(resolvedCanonical && resolvedCanonical !== url),
+  };
 }
 
-const writePage = (relPath, html) => {
+const writePage = (relPath, pageOutput) => {
+  const html = typeof pageOutput === 'string' ? pageOutput : pageOutput.html;
+  if (pageOutput && typeof pageOutput === 'object' && pageOutput.hasCustomCanonical) {
+    overriddenCanonicalFiles.add(relPath);
+  }
   const full = path.join(dist, relPath);
   fs.mkdirSync(path.dirname(full), { recursive: true });
   fs.writeFileSync(full, html);
@@ -703,23 +1157,19 @@ const homeContent = `
 </section>`;
 
 const homeHtml = createPageHtml({
-  title: 'AINOVEX - AI Tools & Technology Platform',
-  description: 'Discover the best AI tools, software reviews, and guides on AINOVEX. Boost productivity and work smarter with curated artificial intelligence.',
+  seo: resolveStaticRouteSeo('/'),
   path: '/',
   contentHtml: homeContent,
-  jsonLd: {
-    '@context': 'https://schema.org',
-    '@graph': [orgNode, websiteNode],
-  },
 });
 writePage('index.html', homeHtml);
 
 // ----------------------------------------------------------------------------
 // 2. Tools Directory (/tools/)
 // ----------------------------------------------------------------------------
+const toolsSeo = resolveStaticRouteSeo('/tools/');
 const toolsContent = `
 <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
-  ${renderBreadcrumb([{ label: 'AI Tools Directory' }])}
+  ${renderResolvedBreadcrumb(toolsSeo)}
   <div class="py-6 text-center max-w-3xl mx-auto">
     <h1 class="text-3xl sm:text-4xl font-extrabold text-slate-900 dark:text-white tracking-tight mb-3">
       Explore All AI Tools &amp; Software
@@ -738,26 +1188,19 @@ const toolsContent = `
 </div>`;
 
 const toolsPageHtml = createPageHtml({
-  title: 'Best AI Tools Directory & Software Reviews 2026 | AINOVEX',
-  description: 'Browse and compare the top artificial intelligence tools for writing, image creation, video, coding, and productivity. Find the best software for your needs.',
+  seo: toolsSeo,
   path: '/tools/',
   contentHtml: toolsContent,
-  jsonLd: {
-    '@context': 'https://schema.org',
-    '@type': 'CollectionPage',
-    name: 'AI Tools Directory',
-    url: `${baseUrl}/tools/`,
-    description: 'Browse and compare the top artificial intelligence tools for writing, image creation, video, coding, and productivity.',
-  },
 });
 writePage('tools/index.html', toolsPageHtml);
 
 // ----------------------------------------------------------------------------
 // 3. Blog Archive (/blog/)
 // ----------------------------------------------------------------------------
+const blogSeo = resolveStaticRouteSeo('/blog/');
 const blogContent = `
 <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
-  ${renderBreadcrumb([{ label: 'Blog & Articles' }])}
+  ${renderResolvedBreadcrumb(blogSeo)}
   <div class="py-6 text-center max-w-3xl mx-auto">
     <h1 class="text-3xl sm:text-4xl font-extrabold text-slate-900 dark:text-white tracking-tight mb-3">
       AI Articles, Tutorials &amp; Reviews
@@ -785,26 +1228,19 @@ const blogContent = `
 </div>`;
 
 const blogPageHtml = createPageHtml({
-  title: 'AI Insights, Tutorials & Technology Guides | AINOVEX',
-  description: 'Explore actionable AI tutorials, practical workflows, tool comparisons, and tech guides from the AINOVEX editorial team. Master modern AI applications today.',
+  seo: blogSeo,
   path: '/blog/',
   contentHtml: blogContent,
-  jsonLd: {
-    '@context': 'https://schema.org',
-    '@type': 'CollectionPage',
-    name: 'AI Insights, Tutorials & Technology Guides',
-    url: `${baseUrl}/blog/`,
-    description: 'Explore actionable AI tutorials, practical workflows, tool comparisons, and tech guides from the AINOVEX editorial team.',
-  },
 });
 writePage('blog/index.html', blogPageHtml);
 
 // ----------------------------------------------------------------------------
 // 4. Categories Directory (/categories/)
 // ----------------------------------------------------------------------------
+const categoriesSeo = resolveStaticRouteSeo('/categories/');
 const categoriesContent = `
 <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
-  ${renderBreadcrumb([{ label: 'Categories' }])}
+  ${renderResolvedBreadcrumb(categoriesSeo)}
   <div class="py-6 text-center max-w-3xl mx-auto mb-8">
     <h1 class="text-3xl sm:text-4xl font-extrabold text-slate-900 dark:text-white tracking-tight mb-3">
       Explore AI Topics &amp; Categories
@@ -824,17 +1260,9 @@ const categoriesContent = `
 </div>`;
 
 const categoriesPageHtml = createPageHtml({
-  title: 'Browse AI Categories & Topics | AINOVEX',
-  description: 'Explore specialized AI software categories from writing and image generation to coding and productivity. Find the right tools for your specific workflow.',
+  seo: categoriesSeo,
   path: '/categories/',
   contentHtml: categoriesContent,
-  jsonLd: {
-    '@context': 'https://schema.org',
-    '@type': 'CollectionPage',
-    name: 'Browse AI Categories',
-    url: `${baseUrl}/categories/`,
-    description: 'Explore specialized AI software categories from writing and image generation to coding and productivity.',
-  },
 });
 writePage('categories/index.html', categoriesPageHtml);
 
@@ -857,15 +1285,17 @@ for (const a of articles) {
     .sort((x, y) => Number(y.category === a.category) - Number(x.category === a.category))
     .slice(0, 2);
   const imgSize = getImageSize(a.featuredImage);
+  const ogImgSize = getImageSize(a.ogImage || a.featuredImage);
+  const wordCount = mdRaw.split(/\s+/).filter(Boolean).length;
+  const articleSeo = resolveStaticRouteSeo(`/blog/${a.slug}/`, {
+    wordCount,
+    imageSize: ogImgSize,
+  });
   const authorProfile = getArticleAuthorProfile(a.author);
 
   const articleContent = `
 <article class="max-w-4xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
-  ${renderBreadcrumb([
-    { label: 'Blog', path: '/blog/' },
-    { label: a.categoryName || a.category, path: `/category/${a.category}/` },
-    { label: a.title },
-  ])}
+  ${renderResolvedBreadcrumb(articleSeo)}
   <div class="py-6 border-b border-slate-200 dark:border-slate-800/80 mb-8">
     <a href="/category/${a.category}/" class="inline-block px-3 py-1 rounded-full text-xs font-bold uppercase tracking-wider bg-blue-50 text-blue-600 border border-blue-200 dark:bg-blue-600/20 dark:text-blue-400 dark:border-blue-500/30 mb-4 hover:bg-blue-100 transition-colors">
       ${esc(a.categoryName || a.category)}
@@ -946,146 +1376,11 @@ for (const a of articles) {
   </div>` : ''}
 </article>`;
 
-  const absArticleUrl = `${baseUrl}/blog/${a.slug}/`;
-  const absImageUrl = toAbsoluteUrl(a.ogImage || a.featuredImage);
-  const absAuthorUrl = authorProfile ? `${baseUrl}${authorProfile.path}` : null;
-
-  const graphNodes = [
-    websiteNode,
-    orgNode,
-    ...(authorProfile ? [{
-      '@type': 'Person',
-      '@id': `${absAuthorUrl}#person`,
-      name: authorProfile.name,
-      url: absAuthorUrl,
-      jobTitle: authorProfile.role,
-      description: authorProfile.schemaDescription,
-      worksFor: {
-        '@id': `${baseUrl}/#organization`,
-      },
-    }] : []),
-    {
-      '@type': 'BlogPosting',
-      '@id': `${absArticleUrl}#article`,
-      isPartOf: {
-        '@id': `${baseUrl}/#website`,
-      },
-      headline: a.title,
-      description: trimDesc(a.metaDescription || a.excerpt),
-      image: {
-        '@type': 'ImageObject',
-        url: absImageUrl,
-        ...(getImageSize(a.ogImage || a.featuredImage) || {}),
-      },
-      datePublished: a.publishedAt,
-      dateModified: a.updatedAt || a.publishedAt,
-      wordCount: mdRaw.split(/\s+/).filter(Boolean).length,
-      mainEntityOfPage: absArticleUrl,
-      author: absAuthorUrl
-        ? { '@id': `${absAuthorUrl}#person` }
-        : { '@id': `${baseUrl}/#organization` },
-      publisher: {
-        '@id': `${baseUrl}/#organization`,
-      },
-      inLanguage: 'en-US',
-      articleSection: a.categoryName || a.category,
-      keywords: a.tags || [],
-    },
-  ];
-
-  if (a.slug === 'best-ai-tools-bulk-product-catalog-enrichment') {
-    graphNodes.push({
-      '@type': 'FAQPage',
-      '@id': `${absArticleUrl}#faq`,
-      mainEntity: [
-        {
-          '@type': 'Question',
-          name: 'What are the best AI tools for bulk product catalog enrichment?',
-          acceptedAnswer: {
-            '@type': 'Answer',
-            text: 'There is no single universal winner. Naper Studio is best suited for batch catalog editing and multichannel product content. Akeneo\'s Extraction module excels at structured attribute extraction for enterprise PIMs. Eligible BigCommerce merchants can use Catalog Enrichment for native storefront copy, while Bulkbase addresses CSV supplier feed transformations.',
-          },
-        },
-        {
-          '@type': 'Question',
-          name: 'Can AI tools enrich thousands of product listings simultaneously?',
-          acceptedAnswer: {
-            '@type': 'Answer',
-            text: 'Yes, but processing capacities depend on platform architecture. Akeneo documents extraction jobs accommodating up to 30,000 product rows, while Naper Studio provides batch catalog tools and bulk APIs. BigCommerce Catalog Enrichment caps individual requests at 250 products. Always test sample batches before processing entire inventories.',
-          },
-        },
-        {
-          '@type': 'Question',
-          name: 'How does AI extract missing product attributes from supplier data?',
-          acceptedAnswer: {
-            '@type': 'Answer',
-            text: 'The Extraction module analyzes raw supplier descriptions and digital asset sources to identify missing property values (such as materials, dimensions, or technical specifications). It then populates these into structured database fields, displaying visual bot indicators and routing low-confidence predictions to an editorial review queue.',
-          },
-        },
-        {
-          '@type': 'Question',
-          name: 'What is the difference between product data enrichment and mapping?',
-          acceptedAnswer: {
-            '@type': 'Answer',
-            text: 'Product data mapping aligns columns between two data formats (e.g., connecting a supplier\'s "Item_Description" to your store\'s "Body_HTML"). In contrast, enrichment enhances the data within those fields by filling in missing attributes, normalizing values, or generating clearer copy. Both steps are essential for clean catalog processing.',
-          },
-        },
-        {
-          '@type': 'Question',
-          name: 'How can ecommerce managers prevent AI hallucinations in catalog specs?',
-          acceptedAnswer: {
-            '@type': 'Answer',
-            text: 'Establish strict system prompts directing the AI to leave unknown fields empty rather than guessing values. Utilize tools with built-in confidence scoring, enforce controlled attribute dictionaries, and require mandatory human review for critical specifications such as dimensions, safety compliance, materials, and device compatibility.',
-          },
-        },
-        {
-          '@type': 'Question',
-          name: 'Can AI enrich product catalogs directly on Shopify or BigCommerce?',
-          acceptedAnswer: {
-            '@type': 'Answer',
-            text: 'BigCommerce offers native Catalog Enrichment for eligible stores to update titles, descriptions, and search snippets directly in the control panel. For Shopify, merchants can connect catalog management platforms like Naper Studio via dedicated apps or leverage REST API bulk update routines to synchronize enriched attributes.',
-          },
-        },
-        {
-          '@type': 'Question',
-          name: 'How much do AI bulk catalog enrichment tools cost?',
-          acceptedAnswer: {
-            '@type': 'Answer',
-            text: 'Pricing models vary by platform type. Naper provides 50 free credits upon signup (each credit generates one field output) with paid tiers outlined on its pricing page. BigCommerce Catalog Enrichment operates as a paid beta feature for eligible storefronts. Enterprise PIM platforms like Akeneo require custom licensing quotes, while Bulkbase pricing requires direct inquiry.',
-          },
-        },
-        {
-          '@type': 'Question',
-          name: 'What is the recommended workflow for auditing enriched catalog data?',
-          acceptedAnswer: {
-            '@type': 'Answer',
-            text: 'Export an untouched backup of your master catalog before making changes. Run batch enrichment on a small pilot sample (such as under 200 products as recommended in Akeneo\'s documentation), inspect high-impact technical attributes against manufacturer source documents, verify that category fields populate correctly, and retain change logs before publishing mass updates to production.',
-          },
-        },
-      ],
-    });
-  }
-
   const articleHtml = createPageHtml({
-    title: a.metaTitle || `${a.title} | AINOVEX`,
-    description: a.metaDescription || a.excerpt,
+    seo: articleSeo,
     path: `/blog/${a.slug}/`,
-    image: a.ogImage || a.featuredImage,
-    imageAlt: a.imageAlt || a.title,
     preloadImage: a.featuredImage,
-    ogType: 'article',
-    articleMeta: {
-      published: a.publishedAt,
-      modified: a.updatedAt || a.publishedAt,
-      authorUrl: absAuthorUrl,
-      section: a.categoryName || a.category,
-      tags: a.tags || [],
-    },
     contentHtml: articleContent,
-    jsonLd: {
-      '@context': 'https://schema.org',
-      '@graph': graphNodes,
-    },
   });
 
   writePage(`blog/${a.slug}/index.html`, articleHtml);
@@ -1097,13 +1392,11 @@ for (const a of articles) {
 for (const c of categories) {
   const catTools = tools.filter(t => t.category === c.slug);
   const catArticles = articles.filter(a => a.category === c.slug);
+  const catSeo = resolveStaticRouteSeo(`/category/${c.slug}/`);
 
   const catContent = `
 <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
-  ${renderBreadcrumb([
-    { label: 'Categories', path: '/categories/' },
-    { label: c.name },
-  ])}
+  ${renderResolvedBreadcrumb(catSeo)}
   <div class="py-8 border-b border-slate-200 dark:border-slate-800/80 mb-10 text-center max-w-3xl mx-auto">
     <h1 class="text-3xl sm:text-4xl font-extrabold text-slate-900 dark:text-white mb-3">
       ${esc(c.name)}
@@ -1145,29 +1438,20 @@ for (const c of categories) {
   </div>
 </div>`;
 
-  const catDesc = trimDesc(`${c.description} Browse handpicked software reviews and tutorials on AINOVEX.`);
-
   writePage(`category/${c.slug}/index.html`, createPageHtml({
-    title: categoryTitle(c),
-    description: catDesc,
+    seo: catSeo,
     path: `/category/${c.slug}/`,
     contentHtml: catContent,
-    jsonLd: {
-      '@context': 'https://schema.org',
-      '@type': 'CollectionPage',
-      name: `${c.name} AI Tools & Guides`,
-      url: `${baseUrl}/category/${c.slug}/`,
-      description: catDesc,
-    },
   }));
 }
 
 // ----------------------------------------------------------------------------
 // 7. Static Pages: About, Contact, Privacy, Terms, Editorial, Disclaimer
 // ----------------------------------------------------------------------------
+const aboutSeo = resolveStaticRouteSeo('/about/');
 const aboutContent = `
 <div class="max-w-4xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
-  ${renderBreadcrumb([{ label: 'About Us' }])}
+  ${renderResolvedBreadcrumb(aboutSeo)}
   <div class="py-6 border-b border-slate-200 dark:border-slate-800 mb-10 text-center">
     <h1 class="text-3xl sm:text-5xl font-extrabold text-slate-900 dark:text-white tracking-tight mb-4">
       Empowering Creators with Artificial Intelligence
@@ -1203,15 +1487,15 @@ const aboutContent = `
   </div>
 </div>`;
 writePage('about/index.html', createPageHtml({
-  title: 'About Us & Editorial Standards | AINOVEX',
-  description: 'Learn about AINOVEX, our mission to simplify artificial intelligence, our testing standards, and our independent editorial review methodology.',
+  seo: aboutSeo,
   path: '/about/',
   contentHtml: aboutContent,
 }));
 
+const contactSeo = resolveStaticRouteSeo('/contact/');
 const contactContent = `
 <div class="max-w-4xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
-  ${renderBreadcrumb([{ label: 'Contact Us' }])}
+  ${renderResolvedBreadcrumb(contactSeo)}
   <div class="py-6 border-b border-slate-200 dark:border-slate-800 mb-8 text-center">
     <h1 class="text-3xl sm:text-4xl font-extrabold text-slate-900 dark:text-white tracking-tight mb-2">
       Contact the Editorial Team
@@ -1226,8 +1510,7 @@ const contactContent = `
   </div>
 </div>`;
 writePage('contact/index.html', createPageHtml({
-  title: 'Contact AINOVEX | Editorial & Support Team',
-  description: 'Contact the AINOVEX editorial team for software recommendations, directory submissions, editorial corrections, or partnership inquiries.',
+  seo: contactSeo,
   path: '/contact/',
   contentHtml: contactContent,
 }));
@@ -1240,14 +1523,11 @@ for (const author of authors) {
 
   const authorArticlesList = author.articles;
   const authorUrlPath = author.path;
-  const authorAbsUrl = `${baseUrl}${authorUrlPath}`;
+  const authorSeo = resolveStaticRouteSeo(authorUrlPath);
 
   const authorContent = `
 <div class="max-w-5xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
-  ${renderBreadcrumb([
-    { label: 'Authors', path: '/about/' },
-    { label: author.name },
-  ])}
+  ${renderResolvedBreadcrumb(authorSeo)}
 
   <div class="bg-white dark:bg-slate-900/70 border border-slate-200 dark:border-slate-800 rounded-3xl p-6 sm:p-10 shadow-sm mb-12">
     <div class="flex flex-col sm:flex-row items-start sm:items-center gap-6 mb-8 pb-8 border-b border-slate-200 dark:border-slate-800">
@@ -1332,36 +1612,19 @@ for (const author of authors) {
 </div>`;
 
   writePage(`author/${author.slug}/index.html`, createPageHtml({
-    title: author.seoTitle,
-    description: author.seoDescription,
+    seo: authorSeo,
     path: authorUrlPath,
     contentHtml: authorContent,
-    jsonLd: {
-      '@context': 'https://schema.org',
-      '@graph': [orgNode, {
-        '@type': 'ProfilePage',
-        mainEntity: {
-          '@type': 'Person',
-          '@id': `${authorAbsUrl}#person`,
-          name: author.name,
-          url: authorAbsUrl,
-          jobTitle: author.role,
-          description: author.schemaDescription,
-          worksFor: {
-            '@id': `${baseUrl}/#organization`,
-          },
-        },
-      }],
-    },
   }));
 }
 
 const legal = getLegalContent({ siteUrl: baseUrl, contactEmail: settings.contactEmail, strict: true });
 const legalDateLabel = formatLegalDate();
 
+const privacySeo = resolveStaticRouteSeo('/privacy/');
 const privacyContent = `
 <div class="max-w-4xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
-  ${renderBreadcrumb([{ label: LEGAL_BREADCRUMBS.privacy }])}
+  ${renderResolvedBreadcrumb(privacySeo)}
   <div class="py-6 border-b border-slate-200 dark:border-slate-800/80 mb-8">
     <h1 class="text-3xl sm:text-4xl font-extrabold text-slate-900 dark:text-white tracking-tight mb-2">${esc(LEGAL_TITLES.privacy)}</h1>
     <p class="text-xs text-slate-500 dark:text-slate-400">Last updated: ${esc(legalDateLabel)} &bull; Published by AINOVEX Editorial Team</p>
@@ -1386,15 +1649,15 @@ const privacyContent = `
   </div>
 </div>`;
 writePage('privacy/index.html', createPageHtml({
-  title: 'Privacy Policy | AINOVEX AI Platform',
-  description: 'Read the official AINOVEX Privacy Policy. Learn how we safeguard your personal information, handle essential cookies, and maintain data privacy.',
+  seo: privacySeo,
   path: '/privacy/',
   contentHtml: privacyContent,
 }));
 
+const termsSeo = resolveStaticRouteSeo('/terms/');
 const termsContent = `
 <div class="max-w-4xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
-  ${renderBreadcrumb([{ label: LEGAL_BREADCRUMBS.terms }])}
+  ${renderResolvedBreadcrumb(termsSeo)}
   <div class="py-6 border-b border-slate-200 dark:border-slate-800/80 mb-8">
     <h1 class="text-3xl sm:text-4xl font-extrabold text-slate-900 dark:text-white tracking-tight mb-2">${esc(LEGAL_TITLES.terms)}</h1>
     <p class="text-xs text-slate-500 dark:text-slate-400">Last updated: ${esc(legalDateLabel)} &bull; Published by AINOVEX Editorial Team</p>
@@ -1415,15 +1678,15 @@ const termsContent = `
   </div>
 </div>`;
 writePage('terms/index.html', createPageHtml({
-  title: 'Terms of Service | AINOVEX Platform',
-  description: 'Review the AINOVEX Terms of Service. Understand the rules, guidelines, disclaimers, and legal agreements governing the use of our website.',
+  seo: termsSeo,
   path: '/terms/',
   contentHtml: termsContent,
 }));
 
+const editorialSeo = resolveStaticRouteSeo('/editorial-policy/');
 const editorialContent = `
 <div class="max-w-4xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
-  ${renderBreadcrumb([{ label: LEGAL_BREADCRUMBS.editorial }])}
+  ${renderResolvedBreadcrumb(editorialSeo)}
   <div class="py-6 border-b border-slate-200 dark:border-slate-800/80 mb-8">
     <h1 class="text-3xl sm:text-4xl font-extrabold text-slate-900 dark:text-white tracking-tight mb-2">${esc(LEGAL_TITLES.editorial)}</h1>
     <p class="text-xs text-slate-500 dark:text-slate-400">Last updated: ${esc(legalDateLabel)} &bull; Published by AINOVEX Editorial Team</p>
@@ -1442,15 +1705,15 @@ const editorialContent = `
   </div>
 </div>`;
 writePage('editorial-policy/index.html', createPageHtml({
-  title: 'Editorial Policy & Review Standards | AINOVEX',
-  description: 'Explore AINOVEX editorial policy, review guidelines, testing benchmarks, and independence standards for recommending artificial intelligence tools.',
+  seo: editorialSeo,
   path: '/editorial-policy/',
   contentHtml: editorialContent,
 }));
 
+const affiliateSeo = resolveStaticRouteSeo('/affiliate-disclosure/');
 const affiliateContent = `
 <div class="max-w-4xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
-  ${renderBreadcrumb([{ label: LEGAL_BREADCRUMBS.affiliate }])}
+  ${renderResolvedBreadcrumb(affiliateSeo)}
   <div class="py-6 border-b border-slate-200 dark:border-slate-800/80 mb-8">
     <h1 class="text-3xl sm:text-4xl font-extrabold text-slate-900 dark:text-white tracking-tight mb-2">${esc(LEGAL_TITLES.affiliate)}</h1>
     <p class="text-xs text-slate-500 dark:text-slate-400">Last updated: ${esc(legalDateLabel)} &bull; Published by AINOVEX Editorial Team</p>
@@ -1467,8 +1730,7 @@ const affiliateContent = `
   </div>
 </div>`;
 writePage('affiliate-disclosure/index.html', createPageHtml({
-  title: 'Affiliate & Monetization Disclosure | AINOVEX',
-  description: 'Read the AINOVEX affiliate and advertising disclosure. Learn how our site remains free for readers through transparent monetization and integrity.',
+  seo: affiliateSeo,
   path: '/affiliate-disclosure/',
   contentHtml: affiliateContent,
 }));
@@ -1490,11 +1752,9 @@ const notFoundContent = `
   </div>
 </div>`;
 const notFoundHtml = createPageHtml({
-  title: 'Page Not Found (404) | AINOVEX',
-  description: 'The page you requested could not be found. Explore top AI tools, software reviews, and guides on AINOVEX.',
+  seo: resolveStaticRouteSeo('/404/'),
   path: '/404/',
   contentHtml: notFoundContent,
-  notFound: true,
 });
 writePage('404.html', notFoundHtml);
 
@@ -1553,7 +1813,11 @@ for (const filePath of allHtmlFiles) {
       offending.push(`[${relFile}] 404.html must not contain <meta property="og:url">`);
     }
   } else {
-    if (!canonHref || !canonHref.startsWith(baseUrl) || !canonHref.endsWith('/')) {
+    if (overriddenCanonicalFiles.has(relFile)) {
+      if (!canonHref || !isSafeHttpUrl(canonHref)) {
+        offending.push(`[${relFile}] custom canonical href "${canonHref}" is not a valid HTTP/HTTPS URL`);
+      }
+    } else if (!canonHref || !canonHref.startsWith(baseUrl) || !canonHref.endsWith('/')) {
       offending.push(`[${relFile}] canonical href "${canonHref}" does not start with baseUrl "${baseUrl}" or does not end with "/"`);
     }
     if (!ogUrlContent || !ogUrlContent.startsWith(baseUrl) || !ogUrlContent.endsWith('/')) {

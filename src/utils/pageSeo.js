@@ -5,7 +5,7 @@
 
 import { LEGAL_TITLES, LEGAL_BREADCRUMBS } from '../config/legal.js';
 import { categoryHasContent, categoryTitle } from '../config/indexing.js';
-import { findAuthorBySlug } from './authors.js';
+import { findAuthorBySlug, getArticleAuthorProfile } from './authors.js';
 
 export const DEFAULT_SITE_URL = 'https://ai-novex.netlify.app';
 export const DEFAULT_SITE_NAME = 'AINOVEX';
@@ -167,11 +167,11 @@ function isPlainObject(val) {
   return proto === Object.prototype || proto === null;
 }
 
-function cleanString(val, maxLen = 500) {
+function cleanString(val, maxLen = 500, minLen = 1) {
   if (typeof val !== 'string') return '';
   if (CONTROL_CHAR_REGEX.test(val)) return '';
   const trimmed = val.trim();
-  if (!trimmed || trimmed.length > maxLen) return '';
+  if (!trimmed || trimmed.length < minLen || trimmed.length > maxLen) return '';
   return trimmed;
 }
 
@@ -267,6 +267,53 @@ export function formatTitleWithTemplate(rawTitle, titleTemplate, siteName = DEFA
   return siteName && !title.includes(`| ${siteName}`) ? `${title} | ${siteName}` : title;
 }
 
+const STRUCTURED_DATA_URL_KEYS = new Set([
+  'url',
+  '@id',
+  'sameAs',
+  'item',
+  'contentUrl',
+  'embedUrl',
+  'target',
+]);
+
+function isSafeStructuredDataUrl(val) {
+  if (typeof val !== 'string') return false;
+  const trimmed = val.trim();
+  if (!trimmed || CONTROL_CHAR_REGEX.test(trimmed)) return false;
+  if (DANGEROUS_SCHEME_REGEX.test(trimmed) || DANGEROUS_MARKUP_REGEX.test(trimmed)) return false;
+  if (isSafeHttpUrl(trimmed)) return true;
+  if (trimmed.startsWith('/') && isSafeAssetOrUrl(trimmed)) return true;
+  return false;
+}
+
+function validateStructuredDataUrls(val) {
+  if (typeof val === 'string') return isSafeStructuredDataUrl(val);
+  if (Array.isArray(val)) return val.every((item) => validateStructuredDataUrls(item));
+  if (isPlainObject(val)) {
+    if (typeof val['@id'] === 'string' && !isSafeStructuredDataUrl(val['@id'])) return false;
+    if (typeof val.url === 'string' && !isSafeStructuredDataUrl(val.url)) return false;
+    return true;
+  }
+  return false;
+}
+
+function isValidSchemaTypeValue(t) {
+  const validSingle = (v) => typeof v === 'string' && SCHEMA_TYPE_VALUE_REGEX.test(v);
+  if (Array.isArray(t)) {
+    return t.length > 0 && t.every(validSingle);
+  }
+  return validSingle(t);
+}
+
+function isValidSchemaContextValue(ctx) {
+  return (
+    typeof ctx === 'string' &&
+    (['https://schema.org', 'http://schema.org', 'https://schema.org/', 'http://schema.org/'].includes(ctx) ||
+      isSafeHttpUrl(ctx))
+  );
+}
+
 export function isSafeStructuredData(value, maxDepth = 6, maxBytes = 16384) {
   if (!isPlainObject(value)) return false;
   let serialized;
@@ -275,7 +322,15 @@ export function isSafeStructuredData(value, maxDepth = 6, maxBytes = 16384) {
   } catch {
     return false;
   }
-  if (typeof serialized !== 'string' || serialized.length > maxBytes) return false;
+  if (typeof serialized !== 'string') return false;
+
+  let byteLength = serialized.length;
+  if (typeof TextEncoder !== 'undefined') {
+    byteLength = new TextEncoder().encode(serialized).length;
+  } else if (typeof Buffer !== 'undefined') {
+    byteLength = Buffer.byteLength(serialized, 'utf8');
+  }
+  if (byteLength > maxBytes) return false;
 
   const stack = [{ node: value, depth: 0 }];
   const seen = new WeakSet();
@@ -308,34 +363,47 @@ export function isSafeStructuredData(value, maxDepth = 6, maxBytes = 16384) {
     }
     if (!isPlainObject(node)) return false;
 
+    if (
+      Object.prototype.hasOwnProperty.call(node, '@context') &&
+      node['@context'] !== undefined &&
+      !isValidSchemaContextValue(node['@context'])
+    ) {
+      return false;
+    }
+
+    if (
+      Object.prototype.hasOwnProperty.call(node, '@type') &&
+      node['@type'] !== undefined &&
+      !isValidSchemaTypeValue(node['@type'])
+    ) {
+      return false;
+    }
+
     for (const key of Object.getOwnPropertyNames(node)) {
       if (PROTO_POLLUTION_KEYS.has(key)) return false;
       if (CONTROL_CHAR_REGEX.test(key)) return false;
       const val = node[key];
+      if (STRUCTURED_DATA_URL_KEYS.has(key) && val !== undefined && !validateStructuredDataUrls(val)) {
+        return false;
+      }
       if (val !== null && typeof val === 'object' && depth + 1 > maxDepth) return false;
       stack.push({ node: val, depth: depth + 1 });
     }
   }
 
-  if (Object.prototype.hasOwnProperty.call(value, '@context') && value['@context'] !== undefined) {
-    const ctx = value['@context'];
-    if (
-      typeof ctx !== 'string' ||
-      (!['https://schema.org', 'http://schema.org', 'https://schema.org/', 'http://schema.org/'].includes(ctx) &&
-        !isSafeHttpUrl(ctx))
-    ) {
-      return false;
-    }
-  }
+  const hasRootType =
+    Object.prototype.hasOwnProperty.call(value, '@type') &&
+    value['@type'] !== undefined &&
+    isValidSchemaTypeValue(value['@type']);
+  const hasValidGraph =
+    Array.isArray(value['@graph']) &&
+    value['@graph'].length > 0 &&
+    value['@graph'].every(
+      (item) => isPlainObject(item) && item['@type'] !== undefined && isValidSchemaTypeValue(item['@type'])
+    );
 
-  if (Object.prototype.hasOwnProperty.call(value, '@type') && value['@type'] !== undefined) {
-    const t = value['@type'];
-    const validSingle = (v) => typeof v === 'string' && SCHEMA_TYPE_VALUE_REGEX.test(v);
-    if (Array.isArray(t)) {
-      if (t.length === 0 || !t.every(validSingle)) return false;
-    } else if (!validSingle(t)) {
-      return false;
-    }
+  if (!hasRootType && !hasValidGraph) {
+    return false;
   }
 
   return true;
@@ -375,8 +443,8 @@ export function extractSafeSeoDefaults(seoConfig) {
     typeof raw.titleTemplate === 'string' && raw.titleTemplate.includes('%s')
       ? cleanString(raw.titleTemplate, 120)
       : '';
-  const defaultSeoTitle = cleanString(raw.defaultSeoTitle, 160) || '';
-  const defaultMetaDescription = cleanString(raw.defaultMetaDescription, 320) || '';
+  const defaultSeoTitle = cleanString(raw.defaultSeoTitle, 160, 3) || '';
+  const defaultMetaDescription = cleanString(raw.defaultMetaDescription, 320, 10) || '';
   const defaultFocusKeyword = cleanString(raw.defaultFocusKeyword, 120) || '';
   const defaultSecondaryKeywords = Array.isArray(raw.defaultSecondaryKeywords)
     ? raw.defaultSecondaryKeywords.filter((k) => cleanString(k, 100)).map((k) => k.trim())
@@ -501,24 +569,41 @@ function extractSafePageOverrides(pageRecord) {
     let items;
     if (Array.isArray(pageRecord.breadcrumb.items)) {
       const validItems = [];
-      let allValid = pageRecord.breadcrumb.items.length <= 10;
+      const seenPaths = new Set();
+      let allValid = pageRecord.breadcrumb.items.length > 0 && pageRecord.breadcrumb.items.length <= 10;
       if (allValid) {
-        for (const item of pageRecord.breadcrumb.items) {
-          if (
-            !isPlainObject(item) ||
-            !cleanString(item.name, 100) ||
-            !isValidSeoPathFormat(item.path)
-          ) {
+        for (let idx = 0; idx < pageRecord.breadcrumb.items.length; idx++) {
+          const item = pageRecord.breadcrumb.items[idx];
+          const itemName = cleanString(item?.name, 100);
+          if (!isPlainObject(item) || !itemName || !isValidSeoPathFormat(item.path)) {
             allValid = false;
             break;
           }
+          const normItemPath = normalizeRoutePath(item.path);
+          if (seenPaths.has(normItemPath)) {
+            allValid = false;
+            break;
+          }
+          if (normItemPath === '/' && idx > 0) {
+            allValid = false;
+            break;
+          }
+          if (itemName.toLowerCase() === 'home' && (idx > 0 || normItemPath !== '/')) {
+            allValid = false;
+            break;
+          }
+          seenPaths.add(normItemPath);
           validItems.push({
-            name: item.name.trim(),
-            path: normalizeRoutePath(item.path),
+            name: itemName,
+            path: normItemPath,
           });
         }
       }
-      if (allValid && validItems.length > 0) {
+      if (
+        allValid &&
+        validItems.length > 0 &&
+        !(validItems.length === 1 && validItems[0].path === '/')
+      ) {
         items = validItems;
       }
     }
@@ -537,8 +622,8 @@ function extractSafePageOverrides(pageRecord) {
   return {
     pageId: cleanString(pageRecord.pageId, 128) || null,
     pageType: cleanString(pageRecord.pageType, 32) || null,
-    seoTitle: cleanString(pageRecord.seoTitle, 160) || null,
-    metaDescription: cleanString(pageRecord.metaDescription, 320) || null,
+    seoTitle: cleanString(pageRecord.seoTitle, 160, 3) || null,
+    metaDescription: cleanString(pageRecord.metaDescription, 320, 10) || null,
     canonicalUrl: isSafeHttpUrl(pageRecord.canonicalUrl) ? pageRecord.canonicalUrl.trim() : null,
     index: typeof pageRecord.index === 'boolean' ? pageRecord.index : null,
     follow: typeof pageRecord.follow === 'boolean' ? pageRecord.follow : null,
@@ -602,7 +687,7 @@ export function formatRobotsContent({
  * Resolves visible breadcrumb items from configured breadcrumb data or route defaults.
  * Strips redundant leading "Home" item because Breadcrumbs UI & BreadcrumbList always prepend Home.
  */
-function resolveBreadcrumbItems({ pageOverrides, breadcrumbEnabled, defaultCrumbs }) {
+function resolveBreadcrumbItems({ pageOverrides, breadcrumbEnabled, defaultCrumbs, normPath = '/' }) {
   if (!breadcrumbEnabled) return [];
   const configuredItems = pageOverrides?.breadcrumb?.items;
   if (Array.isArray(configuredItems) && configuredItems.length > 0) {
@@ -622,9 +707,13 @@ function resolveBreadcrumbItems({ pageOverrides, breadcrumbEnabled, defaultCrumb
     );
   }
 
+  if (normPath === '/') {
+    return [];
+  }
+
   const labelOverride = pageOverrides?.breadcrumb?.label;
   if (!Array.isArray(defaultCrumbs) || defaultCrumbs.length === 0) {
-    return labelOverride ? [{ label: labelOverride }] : [];
+    return labelOverride && labelOverride.toLowerCase() !== 'home' ? [{ label: labelOverride }] : [];
   }
 
   return defaultCrumbs.map((c, idx) =>
@@ -701,6 +790,76 @@ const BULK_ENRICHMENT_FAQ_ENTITIES = [
   },
 ];
 
+const ARTICLE_SCHEMA_TYPES = new Set(['BlogPosting', 'Article', 'NewsArticle']);
+const ROUTE_PERMITTED_SCHEMA_TYPES = {
+  home: new Set(['WebSite', 'WebPage', 'CollectionPage', 'AboutPage', 'ContactPage']),
+  static: new Set(['WebPage', 'CollectionPage', 'AboutPage', 'ContactPage', 'WebSite']),
+  article: new Set(['BlogPosting', 'Article', 'NewsArticle', 'WebPage']),
+  category: new Set(['CollectionPage', 'WebPage']),
+  author: new Set(['ProfilePage', 'WebPage']),
+  tool: new Set(['SoftwareApplication', 'Product', 'WebPage']),
+};
+
+function hasNodeType(node, typeName) {
+  const t = node?.['@type'];
+  if (typeof t === 'string') return t === typeName;
+  if (Array.isArray(t)) return t.includes(typeName);
+  return false;
+}
+
+function isValidCustomFaqNode(node) {
+  if (!Array.isArray(node?.mainEntity) || node.mainEntity.length === 0) return false;
+  return node.mainEntity.every(
+    (q) =>
+      isPlainObject(q) &&
+      hasNodeType(q, 'Question') &&
+      Boolean(cleanString(q.name, 500)) &&
+      isPlainObject(q.acceptedAnswer) &&
+      hasNodeType(q.acceptedAnswer, 'Answer') &&
+      Boolean(cleanString(q.acceptedAnswer.text, 5000))
+  );
+}
+
+function resolvePermittedSchemaType({
+  routeKind,
+  requestedSchemaType,
+  customStructuredData = null,
+  staticDefaultSchemaType = null,
+  entity = null,
+  fallbackSchemaType = 'WebPage',
+  notFound = false,
+}) {
+  if (notFound) return 'WebPage';
+  const defaultType = staticDefaultSchemaType || fallbackSchemaType || 'WebPage';
+  if (!requestedSchemaType) return defaultType;
+
+  if (requestedSchemaType === 'Custom') {
+    if (customStructuredData && isSafeStructuredData(customStructuredData)) {
+      return 'Custom';
+    }
+    return defaultType;
+  }
+
+  if (routeKind === 'article' && entity) {
+    if (
+      requestedSchemaType === 'FAQPage' &&
+      entity.slug === 'best-ai-tools-bulk-product-catalog-enrichment'
+    ) {
+      return 'FAQPage';
+    }
+    if (ARTICLE_SCHEMA_TYPES.has(requestedSchemaType)) {
+      return requestedSchemaType;
+    }
+    return defaultType;
+  }
+
+  const permitted = ROUTE_PERMITTED_SCHEMA_TYPES[routeKind];
+  if (permitted && permitted.has(requestedSchemaType)) {
+    return requestedSchemaType;
+  }
+  return defaultType;
+}
+
 /**
  * Builds valid, deduplicated Schema.org JSON-LD @graph for a resolved page.
  */
@@ -724,7 +883,14 @@ export function buildPageJsonLd({
   wordCount = null,
   notFound = false,
 }) {
-  const cleanBase = String(baseUrl || DEFAULT_SITE_URL).replace(/\/+$/, '');
+  const cleanBase = (isSafeHttpUrl(String(baseUrl || ''))
+    ? new URL(String(baseUrl)).origin
+    : DEFAULT_SITE_URL
+  ).replace(/\/+$/, '');
+  const safePageUrl = isSafeHttpUrl(String(pageUrl || ''))
+    ? String(pageUrl).trim()
+    : `${cleanBase}${normalizeRoutePath(normPath || '/')}`;
+
   const orgNode = {
     '@type': 'Organization',
     '@id': `${cleanBase}/#organization`,
@@ -761,14 +927,41 @@ export function buildPageJsonLd({
     return { '@context': 'https://schema.org', '@graph': graph };
   }
 
-  const effectiveType = schemaType && schemaType !== 'Custom' ? schemaType : null;
+  const safeCustomData =
+    customStructuredData && isSafeStructuredData(customStructuredData)
+      ? customStructuredData
+      : null;
+
+  const staticDef = STATIC_SEO_DEFAULTS[normPath] || {};
+  const resolvedType = resolvePermittedSchemaType({
+    routeKind,
+    requestedSchemaType: schemaType,
+    customStructuredData: safeCustomData,
+    staticDefaultSchemaType: staticDef.schemaType || null,
+    entity,
+    fallbackSchemaType:
+      routeKind === 'article'
+        ? 'BlogPosting'
+        : routeKind === 'category'
+          ? 'CollectionPage'
+          : routeKind === 'author'
+            ? 'ProfilePage'
+            : routeKind === 'tool'
+              ? 'SoftwareApplication'
+              : routeKind === 'home'
+                ? 'WebSite'
+                : 'WebPage',
+    notFound,
+  });
+
+  const effectiveType = resolvedType !== 'Custom' ? resolvedType : null;
 
   if (routeKind === 'home') {
     if (effectiveType && effectiveType !== 'WebSite') {
       graph.push({
         '@type': effectiveType,
-        '@id': `${pageUrl}#webpage`,
-        url: pageUrl,
+        '@id': `${safePageUrl}#webpage`,
+        url: safePageUrl,
         name: title,
         description,
         isPartOf: { '@id': `${cleanBase}/#website` },
@@ -789,16 +982,11 @@ export function buildPageJsonLd({
       });
     }
 
-    const articleNodeType =
-      effectiveType === 'Article' ||
-      effectiveType === 'BlogPosting' ||
-      effectiveType === 'NewsArticle'
-        ? effectiveType
-        : 'BlogPosting';
+    const articleNodeType = ARTICLE_SCHEMA_TYPES.has(effectiveType) ? effectiveType : 'BlogPosting';
 
     const articleNode = {
       '@type': articleNodeType,
-      '@id': `${pageUrl}#article`,
+      '@id': `${safePageUrl}#article`,
       isPartOf: { '@id': `${cleanBase}/#website` },
       headline: entity.title,
       description,
@@ -810,7 +998,7 @@ export function buildPageJsonLd({
       datePublished: entity.publishedAt,
       dateModified: entity.updatedAt || entity.publishedAt,
       ...(typeof wordCount === 'number' && wordCount > 0 ? { wordCount } : {}),
-      mainEntityOfPage: pageUrl,
+      mainEntityOfPage: safePageUrl,
       author: absAuthorUrl
         ? { '@id': `${absAuthorUrl}#person` }
         : { '@id': `${cleanBase}/#organization` },
@@ -824,25 +1012,8 @@ export function buildPageJsonLd({
     if (entity.slug === 'best-ai-tools-bulk-product-catalog-enrichment') {
       graph.push({
         '@type': 'FAQPage',
-        '@id': `${pageUrl}#faq`,
+        '@id': `${safePageUrl}#faq`,
         mainEntity: BULK_ENRICHMENT_FAQ_ENTITIES,
-      });
-    }
-
-    if (
-      effectiveType &&
-      effectiveType !== articleNodeType &&
-      effectiveType !== 'WebPage' &&
-      !(effectiveType === 'FAQPage' && entity.slug === 'best-ai-tools-bulk-product-catalog-enrichment')
-    ) {
-      graph.push({
-        '@type': effectiveType,
-        '@id': `${pageUrl}#webpage`,
-        url: pageUrl,
-        name: title,
-        description,
-        isPartOf: { '@id': `${cleanBase}/#website` },
-        inLanguage: 'en-US',
       });
     }
   } else if (routeKind === 'tool' && entity) {
@@ -850,10 +1021,10 @@ export function buildPageJsonLd({
     const toolImageUrl = toAbsoluteAssetUrl(entity.icon || imageUrl, cleanBase);
     const toolNode = {
       '@type': toolNodeType,
-      '@id': `${pageUrl}#tool`,
+      '@id': `${safePageUrl}#tool`,
       name: entity.name,
       description,
-      url: pageUrl,
+      url: safePageUrl,
       sameAs: entity.url,
       image: toolImageUrl,
       isPartOf: { '@id': `${cleanBase}/#website` },
@@ -873,17 +1044,17 @@ export function buildPageJsonLd({
     const profileType = effectiveType || 'ProfilePage';
     graph.push({
       '@type': profileType,
-      '@id': `${pageUrl}#profile`,
-      url: pageUrl,
+      '@id': `${safePageUrl}#profile`,
+      url: safePageUrl,
       name: title,
       description,
       isPartOf: { '@id': `${cleanBase}/#website` },
       inLanguage: 'en-US',
       mainEntity: {
         '@type': 'Person',
-        '@id': `${pageUrl}#person`,
+        '@id': `${safePageUrl}#person`,
         name: entity.name,
-        url: pageUrl,
+        url: safePageUrl,
         jobTitle: entity.role,
         description: entity.schemaDescription,
         worksFor: { '@id': `${cleanBase}/#organization` },
@@ -893,23 +1064,22 @@ export function buildPageJsonLd({
     const catType = effectiveType || 'CollectionPage';
     graph.push({
       '@type': catType,
-      '@id': `${pageUrl}#collection`,
+      '@id': `${safePageUrl}#collection`,
       name: `${entity.name} AI Tools & Guides`,
-      url: pageUrl,
+      url: safePageUrl,
       description,
       isPartOf: { '@id': `${cleanBase}/#website` },
       inLanguage: 'en-US',
     });
   } else {
     // Static routes: /tools/, /blog/, /categories/, /about/, /contact/, legal, etc.
-    const staticDef = STATIC_SEO_DEFAULTS[normPath] || {};
     const nodeType = effectiveType || staticDef.schemaType || 'WebPage';
-    if (!(schemaType === 'Custom' && customStructuredData)) {
+    if (!(resolvedType === 'Custom' && safeCustomData)) {
       graph.push({
         '@type': nodeType,
-        '@id': `${pageUrl}#webpage`,
+        '@id': `${safePageUrl}#webpage`,
         name: staticDef.schemaName || title,
-        url: pageUrl,
+        url: safePageUrl,
         description,
         isPartOf: { '@id': `${cleanBase}/#website` },
         inLanguage: 'en-US',
@@ -917,29 +1087,34 @@ export function buildPageJsonLd({
     }
   }
 
-  // Merge safe customStructuredData without duplicating Organization, WebSite, or @id
-  if (customStructuredData && isPlainObject(customStructuredData)) {
-    const rawNodes = Array.isArray(customStructuredData['@graph'])
-      ? customStructuredData['@graph']
-      : [customStructuredData];
+  // Merge safe customStructuredData without duplicating Organization, WebSite, FAQPage, or @id,
+  // and ignoring BreadcrumbList so JSON-LD stays strictly consistent with resolved breadcrumbs.
+  if (safeCustomData) {
+    const rawNodes = Array.isArray(safeCustomData['@graph'])
+      ? safeCustomData['@graph']
+      : [safeCustomData];
 
     for (const rawNode of rawNodes) {
       if (!isPlainObject(rawNode)) continue;
+      if (!rawNode['@type'] || !isValidSchemaTypeValue(rawNode['@type'])) continue;
       const cloned = cloneSafeJson(rawNode);
       delete cloned['@context'];
-      const nodeType = cloned['@type'];
       const nodeId = cloned['@id'];
 
+      if (hasNodeType(cloned, 'BreadcrumbList')) {
+        continue;
+      }
       if (nodeId && graph.some((existing) => existing['@id'] === nodeId)) {
         continue;
       }
-      if (!nodeId && (nodeType === 'Organization' || nodeType === 'WebSite')) {
+      if (hasNodeType(cloned, 'Organization') || hasNodeType(cloned, 'WebSite')) {
         continue;
       }
-      if (nodeType === 'BreadcrumbList') {
-        const existingBcIdx = graph.findIndex((n) => n['@type'] === 'BreadcrumbList');
-        if (existingBcIdx >= 0) {
-          graph[existingBcIdx] = cloned;
+      if (hasNodeType(cloned, 'FAQPage')) {
+        if (graph.some((existing) => hasNodeType(existing, 'FAQPage'))) {
+          continue;
+        }
+        if (!isValidCustomFaqNode(cloned)) {
           continue;
         }
       }
@@ -947,24 +1122,23 @@ export function buildPageJsonLd({
     }
   }
 
-  // Add ONE BreadcrumbList if enabled, has crumbs, and none was provided by customStructuredData
-  if (
-    breadcrumbEnabled &&
-    Array.isArray(breadcrumbs) &&
-    breadcrumbs.length > 0 &&
-    !graph.some((n) => n['@type'] === 'BreadcrumbList')
-  ) {
+  // Add ONE authoritative BreadcrumbList if enabled and non-empty
+  if (breadcrumbEnabled && Array.isArray(breadcrumbs) && breadcrumbs.length > 0) {
     graph.push({
       '@type': 'BreadcrumbList',
-      '@id': `${pageUrl}#breadcrumb`,
+      '@id': `${safePageUrl}#breadcrumb`,
       itemListElement: [
         { '@type': 'ListItem', position: 1, name: 'Home', item: `${cleanBase}/` },
-        ...breadcrumbs.map((c, idx) => ({
-          '@type': 'ListItem',
-          position: idx + 2,
-          name: c.label,
-          item: c.path ? `${cleanBase}${normalizeRoutePath(c.path)}` : pageUrl,
-        })),
+        ...breadcrumbs.map((c, idx) => {
+          const hasValidItemPath =
+            typeof c.path === 'string' && c.path.trim() && isValidSeoPathFormat(c.path);
+          return {
+            '@type': 'ListItem',
+            position: idx + 2,
+            name: c.label,
+            item: hasValidItemPath ? `${cleanBase}${normalizeRoutePath(c.path)}` : safePageUrl,
+          };
+        }),
       ],
     });
   }
@@ -975,10 +1149,11 @@ export function buildPageJsonLd({
 /**
  * Resolves effective SEO metadata, breadcrumbs, and structured data for any route.
  * Priority:
- * 1. Page-specific SEO override (from seo.json -> pages)
- * 2. Entity-specific SEO metadata (for article / category / tool / author)
+ * 1. Explicit valid page-level SEO override (from seo.json -> pages)
+ * 2. Entity-specific SEO metadata (for article / category / tool / author) or
+ *    route-specific static SEO metadata (from STATIC_SEO_DEFAULTS)
  * 3. Global SEO defaults (from seo.json -> defaults)
- * 4. Existing safe page metadata fallback
+ * 4. Safe final fallback
  */
 export function resolvePageSeo({
   path = '/',
@@ -990,7 +1165,16 @@ export function resolvePageSeo({
   wordCount = null,
   imageSize = null,
 }) {
-  const baseUrl = String(settings?.productionUrl || DEFAULT_SITE_URL).replace(/\/+$/, '');
+  const rawProductionUrl =
+    typeof settings?.productionUrl === 'string' ? settings.productionUrl.trim() : '';
+  let baseUrl = DEFAULT_SITE_URL;
+  if (isSafeHttpUrl(rawProductionUrl)) {
+    try {
+      baseUrl = new URL(rawProductionUrl).origin.replace(/\/+$/, '');
+    } catch {
+      baseUrl = DEFAULT_SITE_URL;
+    }
+  }
   const defaults = extractSafeSeoDefaults(seoConfig);
 
   const siteName = defaults.siteName || cleanString(settings?.siteTitle, 100) || DEFAULT_SITE_NAME;
@@ -1044,8 +1228,8 @@ export function resolvePageSeo({
     const def = STATIC_SEO_DEFAULTS[normPath];
     routeKind = def.pageType === 'home' ? 'home' : 'static';
     candidatePageIds = [def.pageId];
-    fallbackTitle = def.title;
-    fallbackDesc = def.description;
+    fallbackTitle = def.title || DEFAULT_SEO_TITLE;
+    fallbackDesc = def.description || DEFAULT_META_DESCRIPTION;
     fallbackSchemaType = def.schemaType;
     fallbackCrumbs = def.crumbs;
     fallbackBreadcrumbEnabled = def.breadcrumbEnabled;
@@ -1173,40 +1357,50 @@ export function resolvePageSeo({
   const pageOverrides = extractSafePageOverrides(rawPageRecord);
 
   // Resolve title & description with strict priority:
-  // - Static routes: 1. page override -> 2. global default -> 3. hardcoded safe fallback
+  // - Static routes: 1. page override -> 2. route-specific static metadata -> 3. global default -> 4. safe final fallback
   // - Dynamic entity routes (article/category/tool/author): 1. page override -> entity metadata -> global default -> safe fallback
   const isEntityRoute = Boolean(entity);
+  const staticDefault = !isEntityRoute && !notFound ? STATIC_SEO_DEFAULTS[normPath] || null : null;
+  const staticTitle = cleanString(staticDefault?.title, 160, 3) || '';
+  const staticDesc = cleanString(staticDefault?.description, 320, 10) || '';
+  const staticOgTitle = cleanString(staticDefault?.ogTitle, 160, 1) || staticTitle;
+  const staticOgDesc = cleanString(staticDefault?.ogDescription, 320, 1) || staticDesc;
 
-  const seoTitle = pageOverrides?.seoTitle
-    ? pageOverrides.seoTitle
-    : isEntityRoute
-      ? fallbackTitle || globalDefaultTitle
-      : defaults.defaultSeoTitle || fallbackTitle;
+  const seoTitle = isEntityRoute
+    ? pageOverrides?.seoTitle || fallbackTitle || globalDefaultTitle
+    : pageOverrides?.seoTitle ||
+      staticTitle ||
+      defaults.defaultSeoTitle ||
+      fallbackTitle ||
+      DEFAULT_SEO_TITLE;
 
-  const rawDescription = pageOverrides?.metaDescription
-    ? pageOverrides.metaDescription
-    : isEntityRoute
-      ? fallbackDesc || globalDefaultDesc
-      : defaults.defaultMetaDescription || fallbackDesc;
+  const rawDescription = isEntityRoute
+    ? pageOverrides?.metaDescription || fallbackDesc || globalDefaultDesc
+    : pageOverrides?.metaDescription ||
+      staticDesc ||
+      defaults.defaultMetaDescription ||
+      fallbackDesc ||
+      DEFAULT_META_DESCRIPTION;
   const metaDescription = trimMetaDescription(rawDescription, 155);
 
-  // Open Graph & Twitter resolution matching Task 113 resolveEffectiveSeo semantics
-  const ogTitle = pageOverrides?.ogTitle
-    ? pageOverrides.ogTitle
-    : pageOverrides?.seoTitle
-      ? pageOverrides.seoTitle
-      : isEntityRoute
-        ? seoTitle
-        : defaults.defaultOgTitle || defaults.defaultSeoTitle || seoTitle;
+  const ogTitle = isEntityRoute
+    ? pageOverrides?.ogTitle || pageOverrides?.seoTitle || seoTitle
+    : pageOverrides?.ogTitle ||
+      pageOverrides?.seoTitle ||
+      staticOgTitle ||
+      defaults.defaultOgTitle ||
+      defaults.defaultSeoTitle ||
+      seoTitle;
 
   const ogDescription = trimMetaDescription(
-    pageOverrides?.ogDescription
-      ? pageOverrides.ogDescription
-      : pageOverrides?.metaDescription
-        ? pageOverrides.metaDescription
-        : isEntityRoute
-          ? rawDescription
-          : defaults.defaultOgDescription || defaults.defaultMetaDescription || rawDescription,
+    isEntityRoute
+      ? pageOverrides?.ogDescription || pageOverrides?.metaDescription || rawDescription
+      : pageOverrides?.ogDescription ||
+          pageOverrides?.metaDescription ||
+          staticOgDesc ||
+          defaults.defaultOgDescription ||
+          defaults.defaultMetaDescription ||
+          rawDescription,
     155
   );
 
@@ -1316,15 +1510,27 @@ export function resolvePageSeo({
     pageOverrides,
     breadcrumbEnabled,
     defaultCrumbs: fallbackCrumbs,
+    normPath,
   });
 
   // Schema type & JSON-LD
-  const resolvedSchemaType =
-    pageOverrides?.schemaType ||
-    (isEntityRoute ? fallbackSchemaType : null) ||
-    (STATIC_SEO_DEFAULTS[normPath]?.schemaType ?? null) ||
-    defaults.defaultSchemaType ||
-    fallbackSchemaType;
+  const requestedSchemaType = notFound
+    ? 'WebPage'
+    : pageOverrides?.schemaType ||
+      (isEntityRoute ? fallbackSchemaType : null) ||
+      (STATIC_SEO_DEFAULTS[normPath]?.schemaType ?? null) ||
+      defaults.defaultSchemaType ||
+      fallbackSchemaType;
+
+  const resolvedSchemaType = resolvePermittedSchemaType({
+    routeKind,
+    requestedSchemaType,
+    customStructuredData: pageOverrides?.customStructuredData || null,
+    staticDefaultSchemaType: STATIC_SEO_DEFAULTS[normPath]?.schemaType ?? null,
+    entity,
+    fallbackSchemaType,
+    notFound,
+  });
 
   const jsonLd = buildPageJsonLd({
     baseUrl,

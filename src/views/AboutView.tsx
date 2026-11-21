@@ -1,15 +1,24 @@
 import React from 'react';
 import { ShieldCheck, Award, Zap, Users, Mail, Globe } from 'lucide-react';
-import { Breadcrumbs } from '../components/Breadcrumbs';
+import { Breadcrumbs, BreadcrumbItem } from '../components/Breadcrumbs';
 
 interface AboutViewProps {
   onNavigate: (path: string) => void;
+  breadcrumbs?: BreadcrumbItem[];
+  breadcrumbEnabled?: boolean;
 }
 
-export const AboutView: React.FC<AboutViewProps> = ({ onNavigate }) => {
+export const AboutView: React.FC<AboutViewProps> = ({
+  onNavigate,
+  breadcrumbs,
+  breadcrumbEnabled = true,
+}) => {
+  const effectiveBreadcrumbs = breadcrumbs !== undefined ? breadcrumbs : [{ label: 'About' }];
+  const showBreadcrumbs = breadcrumbEnabled !== false && effectiveBreadcrumbs.length > 0;
+
   return (
     <div className="max-w-4xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
-      <Breadcrumbs items={[{ label: 'About Us' }]} onNavigate={onNavigate} />
+      {showBreadcrumbs && <Breadcrumbs items={effectiveBreadcrumbs} onNavigate={onNavigate} />}
 
       <div className="py-6 border-b border-slate-200 dark:border-slate-800/80 mb-10 text-center">
         <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full text-xs font-semibold bg-blue-50 text-blue-600 border border-blue-200 dark:bg-blue-500/10 dark:text-blue-400 dark:border-blue-500/20 mb-3">

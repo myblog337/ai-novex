@@ -1,13 +1,19 @@
 import React, { useState } from 'react';
 import { Mail, Send, CheckCircle2, MessageSquare, Clock } from 'lucide-react';
-import { Breadcrumbs } from '../components/Breadcrumbs';
+import { Breadcrumbs, BreadcrumbItem } from '../components/Breadcrumbs';
 import settings from '../../content/settings.json';
 
 interface ContactViewProps {
   onNavigate: (path: string) => void;
+  breadcrumbs?: BreadcrumbItem[];
+  breadcrumbEnabled?: boolean;
 }
 
-export const ContactView: React.FC<ContactViewProps> = ({ onNavigate }) => {
+export const ContactView: React.FC<ContactViewProps> = ({
+  onNavigate,
+  breadcrumbs,
+  breadcrumbEnabled = true,
+}) => {
   const [name, setName] = useState('');
   const [email, setEmail] = useState('');
   const [subject, setSubject] = useState('');
@@ -34,9 +40,12 @@ export const ContactView: React.FC<ContactViewProps> = ({ onNavigate }) => {
     }
   };
 
+  const effectiveBreadcrumbs = breadcrumbs !== undefined ? breadcrumbs : [{ label: 'Contact' }];
+  const showBreadcrumbs = breadcrumbEnabled !== false && effectiveBreadcrumbs.length > 0;
+
   return (
     <div className="max-w-4xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
-      <Breadcrumbs items={[{ label: 'Contact Us' }]} onNavigate={onNavigate} />
+      {showBreadcrumbs && <Breadcrumbs items={effectiveBreadcrumbs} onNavigate={onNavigate} />}
 
       <div className="py-6 border-b border-slate-200 dark:border-slate-800/80 mb-10 text-center">
         <h1 className="text-3xl sm:text-4xl font-extrabold text-slate-900 dark:text-white tracking-tight mb-3">

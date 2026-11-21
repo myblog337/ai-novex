@@ -12,12 +12,14 @@ import {
   ArrowRight,
 } from 'lucide-react';
 import { Category } from '../types';
-import { Breadcrumbs } from '../components/Breadcrumbs';
+import { Breadcrumbs, BreadcrumbItem } from '../components/Breadcrumbs';
 
 interface CategoriesViewProps {
   categories: Category[];
   onSelectCategory: (slug: string) => void;
   onNavigate: (path: string) => void;
+  breadcrumbs?: BreadcrumbItem[];
+  breadcrumbEnabled?: boolean;
 }
 
 const iconMap: Record<string, React.ReactNode> = {
@@ -36,10 +38,15 @@ export const CategoriesView: React.FC<CategoriesViewProps> = ({
   categories,
   onSelectCategory,
   onNavigate,
+  breadcrumbs,
+  breadcrumbEnabled = true,
 }) => {
+  const effectiveBreadcrumbs = breadcrumbs !== undefined ? breadcrumbs : [{ label: 'Categories' }];
+  const showBreadcrumbs = breadcrumbEnabled !== false && effectiveBreadcrumbs.length > 0;
+
   return (
     <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
-      <Breadcrumbs items={[{ label: 'Categories' }]} onNavigate={onNavigate} />
+      {showBreadcrumbs && <Breadcrumbs items={effectiveBreadcrumbs} onNavigate={onNavigate} />}
 
       <div className="py-6 text-center max-w-3xl mx-auto mb-8">
         <h1 className="text-3xl sm:text-4xl font-extrabold text-slate-900 dark:text-white tracking-tight mb-3">

@@ -1,19 +1,23 @@
 import React from 'react';
 import { Shield, BookOpen, ArrowRight } from 'lucide-react';
 import { Article } from '../types';
-import { Breadcrumbs } from '../components/Breadcrumbs';
+import { Breadcrumbs, BreadcrumbItem } from '../components/Breadcrumbs';
 import { findAuthorBySlug } from '../utils/authors.js';
 
 interface AuthorViewProps {
   slug?: string;
   articles: Article[];
   onNavigate: (path: string) => void;
+  breadcrumbs?: BreadcrumbItem[];
+  breadcrumbEnabled?: boolean;
 }
 
 export const AuthorView: React.FC<AuthorViewProps> = ({
   slug = 'md-shamim',
   articles,
   onNavigate,
+  breadcrumbs,
+  breadcrumbEnabled = true,
 }) => {
   const author = findAuthorBySlug(slug, articles);
 
@@ -42,15 +46,15 @@ export const AuthorView: React.FC<AuthorViewProps> = ({
   const authorRole = author.role;
   const authorArticles = author.articles;
 
+  const effectiveBreadcrumbs =
+    breadcrumbs !== undefined
+      ? breadcrumbs
+      : [{ label: 'Authors', path: '/about/' }, { label: authorName }];
+  const showBreadcrumbs = breadcrumbEnabled !== false && effectiveBreadcrumbs.length > 0;
+
   return (
     <div className="max-w-5xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
-      <Breadcrumbs
-        items={[
-          { label: 'Authors', path: '/about/' },
-          { label: authorName },
-        ]}
-        onNavigate={onNavigate}
-      />
+      {showBreadcrumbs && <Breadcrumbs items={effectiveBreadcrumbs} onNavigate={onNavigate} />}
 
       {/* Author Profile Header */}
       <div className="bg-white dark:bg-slate-900/70 border border-slate-200 dark:border-slate-800 rounded-3xl p-6 sm:p-10 shadow-sm mb-12">
