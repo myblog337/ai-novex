@@ -9,6 +9,11 @@ import {
   executeTransaction,
   resolveSecureJsonPath,
   resolveSecureMarkdownPath,
+  resolveSecureMediaPath,
+  validateMediaFileName,
+  ensureSecureMediaDirectory,
+  isInsideAuthorizedDirectory,
+  MAX_TRANSACTION_OPERATIONS,
   sanitizeErrorMessage,
   defaultStorageEngine,
   getActiveMutexCount,
@@ -59,6 +64,24 @@ import {
   isValidCustomPageSlug,
   validateCustomPage,
   validatePages,
+  MAX_MEDIA_FILE_SIZE_BYTES,
+  MAX_MEDIA_IMAGE_DIMENSION,
+  MAX_MEDIA_ITEMS,
+  MAX_MEDIA_ALT_LENGTH,
+  MAX_MEDIA_ORIGINAL_NAME_LENGTH,
+  MEDIA_PUBLIC_URL_PREFIX,
+  ALLOWED_MEDIA_MIME_TYPES,
+  MEDIA_MIME_TO_EXT,
+  ALLOWED_MEDIA_FIELDS,
+  isValidMediaId,
+  isValidMediaFilename,
+  isValidMediaPublicUrl,
+  sanitizeMediaOriginalFilename,
+  validateMediaAltText,
+  inspectImageBuffer,
+  validateMediaRecord,
+  validateMediaLibrary,
+  findMediaReferencesInContent,
 } from './lib/validators.mjs';
 
 const HOST = '127.0.0.1';
@@ -3087,6 +3110,898 @@ function buildUpdatedCustomPage(existingPage, rawPage, serverNow = new Date().to
     createdAt: safeExisting.createdAt,
     updatedAt: ensureMonotonicIsoTimestamp(safeExisting.createdAt, serverNow),
   };
+}
+
+// ----------------------------------------------------------------------------
+// Media Library Helpers & Streaming Upload Parser (Task 115-B)
+// ----------------------------------------------------------------------------
+
+const MEDIA_ROUTE_PREFIX = '/api/cms/media/';
+const MEDIA_PUBLIC_PREFIX = MEDIA_PUBLIC_URL_PREFIX;
+const ALLOWED_MEDIA_MIME_SET = new Set(ALLOWED_MEDIA_MIME_TYPES);
+const ALLOWED_MEDIA_FIELD_SET = new Set(ALLOWED_MEDIA_FIELDS);
+const MEDIA_UPDATABLE_FIELDS = ['alt'];
+const MAX_MEDIA_MULTIPART_OVERHEAD = 64 * 1024; // 64 KB strictly bounded framing + metadata overhead
+const MAX_MEDIA_MULTIPART_BODY = MAX_MEDIA_FILE_SIZE_BYTES + MAX_MEDIA_MULTIPART_OVERHEAD;
+const MAX_MEDIA_PART_HEADER_BYTES = 8 * 1024;
+const MAX_MEDIA_TEXT_FIELD_BYTES = 4 * 1024;
+const MAX_MEDIA_PREAMBLE_BYTES = 4 * 1024;
+const MAX_MEDIA_MULTIPART_PARTS = 4;
+
+/**
+ * Safe id-aware path parser for Media Library routes (/api/cms/media/:id).
+ */
+function parseMediaIdPath(input, options = {}) {
+  const prefix =
+    options && typeof options.prefix === 'string' && options.prefix.startsWith('/')
+      ? options.prefix
+      : MEDIA_ROUTE_PREFIX;
+
+  const makeNotFound = (rawPath = '/', rawId = null, error = 'Route not found') => ({
+    matched: false,
+    valid: false,
+    invalid: false,
+    status: 'not_found',
+    statusCode: 404,
+    id: null,
+    rawId,
+    rawPath,
+    error,
+  });
+
+  const makeInvalid = (rawPath, rawId, error) => ({
+    matched: true,
+    valid: false,
+    invalid: true,
+    status: 'invalid',
+    statusCode: 400,
+    id: null,
+    rawId,
+    rawPath,
+    error,
+  });
+
+  try {
+    let rawUrl = null;
+    if (typeof input === 'string') {
+      rawUrl = input;
+    } else if (input && typeof input === 'object' && !Array.isArray(input)) {
+      if (typeof input.rawRequestPath === 'string') {
+        rawUrl = input.rawRequestPath;
+      } else if (typeof input.url === 'string') {
+        rawUrl = input.url;
+      }
+    }
+
+    if (!rawUrl || typeof rawUrl !== 'string') {
+      return makeNotFound('/');
+    }
+
+    const rawPath = extractRawRequestPath(rawUrl);
+
+    if (!rawPath.startsWith(prefix)) {
+      return makeNotFound(rawPath);
+    }
+
+    const rawIdPart = rawPath.slice(prefix.length);
+
+    if (!rawIdPart || rawIdPart.includes('/')) {
+      return makeNotFound(rawPath, rawIdPart || null);
+    }
+
+    if (
+      /%2f/i.test(rawIdPart) ||
+      /%5c/i.test(rawIdPart) ||
+      rawIdPart.includes('\\') ||
+      rawIdPart.includes('..') ||
+      /%2e/i.test(rawIdPart) ||
+      rawIdPart.includes('\0') ||
+      /%00/i.test(rawIdPart) ||
+      /%25/i.test(rawIdPart) ||
+      /%(?![0-9a-fA-F]{2})/.test(rawIdPart)
+    ) {
+      return makeInvalid(rawPath, rawIdPart, 'Malformed or forbidden media id');
+    }
+
+    let decodedId;
+    try {
+      decodedId = decodeURIComponent(rawIdPart);
+    } catch {
+      return makeInvalid(rawPath, rawIdPart, 'Malformed percent encoding in media id');
+    }
+
+    if (
+      decodedId.includes('/') ||
+      decodedId.includes('\\') ||
+      decodedId.includes('..') ||
+      decodedId.includes('\0') ||
+      decodedId.includes('%') ||
+      !isValidMediaId(decodedId)
+    ) {
+      return makeInvalid(
+        rawPath,
+        rawIdPart,
+        'Invalid media id: must be 1-128 lowercase alphanumeric characters, hyphens, or underscores starting with alphanumeric'
+      );
+    }
+
+    return {
+      matched: true,
+      valid: true,
+      invalid: false,
+      status: 'valid',
+      statusCode: 200,
+      id: decodedId,
+      rawId: rawIdPart,
+      rawPath,
+      error: null,
+    };
+  } catch {
+    return makeNotFound('/');
+  }
+}
+
+/**
+ * Safe filename parser for public media serving routes (/images/media/:filename).
+ */
+function parsePublicMediaFilenamePath(input) {
+  const prefix = MEDIA_PUBLIC_PREFIX;
+  const makeNotFound = (rawPath = '/', rawFile = null, error = 'Route not found') => ({
+    matched: false,
+    valid: false,
+    invalid: false,
+    status: 'not_found',
+    filename: null,
+    rawFile,
+    rawPath,
+    error,
+  });
+  const makeInvalid = (rawPath, rawFile, error) => ({
+    matched: true,
+    valid: false,
+    invalid: true,
+    status: 'invalid',
+    filename: null,
+    rawFile,
+    rawPath,
+    error,
+  });
+
+  try {
+    let rawUrl = null;
+    if (typeof input === 'string') {
+      rawUrl = input;
+    } else if (input && typeof input === 'object' && !Array.isArray(input)) {
+      if (typeof input.rawRequestPath === 'string') {
+        rawUrl = input.rawRequestPath;
+      } else if (typeof input.url === 'string') {
+        rawUrl = input.url;
+      }
+    }
+    if (!rawUrl || typeof rawUrl !== 'string') {
+      return makeNotFound('/');
+    }
+
+    const rawPath = extractRawRequestPath(rawUrl);
+    if (!rawPath.startsWith(prefix)) {
+      return makeNotFound(rawPath);
+    }
+
+    const rawFilePart = rawPath.slice(prefix.length);
+    if (!rawFilePart || rawFilePart.includes('/')) {
+      return makeInvalid(rawPath, rawFilePart || null, 'Invalid media asset filename');
+    }
+
+    if (
+      /%2f/i.test(rawFilePart) ||
+      /%5c/i.test(rawFilePart) ||
+      rawFilePart.includes('\\') ||
+      rawFilePart.includes('..') ||
+      /%2e/i.test(rawFilePart) ||
+      rawFilePart.includes('\0') ||
+      /%00/i.test(rawFilePart) ||
+      /%25/i.test(rawFilePart) ||
+      /%(?![0-9a-fA-F]{2})/.test(rawFilePart)
+    ) {
+      return makeInvalid(rawPath, rawFilePart, 'Malformed or forbidden media filename');
+    }
+
+    let decoded;
+    try {
+      decoded = decodeURIComponent(rawFilePart);
+    } catch {
+      return makeInvalid(rawPath, rawFilePart, 'Malformed percent encoding in media filename');
+    }
+
+    if (
+      decoded.includes('/') ||
+      decoded.includes('\\') ||
+      decoded.includes('..') ||
+      decoded.includes('\0') ||
+      decoded.includes('%') ||
+      !isValidMediaFilename(decoded)
+    ) {
+      return makeInvalid(rawPath, rawFilePart, 'Invalid media filename format');
+    }
+
+    return {
+      matched: true,
+      valid: true,
+      invalid: false,
+      status: 'valid',
+      filename: decoded,
+      rawFile: rawFilePart,
+      rawPath,
+      error: null,
+    };
+  } catch {
+    return makeNotFound('/');
+  }
+}
+
+function sanitizeMediaForResponse(record) {
+  if (!isPlainJsonObject(record)) {
+    return {};
+  }
+  const clean = {};
+  for (const field of ALLOWED_MEDIA_FIELDS) {
+    if (Object.prototype.hasOwnProperty.call(record, field) && record[field] !== undefined) {
+      clean[field] = clonePlainJsonData(record[field]);
+    }
+  }
+  return clean;
+}
+
+function computeMediaETag(record) {
+  if (!isPlainJsonObject(record)) {
+    throw new TypeError('Media record must be a non-null object');
+  }
+  const clean = canonicalizeMetadata(sanitizeMediaForResponse(record));
+  return generateETag(JSON.stringify({ kind: 'media-v1', media: clean }));
+}
+
+const computeMediaEtag = computeMediaETag;
+
+function generateServerMediaIdentity(ext) {
+  const safeExt = typeof ext === 'string' && /^(?:jpg|png|webp|gif)$/.test(ext) ? ext : null;
+  if (!safeExt) {
+    throw new Error('Unsupported media extension for server identity generation');
+  }
+  const id = crypto.randomUUID();
+  const filename = `media-${crypto.randomBytes(16).toString('hex')}.${safeExt}`;
+  const url = `${MEDIA_PUBLIC_PREFIX}${filename}`;
+  return { id, filename, url };
+}
+
+function buildUpdatedMediaRecord(existingRecord, rawUpdate, serverNow = new Date().toISOString()) {
+  const safeExisting = isPlainJsonObject(existingRecord) ? existingRecord : {};
+  const safeRaw = isPlainJsonObject(rawUpdate) ? rawUpdate : {};
+  const hasAlt = Object.prototype.hasOwnProperty.call(safeRaw, 'alt') && safeRaw.alt !== undefined;
+  const nextAltCheck = hasAlt
+    ? validateMediaAltText(safeRaw.alt)
+    : { ok: true, alt: safeExisting.alt || '' };
+  if (!nextAltCheck.ok) {
+    const err = new Error(nextAltCheck.error || 'Invalid alt text');
+    err.code = 'SCHEMA_VALIDATION_FAILED';
+    throw err;
+  }
+
+  return {
+    id: safeExisting.id,
+    filename: safeExisting.filename,
+    originalName: safeExisting.originalName,
+    url: safeExisting.url,
+    mimeType: safeExisting.mimeType,
+    size: safeExisting.size,
+    width: safeExisting.width,
+    height: safeExisting.height,
+    checksum: safeExisting.checksum,
+    alt: nextAltCheck.alt,
+    createdAt: safeExisting.createdAt,
+    updatedAt: ensureMonotonicIsoTimestamp(safeExisting.createdAt, serverNow),
+  };
+}
+
+function extractMultipartBoundary(contentTypeHeader) {
+  if (typeof contentTypeHeader !== 'string' || !contentTypeHeader.trim()) {
+    return { ok: false, error: 'Missing Content-Type header' };
+  }
+  const segments = contentTypeHeader.split(';');
+  const mediaType = segments[0].trim().toLowerCase();
+  if (mediaType !== 'multipart/form-data') {
+    return { ok: false, error: 'Not multipart/form-data' };
+  }
+  let boundary = null;
+  for (let i = 1; i < segments.length; i++) {
+    const part = segments[i].trim();
+    if (!part) continue;
+    const eqIdx = part.indexOf('=');
+    if (eqIdx === -1) continue;
+    const key = part.slice(0, eqIdx).trim().toLowerCase();
+    if (key !== 'boundary') continue;
+    if (boundary !== null) {
+      return { ok: false, error: 'Duplicate multipart boundary parameter' };
+    }
+    let val = part.slice(eqIdx + 1).trim();
+    if (val.startsWith('"') && val.endsWith('"') && val.length >= 2) {
+      val = val.slice(1, -1);
+    }
+    if (!val || val.length > 70 || /[\r\n\0]/.test(val)) {
+      return { ok: false, error: 'Malformed multipart boundary parameter' };
+    }
+    boundary = val;
+  }
+  if (!boundary) {
+    return { ok: false, error: 'Missing multipart boundary parameter' };
+  }
+  return { ok: true, boundary };
+}
+
+function parseMultipartPartHeaders(rawHeadersStr) {
+  const lines = rawHeadersStr.split('\r\n');
+  const headers = {};
+  for (const line of lines) {
+    if (!line) return { ok: false, error: 'Empty header line in multipart part' };
+    const colonIdx = line.indexOf(':');
+    if (colonIdx <= 0) {
+      return { ok: false, error: 'Malformed header line in multipart part' };
+    }
+    const name = line.slice(0, colonIdx).trim().toLowerCase();
+    const value = line.slice(colonIdx + 1).trim();
+    if (!name || /[\r\n\0]/.test(value)) {
+      return { ok: false, error: 'Invalid characters in multipart header' };
+    }
+    if (Object.prototype.hasOwnProperty.call(headers, name)) {
+      return { ok: false, error: `Duplicate multipart part header: ${name}` };
+    }
+    headers[name] = value;
+  }
+
+  const disp = headers['content-disposition'];
+  if (!disp) {
+    return { ok: false, error: 'Multipart part missing Content-Disposition header' };
+  }
+  const dispParts = disp.split(';');
+  if (dispParts[0].trim().toLowerCase() !== 'form-data') {
+    return { ok: false, error: 'Multipart part Content-Disposition must be form-data' };
+  }
+
+  let fieldName = null;
+  let filename = null;
+  let hasFilenameParam = false;
+  for (let i = 1; i < dispParts.length; i++) {
+    const param = dispParts[i].trim();
+    if (!param) continue;
+    const eqIdx = param.indexOf('=');
+    if (eqIdx === -1) continue;
+    const pKey = param.slice(0, eqIdx).trim().toLowerCase();
+    let pVal = param.slice(eqIdx + 1).trim();
+    if (pVal.startsWith('"') && pVal.endsWith('"') && pVal.length >= 2) {
+      pVal = pVal.slice(1, -1).replace(/\\(.)/g, '$1');
+    }
+    if (pKey === 'name') {
+      fieldName = pVal;
+    } else if (pKey === 'filename') {
+      hasFilenameParam = true;
+      filename = pVal;
+    }
+  }
+
+  if (!fieldName) {
+    return { ok: false, error: 'Multipart part missing field name' };
+  }
+
+  const transferEnc = headers['content-transfer-encoding'];
+  if (transferEnc && !['binary', '8bit', '7bit'].includes(transferEnc.toLowerCase())) {
+    return { ok: false, error: `Unsupported Content-Transfer-Encoding: ${transferEnc}` };
+  }
+
+  return {
+    ok: true,
+    fieldName,
+    hasFilenameParam,
+    filename,
+    contentType: headers['content-type'] || null,
+  };
+}
+
+function sendMediaUploadError(res, statusCode, errorTitle, message, closeConn = false) {
+  if (res.writableEnded) return Promise.resolve();
+  const headers = {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Cache-Control': 'no-store',
+    'X-Content-Type-Options': 'nosniff',
+  };
+  if (closeConn) {
+    headers.Connection = 'close';
+  }
+  res.writeHead(statusCode, headers);
+  const payload = JSON.stringify({
+    error: errorTitle,
+    message: sanitizeErrorMessage(message),
+  });
+  return new Promise((resolve) => {
+    res.end(payload, resolve);
+  });
+}
+
+/**
+ * Bounded streaming upload parser supporting both multipart/form-data and raw image/* binary uploads.
+ * Streams incoming image bytes to an isolated temp file inside tmpDir, enforcing MAX_MEDIA_FILE_SIZE_BYTES
+ * before writing oversized bytes, and cleans up temp files deterministically on abort, parser error, or oversize.
+ */
+async function streamMediaUploadRequest(req, res, options = {}) {
+  const tmpDir =
+    typeof options.tmpDir === 'string' && options.tmpDir.trim()
+      ? options.tmpDir
+      : os.tmpdir();
+  const contentTypeHeader = req.headers['content-type'];
+  const rawMediaType =
+    typeof contentTypeHeader === 'string'
+      ? contentTypeHeader.split(';')[0].trim().toLowerCase()
+      : '';
+
+  const isMultipart = rawMediaType === 'multipart/form-data';
+  const isDirectBinary = ALLOWED_MEDIA_MIME_SET.has(rawMediaType);
+
+  if (!isMultipart && !isDirectBinary) {
+    req.resume();
+    sendMediaUploadError(
+      res,
+      415,
+      'Unsupported Media Type',
+      `Content-Type must be multipart/form-data or one of: ${ALLOWED_MEDIA_MIME_TYPES.join(', ')}`
+    );
+    return { ok: false };
+  }
+
+  let boundary = null;
+  if (isMultipart) {
+    const bRes = extractMultipartBoundary(contentTypeHeader);
+    if (!bRes.ok) {
+      req.resume();
+      sendMediaUploadError(res, 400, 'Bad Request', bRes.error);
+      return { ok: false };
+    }
+    boundary = bRes.boundary;
+  }
+
+  const maxTotalBytes = isMultipart ? MAX_MEDIA_MULTIPART_BODY : MAX_MEDIA_FILE_SIZE_BYTES;
+  const rawContentLength = req.headers['content-length'];
+  if (rawContentLength !== undefined) {
+    const clStr = Array.isArray(rawContentLength) ? rawContentLength[0] : String(rawContentLength);
+    if (!/^\d+$/.test(clStr.trim())) {
+      req.resume();
+      sendMediaUploadError(res, 400, 'Bad Request', 'Malformed Content-Length header');
+      return { ok: false };
+    }
+    const contentLength = Number.parseInt(clStr.trim(), 10);
+    if (!Number.isSafeInteger(contentLength) || contentLength <= 0) {
+      req.resume();
+      sendMediaUploadError(res, 400, 'Bad Request', 'Upload request body cannot be empty');
+      return { ok: false };
+    }
+    if (contentLength > maxTotalBytes) {
+      req.resume();
+      sendMediaUploadError(
+        res,
+        413,
+        'Payload Too Large',
+        `Upload request exceeds maximum allowed size (${formatBytes(maxTotalBytes)})`,
+        true
+      );
+      return { ok: false };
+    }
+  }
+
+  let tempFilePath = null;
+  let tempHandle = null;
+  const cleanupTemp = async () => {
+    if (tempHandle) {
+      const h = tempHandle;
+      tempHandle = null;
+      try {
+        await h.close();
+      } catch {}
+    }
+    if (tempFilePath) {
+      const p = tempFilePath;
+      tempFilePath = null;
+      try {
+        await fs.promises.unlink(p);
+      } catch {}
+    }
+  };
+
+  const openTempFile = async () => {
+    const candidate = path.join(tmpDir, `ainovex-media-upload-${crypto.randomUUID()}.tmp`);
+    tempHandle = await fs.promises.open(candidate, 'wx', 0o600);
+    tempFilePath = candidate;
+  };
+
+  try {
+    if (isDirectBinary) {
+      let totalBytes = 0;
+      await openTempFile();
+
+      for await (const chunk of req) {
+        const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+        totalBytes += buf.length;
+        if (totalBytes > MAX_MEDIA_FILE_SIZE_BYTES) {
+          req.pause();
+          await cleanupTemp();
+          await sendMediaUploadError(
+            res,
+            413,
+            'Payload Too Large',
+            `Uploaded file exceeds maximum allowed size (${formatBytes(MAX_MEDIA_FILE_SIZE_BYTES)})`,
+            true
+          );
+          if (!req.destroyed) req.destroy();
+          return { ok: false };
+        }
+        if (buf.length > 0) {
+          await tempHandle.write(buf);
+        }
+      }
+
+      if (totalBytes === 0) {
+        await cleanupTemp();
+        sendMediaUploadError(res, 400, 'Bad Request', 'Uploaded file cannot be empty');
+        return { ok: false };
+      }
+
+      await tempHandle.close();
+      tempHandle = null;
+
+      const fileBuffer = await fs.promises.readFile(tempFilePath);
+      const rawFilenameHeader = req.headers['x-media-filename'];
+      const rawAltHeader = req.headers['x-media-alt'];
+      const rawFilename =
+        typeof rawFilenameHeader === 'string' && rawFilenameHeader.trim()
+          ? rawFilenameHeader
+          : `upload.${MEDIA_MIME_TO_EXT[rawMediaType]}`;
+      const rawAlt = typeof rawAltHeader === 'string' ? rawAltHeader : undefined;
+
+      return {
+        ok: true,
+        fileBuffer,
+        declaredMimeType: rawMediaType,
+        rawOriginalFilename: rawFilename,
+        rawAlt,
+        cleanup: cleanupTemp,
+      };
+    }
+
+    // Streaming multipart/form-data parser
+    const initialBoundaryBuf = Buffer.from(`--${boundary}`, 'latin1');
+    const bodyDelimBuf = Buffer.from(`\r\n--${boundary}`, 'latin1');
+    const headerEndBuf = Buffer.from('\r\n\r\n', 'latin1');
+
+    let state = 'PREAMBLE';
+    let pending = Buffer.alloc(0);
+    let totalBytes = 0;
+    let fileBytes = 0;
+    let partCount = 0;
+    let currentPart = null; // 'file' | 'alt'
+    let sawFilePart = false;
+    let sawAltPart = false;
+    let sawClosingBoundary = false;
+    let declaredMimeType = null;
+    let rawOriginalFilename = null;
+    let hasFileNameParam = false;
+    const altChunks = [];
+    let altLen = 0;
+
+    const abortMultipart = async (statusCode, title, message, closeConn = false) => {
+      req.pause();
+      await cleanupTemp();
+      await sendMediaUploadError(res, statusCode, title, message, closeConn || true);
+      if (!req.destroyed) req.destroy();
+      return { ok: false };
+    };
+
+    for await (const chunk of req) {
+      const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      totalBytes += buf.length;
+      if (totalBytes > MAX_MEDIA_MULTIPART_BODY) {
+        return await abortMultipart(
+          413,
+          'Payload Too Large',
+          `Upload request exceeds maximum allowed size (${formatBytes(MAX_MEDIA_MULTIPART_BODY)})`,
+          true
+        );
+      }
+
+      if (state === 'EPILOGUE') {
+        continue;
+      }
+
+      pending = pending.length > 0 ? Buffer.concat([pending, buf]) : buf;
+
+      let progress = true;
+      while (progress) {
+        progress = false;
+
+        if (state === 'PREAMBLE') {
+          const bIdx = pending.indexOf(initialBoundaryBuf);
+          if (bIdx === -1) {
+            if (pending.length > MAX_MEDIA_PREAMBLE_BYTES) {
+              return await abortMultipart(400, 'Bad Request', 'Malformed multipart preamble');
+            }
+            break;
+          }
+          const afterStart = bIdx + initialBoundaryBuf.length;
+          if (pending.length < afterStart + 2) {
+            break;
+          }
+          const suffix = pending.subarray(afterStart, afterStart + 2).toString('latin1');
+          if (suffix === '\r\n') {
+            pending = pending.subarray(afterStart + 2);
+            state = 'HEADERS';
+            progress = true;
+          } else if (suffix === '--') {
+            return await abortMultipart(400, 'Bad Request', 'Empty multipart payload: missing media file');
+          } else {
+            return await abortMultipart(400, 'Bad Request', 'Malformed multipart initial boundary');
+          }
+        } else if (state === 'HEADERS') {
+          if (pending.length >= 2 && pending[0] === 0x0d && pending[1] === 0x0a) {
+            return await abortMultipart(400, 'Bad Request', 'Multipart part missing headers');
+          }
+          const hdrEnd = pending.indexOf(headerEndBuf);
+          if (hdrEnd === -1) {
+            if (pending.length > MAX_MEDIA_PART_HEADER_BYTES) {
+              return await abortMultipart(400, 'Bad Request', 'Multipart part headers exceed limit');
+            }
+            break;
+          }
+          if (hdrEnd > MAX_MEDIA_PART_HEADER_BYTES) {
+            return await abortMultipart(400, 'Bad Request', 'Multipart part headers exceed limit');
+          }
+          partCount++;
+          if (partCount > MAX_MEDIA_MULTIPART_PARTS) {
+            return await abortMultipart(400, 'Bad Request', 'Too many parts in multipart upload');
+          }
+
+          const rawHeaderStr = pending.subarray(0, hdrEnd).toString('utf8');
+          const parsedHeaders = parseMultipartPartHeaders(rawHeaderStr);
+          if (!parsedHeaders.ok) {
+            return await abortMultipart(400, 'Bad Request', parsedHeaders.error);
+          }
+
+          pending = pending.subarray(hdrEnd + 4);
+
+          if (parsedHeaders.fieldName === 'file') {
+            if (sawFilePart) {
+              return await abortMultipart(400, 'Bad Request', 'Multiple file parts are not supported');
+            }
+            sawFilePart = true;
+            const partMime = parsedHeaders.contentType
+              ? parsedHeaders.contentType.split(';')[0].trim().toLowerCase()
+              : '';
+            if (!partMime) {
+              return await abortMultipart(
+                400,
+                'Bad Request',
+                'Uploaded file part must specify a valid image Content-Type'
+              );
+            }
+            if (!ALLOWED_MEDIA_MIME_SET.has(partMime)) {
+              return await abortMultipart(
+                415,
+                'Unsupported Media Type',
+                `Unsupported media type "${partMime}". Allowed: ${ALLOWED_MEDIA_MIME_TYPES.join(', ')}`
+              );
+            }
+            declaredMimeType = partMime;
+            hasFileNameParam = parsedHeaders.hasFilenameParam;
+            rawOriginalFilename = parsedHeaders.filename;
+            await openTempFile();
+            currentPart = 'file';
+            state = 'PART_BODY';
+            progress = true;
+          } else if (parsedHeaders.fieldName === 'alt') {
+            if (sawAltPart) {
+              return await abortMultipart(400, 'Bad Request', 'Duplicate alt field in multipart upload');
+            }
+            if (parsedHeaders.hasFilenameParam) {
+              return await abortMultipart(400, 'Bad Request', 'alt field cannot be a file upload');
+            }
+            sawAltPart = true;
+            currentPart = 'alt';
+            state = 'PART_BODY';
+            progress = true;
+          } else {
+            return await abortMultipart(
+              400,
+              'Bad Request',
+              `Unsupported multipart form field: "${parsedHeaders.fieldName}"`
+            );
+          }
+        } else if (state === 'PART_BODY') {
+          const dIdx = pending.indexOf(bodyDelimBuf);
+          if (dIdx !== -1) {
+            const afterDelim = dIdx + bodyDelimBuf.length;
+            if (pending.length < afterDelim + 2) {
+              break;
+            }
+            const partSlice = pending.subarray(0, dIdx);
+            if (currentPart === 'file') {
+              if (fileBytes + partSlice.length > MAX_MEDIA_FILE_SIZE_BYTES) {
+                return await abortMultipart(
+                  413,
+                  'Payload Too Large',
+                  `Uploaded file exceeds maximum allowed size (${formatBytes(MAX_MEDIA_FILE_SIZE_BYTES)})`,
+                  true
+                );
+              }
+              if (partSlice.length > 0) {
+                await tempHandle.write(partSlice);
+                fileBytes += partSlice.length;
+              }
+              await tempHandle.close();
+              tempHandle = null;
+            } else if (currentPart === 'alt') {
+              if (altLen + partSlice.length > MAX_MEDIA_TEXT_FIELD_BYTES) {
+                return await abortMultipart(400, 'Bad Request', 'alt field exceeds maximum allowed length');
+              }
+              if (partSlice.length > 0) {
+                altChunks.push(Buffer.from(partSlice));
+                altLen += partSlice.length;
+              }
+            }
+
+            const suffix = pending.subarray(afterDelim, afterDelim + 2).toString('latin1');
+            if (suffix === '\r\n') {
+              pending = pending.subarray(afterDelim + 2);
+              currentPart = null;
+              state = 'HEADERS';
+              progress = true;
+            } else if (suffix === '--') {
+              pending = Buffer.alloc(0);
+              currentPart = null;
+              sawClosingBoundary = true;
+              state = 'EPILOGUE';
+            } else {
+              return await abortMultipart(400, 'Bad Request', 'Malformed multipart closing boundary');
+            }
+          } else {
+            const holdback = bodyDelimBuf.length + 2;
+            if (pending.length > holdback) {
+              const flushLen = pending.length - holdback;
+              const flushSlice = pending.subarray(0, flushLen);
+              if (currentPart === 'file') {
+                if (fileBytes + flushLen > MAX_MEDIA_FILE_SIZE_BYTES) {
+                  return await abortMultipart(
+                    413,
+                    'Payload Too Large',
+                    `Uploaded file exceeds maximum allowed size (${formatBytes(MAX_MEDIA_FILE_SIZE_BYTES)})`,
+                    true
+                  );
+                }
+                await tempHandle.write(flushSlice);
+                fileBytes += flushLen;
+              } else if (currentPart === 'alt') {
+                if (altLen + flushLen > MAX_MEDIA_TEXT_FIELD_BYTES) {
+                  return await abortMultipart(400, 'Bad Request', 'alt field exceeds maximum allowed length');
+                }
+                altChunks.push(Buffer.from(flushSlice));
+                altLen += flushLen;
+              }
+              pending = pending.subarray(flushLen);
+            }
+            break;
+          }
+        }
+      }
+    }
+
+    if (!sawClosingBoundary || state !== 'EPILOGUE') {
+      await cleanupTemp();
+      sendMediaUploadError(res, 400, 'Bad Request', 'Truncated or malformed multipart payload');
+      return { ok: false };
+    }
+    if (!sawFilePart || !tempFilePath) {
+      await cleanupTemp();
+      sendMediaUploadError(res, 400, 'Bad Request', 'Missing required "file" field in upload');
+      return { ok: false };
+    }
+    if (fileBytes === 0) {
+      await cleanupTemp();
+      sendMediaUploadError(res, 400, 'Bad Request', 'Uploaded file cannot be empty');
+      return { ok: false };
+    }
+
+    const fileBuffer = await fs.promises.readFile(tempFilePath);
+    const effectiveOriginalFilename = hasFileNameParam
+      ? rawOriginalFilename
+      : `upload.${MEDIA_MIME_TO_EXT[declaredMimeType]}`;
+    const rawAlt = sawAltPart ? Buffer.concat(altChunks).toString('utf8') : undefined;
+
+    return {
+      ok: true,
+      fileBuffer,
+      declaredMimeType,
+      rawOriginalFilename: effectiveOriginalFilename,
+      rawAlt,
+      cleanup: cleanupTemp,
+    };
+  } catch (err) {
+    await cleanupTemp();
+    if (!res.writableEnded) {
+      sendMediaUploadError(
+        res,
+        400,
+        'Bad Request',
+        err?.message === 'aborted' || err?.code === 'ECONNRESET'
+          ? 'Upload aborted before completion'
+          : 'Failed to read upload stream'
+      );
+    }
+    return { ok: false };
+  }
+}
+
+/**
+ * Safely collects all valid article slugs from content/articles/ and articles metadata
+ * for reference-safe deletion without permitting symlinks or path traversal.
+ */
+function collectArticleMarkdownSlugsForMediaCheck(projectRoot, articles = []) {
+  const slugs = new Set();
+  if (Array.isArray(articles)) {
+    for (const a of articles) {
+      if (a && typeof a.slug === 'string' && isValidArticleSlug(a.slug)) {
+        slugs.add(a.slug);
+      }
+    }
+  }
+
+  const rootResolved = path.resolve(projectRoot);
+  const canonicalRoot = fs.existsSync(rootResolved) ? fs.realpathSync(rootResolved) : rootResolved;
+  const contentDir = path.resolve(canonicalRoot, 'content');
+  const articlesDir = path.resolve(contentDir, 'articles');
+
+  let articlesDirStat = null;
+  try {
+    articlesDirStat = fs.lstatSync(articlesDir);
+  } catch (err) {
+    if (err && err.code === 'ENOENT') {
+      return Array.from(slugs);
+    }
+    throw err;
+  }
+
+  if (articlesDirStat.isSymbolicLink() || !articlesDirStat.isDirectory()) {
+    const err = new Error('Symlinks or non-directory paths are forbidden for content/articles');
+    err.code = 'FORBIDDEN_SYMLINK';
+    throw err;
+  }
+
+  const realArticlesDir = fs.realpathSync(articlesDir);
+  if (!isInsideAuthorizedDirectory(fs.realpathSync(contentDir), realArticlesDir)) {
+    const err = new Error('Articles directory escapes authorized content directory');
+    err.code = 'PATH_VALIDATION_FAILED';
+    throw err;
+  }
+
+  const entries = fs.readdirSync(realArticlesDir, { withFileTypes: true });
+  for (const entry of entries) {
+    if (!entry.name.endsWith('.md')) continue;
+    const fullEntry = path.join(realArticlesDir, entry.name);
+    const entryLstat = fs.lstatSync(fullEntry);
+    if (entryLstat.isSymbolicLink()) {
+      const err = new Error(`Symlinks are forbidden for article markdown (${entry.name})`);
+      err.code = 'FORBIDDEN_SYMLINK';
+      throw err;
+    }
+    const slug = entry.name.slice(0, -3);
+    if (isValidArticleSlug(slug)) {
+      slugs.add(slug);
+    }
+  }
+
+  return Array.from(slugs);
 }
 
 const server = http.createServer(async (req, res) => {
@@ -9935,6 +10850,1049 @@ const server = http.createServer(async (req, res) => {
       );
     }
 
+    // ------------------------------------------------------------------------
+    // 9. Media Library API & Public Media File Serving (Task 115-B)
+    // ------------------------------------------------------------------------
+
+    // 9a. GET /api/cms/media - List registered media library metadata
+    if (req.method === 'GET' && pathname === '/api/cms/media') {
+      const session = requireAuth(req, res);
+      if (!session) return;
+
+      for (const qKey of url.searchParams.keys()) {
+        return sendBadRequest(res, `Unsupported query parameter: "${qKey}"`);
+      }
+
+      try {
+        let lockedMedia = null;
+
+        await executeTransaction(
+          [{ type: 'readJson', fileName: 'media.json' }],
+          {
+            precondition: async (snapshotAccessor) => {
+              const mediaSnap = snapshotAccessor.get('media.json');
+              if (!mediaSnap || !mediaSnap.existed) {
+                const err = new Error('Media library store is missing or unavailable');
+                err.code = 'STORE_INTEGRITY_UNAVAILABLE';
+                throw err;
+              }
+              const mediaList = snapshotAccessor.getJson('media.json');
+              const valResult = validateMediaLibrary(mediaList, {
+                projectRoot: defaultStorageEngine.projectRoot,
+              });
+              if (!valResult.isValid) {
+                const err = new Error('Media library store failed schema validation');
+                err.code = 'STORE_INTEGRITY_UNAVAILABLE';
+                throw err;
+              }
+              lockedMedia = mediaList.map((item) => sanitizeMediaForResponse(item));
+            },
+          }
+        );
+
+        if (!Array.isArray(lockedMedia)) {
+          return sendInternalError(res, 'Media library store is unavailable');
+        }
+
+        res.writeHead(200, {
+          'Content-Type': 'application/json; charset=utf-8',
+          'Cache-Control': 'no-store',
+          'X-Content-Type-Options': 'nosniff',
+        });
+        return res.end(
+          JSON.stringify({
+            success: true,
+            media: lockedMedia,
+            total: lockedMedia.length,
+          })
+        );
+      } catch (err) {
+        console.error('[CMS Server] Failed to list media:', err?.code || 'STORE_READ_ERROR');
+        return sendInternalError(res, 'Media library store is unavailable');
+      }
+    }
+
+    // 9b. POST /api/cms/media - Secure bounded streaming media upload
+    if (req.method === 'POST' && rawRequestPath === '/api/cms/media') {
+      const session = requireAuth(req, res);
+      if (!session) {
+        req.resume();
+        return;
+      }
+
+      if (!requireCsrf(req, res, session)) {
+        req.resume();
+        return;
+      }
+
+      for (const qKey of url.searchParams.keys()) {
+        req.resume();
+        return sendBadRequest(res, `Unsupported query parameter: "${qKey}"`);
+      }
+
+      const uploadTmpDir =
+        process.env.AINOVEX_CMS_UPLOAD_TMP_DIR && process.argv.includes('--test')
+          ? process.env.AINOVEX_CMS_UPLOAD_TMP_DIR
+          : os.tmpdir();
+
+      const uploadResult = await streamMediaUploadRequest(req, res, { tmpDir: uploadTmpDir });
+      if (!uploadResult.ok) return;
+
+      const {
+        fileBuffer,
+        declaredMimeType,
+        rawOriginalFilename,
+        rawAlt,
+        cleanup,
+      } = uploadResult;
+
+      try {
+        // Verify media directory containment and reject symlinks before processing
+        try {
+          ensureSecureMediaDirectory(defaultStorageEngine.projectRoot, { createIfMissing: true });
+        } catch (dirErr) {
+          console.error('[CMS Server] Media storage directory check failed:', dirErr?.message || 'Unknown error');
+          return sendInternalError(res, 'Media storage directory failed integrity verification');
+        }
+
+        // Validate optional alt text
+        const altCheck = validateMediaAltText(rawAlt);
+        if (!altCheck.ok) {
+          return sendBadRequest(res, altCheck.error || 'Invalid media alt text');
+        }
+
+        // Sanitize original filename strictly as metadata only (never used for storage path)
+        const nameCheck = sanitizeMediaOriginalFilename(rawOriginalFilename, declaredMimeType);
+        if (!nameCheck.ok) {
+          return sendBadRequest(res, nameCheck.error || 'Invalid uploaded filename');
+        }
+
+        // Deep binary magic-byte, MIME-spoofing, active-content, and dimension inspection
+        const inspected = inspectImageBuffer(fileBuffer, { declaredMimeType });
+        if (!inspected.ok) {
+          return sendBadRequest(res, inspected.error || 'Uploaded image failed binary verification');
+        }
+
+        const ext = MEDIA_MIME_TO_EXT[inspected.mimeType];
+        if (!ext) {
+          return sendBadRequest(res, 'Unsupported verified image MIME type');
+        }
+
+        const { id, filename, url: publicUrl } = generateServerMediaIdentity(ext);
+        const nowIso = new Date().toISOString();
+        const candidateRecord = {
+          id,
+          filename,
+          originalName: nameCheck.originalName,
+          url: publicUrl,
+          mimeType: inspected.mimeType,
+          size: inspected.size,
+          width: inspected.width,
+          height: inspected.height,
+          checksum: inspected.checksum,
+          alt: altCheck.alt,
+          createdAt: nowIso,
+          updatedAt: nowIso,
+        };
+
+        const recordVal = validateMediaRecord(candidateRecord, { isCmsInput: false });
+        if (!recordVal.isValid) {
+          const detail = (recordVal.errors || []).map((e) => e.message).join('; ');
+          return sendBadRequest(res, detail || 'Media metadata validation failed');
+        }
+
+        // Re-verify safe storage path resolution for server-generated filename
+        try {
+          resolveSecureMediaPath(filename, defaultStorageEngine.projectRoot);
+        } catch (pathErr) {
+          console.error('[CMS Server] Media target path verification failed:', pathErr?.message || 'Path error');
+          return sendInternalError(res, 'Failed to resolve secure media storage location');
+        }
+
+        let savedRecord = null;
+        const testFailureIndex = getTestFailureIndex(req);
+
+        try {
+          await executeTransaction(
+            [
+              {
+                type: 'writeJson',
+                fileName: 'media.json',
+                data: (existingMedia) => {
+                  if (!Array.isArray(existingMedia)) {
+                    const err = new Error('Media library store is invalid');
+                    err.code = 'STORE_INTEGRITY_UNAVAILABLE';
+                    throw err;
+                  }
+                  const existingVal = validateMediaLibrary(existingMedia);
+                  if (!existingVal.isValid) {
+                    const err = new Error('Media library store failed schema validation');
+                    err.code = 'STORE_INTEGRITY_UNAVAILABLE';
+                    throw err;
+                  }
+                  if (existingMedia.length >= MAX_MEDIA_ITEMS) {
+                    const err = new Error(`Media library limit of ${MAX_MEDIA_ITEMS} items reached`);
+                    err.code = 'MEDIA_LIMIT_EXCEEDED';
+                    throw err;
+                  }
+                  if (
+                    existingMedia.some(
+                      (m) => m && (m.id === id || m.filename === filename || m.url === publicUrl)
+                    )
+                  ) {
+                    const err = new Error('Media identifier collision occurred; please retry');
+                    err.code = 'MEDIA_CONFLICT';
+                    throw err;
+                  }
+
+                  const nextMedia = [...existingMedia, candidateRecord];
+                  const nextVal = validateMediaLibrary(nextMedia);
+                  if (!nextVal.isValid) {
+                    const detail = (nextVal.errors || []).map((e) => e.message).join('; ');
+                    const err = new Error(detail || 'Media library validation failed');
+                    err.code = 'SCHEMA_VALIDATION_FAILED';
+                    throw err;
+                  }
+                  savedRecord = candidateRecord;
+                  return nextMedia;
+                },
+              },
+              {
+                type: 'writeMedia',
+                fileName: filename,
+                data: fileBuffer,
+              },
+            ],
+            {
+              ...(testFailureIndex >= 0 ? { _simulateMutationFailureAtIndex: testFailureIndex } : {}),
+              precondition: async (snapshotAccessor) => {
+                ensureSecureMediaDirectory(defaultStorageEngine.projectRoot, { createIfMissing: true });
+                const mediaSnap = snapshotAccessor.get('media.json');
+                if (!mediaSnap || !mediaSnap.existed) {
+                  const err = new Error('Media library store is missing or unavailable');
+                  err.code = 'STORE_INTEGRITY_UNAVAILABLE';
+                  throw err;
+                }
+                const existingMedia = snapshotAccessor.getJson('media.json');
+                const existingVal = validateMediaLibrary(existingMedia);
+                if (!existingVal.isValid) {
+                  const err = new Error('Media library store failed schema validation');
+                  err.code = 'STORE_INTEGRITY_UNAVAILABLE';
+                  throw err;
+                }
+                if (existingMedia.length >= MAX_MEDIA_ITEMS) {
+                  const err = new Error(`Media library limit of ${MAX_MEDIA_ITEMS} items reached`);
+                  err.code = 'MEDIA_LIMIT_EXCEEDED';
+                  throw err;
+                }
+                if (
+                  existingMedia.some(
+                    (m) => m && (m.id === id || m.filename === filename || m.url === publicUrl)
+                  )
+                ) {
+                  const err = new Error('Media identifier collision occurred; please retry');
+                  err.code = 'MEDIA_CONFLICT';
+                  throw err;
+                }
+              },
+            }
+          );
+        } catch (err) {
+          const code = err.code || err.originalError?.code;
+          const detailMessage = sanitizeErrorMessage(
+            err?.originalError?.message || err?.message || 'Failed to upload media'
+          );
+          if (code === 'MEDIA_CONFLICT') {
+            return sendConflict(res, detailMessage);
+          }
+          if (code === 'MEDIA_LIMIT_EXCEEDED' || code === 'SCHEMA_VALIDATION_FAILED') {
+            return sendBadRequest(res, detailMessage);
+          }
+          if (code === 'PAYLOAD_TOO_LARGE') {
+            return sendMediaUploadError(res, 413, 'Payload Too Large', detailMessage, true);
+          }
+          console.error('[CMS Server] Failed to commit uploaded media:', code || 'STORE_WRITE_ERROR');
+          return sendInternalError(res, 'Failed to store uploaded media');
+        }
+
+        if (!savedRecord) {
+          return sendInternalError(res, 'Failed to store uploaded media');
+        }
+
+        const sanitizedMedia = sanitizeMediaForResponse(savedRecord);
+        const etag = computeMediaETag(savedRecord);
+
+        res.writeHead(201, {
+          'Content-Type': 'application/json; charset=utf-8',
+          Location: `/api/cms/media/${id}`,
+          ETag: etag,
+          'Cache-Control': 'no-store',
+          'X-Content-Type-Options': 'nosniff',
+        });
+        return res.end(
+          JSON.stringify({
+            success: true,
+            media: sanitizedMedia,
+          })
+        );
+      } finally {
+        await cleanup();
+      }
+    }
+
+    // 9c. GET /api/cms/media/:id - Fetch single media metadata record with strong ETag
+    if (req.method === 'GET' && rawRequestPath.startsWith(MEDIA_ROUTE_PREFIX)) {
+      const session = requireAuth(req, res);
+      if (!session) return;
+
+      const pathResult = parseMediaIdPath({ rawRequestPath, url: req.url });
+      if (!pathResult.matched) {
+        return sendNotFound(res);
+      }
+      if (!pathResult.valid || pathResult.invalid || !pathResult.id) {
+        return sendBadRequest(res, pathResult.error || 'Malformed or forbidden media id');
+      }
+
+      for (const qKey of url.searchParams.keys()) {
+        return sendBadRequest(res, `Unsupported query parameter: "${qKey}"`);
+      }
+
+      const mediaId = pathResult.id;
+
+      try {
+        let targetRecord = null;
+
+        await executeTransaction(
+          [{ type: 'readJson', fileName: 'media.json' }],
+          {
+            precondition: async (snapshotAccessor) => {
+              const mediaSnap = snapshotAccessor.get('media.json');
+              if (!mediaSnap || !mediaSnap.existed) {
+                const err = new Error('Media library store is missing or unavailable');
+                err.code = 'STORE_INTEGRITY_UNAVAILABLE';
+                throw err;
+              }
+              const mediaList = snapshotAccessor.getJson('media.json');
+              const valResult = validateMediaLibrary(mediaList, {
+                projectRoot: defaultStorageEngine.projectRoot,
+              });
+              if (!valResult.isValid) {
+                const err = new Error('Media library store failed schema validation');
+                err.code = 'STORE_INTEGRITY_UNAVAILABLE';
+                throw err;
+              }
+              const found = mediaList.find((m) => m && m.id === mediaId);
+              if (!found) {
+                const err = new Error('Media asset not found');
+                err.code = 'MEDIA_NOT_FOUND';
+                throw err;
+              }
+              targetRecord = found;
+            },
+          }
+        );
+
+        if (!targetRecord) {
+          return sendNotFound(res, 'Media asset not found');
+        }
+
+        const sanitizedMedia = sanitizeMediaForResponse(targetRecord);
+        const etag = computeMediaETag(targetRecord);
+
+        res.writeHead(200, {
+          'Content-Type': 'application/json; charset=utf-8',
+          'Cache-Control': 'no-store',
+          'X-Content-Type-Options': 'nosniff',
+          ETag: etag,
+        });
+        return res.end(
+          JSON.stringify({
+            success: true,
+            media: sanitizedMedia,
+          })
+        );
+      } catch (err) {
+        const code = err.code || err.originalError?.code;
+        if (code === 'MEDIA_NOT_FOUND') {
+          return sendNotFound(res, 'Media asset not found');
+        }
+        console.error('[CMS Server] Failed to fetch media record:', code || 'STORE_READ_ERROR');
+        return sendInternalError(res, 'Media library store is unavailable');
+      }
+    }
+
+    // 9d. PATCH /api/cms/media/:id - Update editable media metadata (alt) with If-Match
+    if (req.method === 'PATCH' && rawRequestPath.startsWith(MEDIA_ROUTE_PREFIX)) {
+      const session = requireAuth(req, res);
+      if (!session) {
+        req.resume();
+        return;
+      }
+
+      if (!requireCsrf(req, res, session)) {
+        req.resume();
+        return;
+      }
+
+      const pathResult = parseMediaIdPath({ rawRequestPath, url: req.url });
+      if (!pathResult.matched) {
+        req.resume();
+        return sendNotFound(res);
+      }
+      if (!pathResult.valid || pathResult.invalid || !pathResult.id) {
+        req.resume();
+        return sendBadRequest(res, pathResult.error || 'Malformed or forbidden media id');
+      }
+
+      const mediaId = pathResult.id;
+
+      const contentType = req.headers['content-type'];
+      const mediaType =
+        typeof contentType === 'string' ? contentType.split(';')[0].trim().toLowerCase() : '';
+      if (mediaType !== 'application/json') {
+        req.resume();
+        res.writeHead(415, {
+          'Content-Type': 'application/json; charset=utf-8',
+          'Cache-Control': 'no-store',
+          'X-Content-Type-Options': 'nosniff',
+        });
+        return res.end(
+          JSON.stringify({
+            error: 'Unsupported Media Type',
+            message: 'Content-Type must be application/json',
+          })
+        );
+      }
+
+      const bodyResult = await parseJsonBody(req, res, MAX_METADATA_BODY);
+      if (!bodyResult.ok) return;
+
+      const body = bodyResult.data;
+
+      const ifMatch = parseIfMatch(req);
+      if (ifMatch.status === 'missing') {
+        return sendPreconditionRequired(res, ifMatch.error || 'If-Match header is required');
+      }
+      if (ifMatch.status === 'invalid') {
+        return sendBadRequest(res, ifMatch.error || 'Invalid If-Match header');
+      }
+
+      const protoKey = findPrototypePollutionKey(body);
+      if (protoKey) {
+        return sendBadRequest(res, `Forbidden prototype pollution key: "${protoKey}"`);
+      }
+
+      if (!isPlainJsonObject(body)) {
+        return sendBadRequest(res, 'Request body must be a JSON object');
+      }
+
+      const topKeys = Object.getOwnPropertyNames(body);
+      if (topKeys.length === 0) {
+        return sendBadRequest(res, 'At least one editable media field (alt) is required');
+      }
+
+      let rawUpdate = null;
+      if (Object.prototype.hasOwnProperty.call(body, 'media')) {
+        for (const k of topKeys) {
+          if (k !== 'media') {
+            return sendBadRequest(res, `Unknown or forbidden field in request body: "${k}"`);
+          }
+        }
+        if (!isPlainJsonObject(body.media)) {
+          return sendBadRequest(res, '"media" must be a JSON object');
+        }
+        rawUpdate = body.media;
+      } else {
+        rawUpdate = body;
+      }
+
+      const suppliedKeys = Object.getOwnPropertyNames(rawUpdate);
+      if (suppliedKeys.length === 0) {
+        return sendBadRequest(res, 'At least one editable media field (alt) is required');
+      }
+
+      for (const key of suppliedKeys) {
+        if (PROTO_POLLUTION_KEYS.has(key)) {
+          return sendBadRequest(res, `Forbidden prototype pollution key: "${key}"`);
+        }
+        if (key !== 'alt') {
+          if (ALLOWED_MEDIA_FIELD_SET.has(key)) {
+            return sendBadRequest(
+              res,
+              `Field "${key}" is server-owned and immutable; only "alt" may be modified`
+            );
+          }
+          return sendBadRequest(res, `Unknown media field: "${key}"`);
+        }
+      }
+
+      if (rawUpdate.alt === undefined) {
+        return sendBadRequest(res, 'At least one editable media field (alt) is required');
+      }
+
+      const altCheck = validateMediaAltText(rawUpdate.alt);
+      if (!altCheck.ok) {
+        return sendBadRequest(res, altCheck.error || 'Invalid alt text');
+      }
+
+      let savedMedia = null;
+      const testFailureIndex = getTestFailureIndex(req);
+
+      try {
+        await executeTransaction(
+          [
+            {
+              type: 'writeJson',
+              fileName: 'media.json',
+              data: (existingMedia) => {
+                if (!Array.isArray(existingMedia)) {
+                  const err = new Error('Media library store is invalid');
+                  err.code = 'STORE_INTEGRITY_UNAVAILABLE';
+                  throw err;
+                }
+                const existingVal = validateMediaLibrary(existingMedia);
+                if (!existingVal.isValid) {
+                  const err = new Error('Media library store failed schema validation');
+                  err.code = 'STORE_INTEGRITY_UNAVAILABLE';
+                  throw err;
+                }
+
+                const targetIndex = existingMedia.findIndex((m) => m && m.id === mediaId);
+                if (targetIndex === -1) {
+                  const err = new Error('Media asset not found');
+                  err.code = 'MEDIA_NOT_FOUND';
+                  throw err;
+                }
+
+                const existingRecord = existingMedia[targetIndex];
+                const currentETag = computeMediaETag(existingRecord);
+                if (currentETag !== ifMatch.etag) {
+                  const err = new Error('If-Match ETag precondition failed');
+                  err.code = 'PRECONDITION_FAILED';
+                  throw err;
+                }
+
+                const updatedRecord = buildUpdatedMediaRecord(
+                  existingRecord,
+                  { alt: altCheck.alt },
+                  new Date().toISOString()
+                );
+
+                const singleVal = validateMediaRecord(updatedRecord, { isCmsInput: false });
+                if (!singleVal.isValid) {
+                  const detail = (singleVal.errors || []).map((e) => e.message).join('; ');
+                  const err = new Error(detail || 'Media record validation failed');
+                  err.code = 'SCHEMA_VALIDATION_FAILED';
+                  throw err;
+                }
+
+                const nextMedia = [...existingMedia];
+                nextMedia[targetIndex] = updatedRecord;
+                const nextVal = validateMediaLibrary(nextMedia);
+                if (!nextVal.isValid) {
+                  const detail = (nextVal.errors || []).map((e) => e.message).join('; ');
+                  const err = new Error(detail || 'Media library validation failed');
+                  err.code = 'SCHEMA_VALIDATION_FAILED';
+                  throw err;
+                }
+
+                savedMedia = updatedRecord;
+                return nextMedia;
+              },
+            },
+          ],
+          {
+            ...(testFailureIndex >= 0 ? { _simulateMutationFailureAtIndex: testFailureIndex } : {}),
+            precondition: async (snapshotAccessor) => {
+              const mediaSnap = snapshotAccessor.get('media.json');
+              if (!mediaSnap || !mediaSnap.existed) {
+                const err = new Error('Media library store is missing or unavailable');
+                err.code = 'STORE_INTEGRITY_UNAVAILABLE';
+                throw err;
+              }
+              const existingMedia = snapshotAccessor.getJson('media.json');
+              const existingVal = validateMediaLibrary(existingMedia);
+              if (!existingVal.isValid) {
+                const err = new Error('Media library store failed schema validation');
+                err.code = 'STORE_INTEGRITY_UNAVAILABLE';
+                throw err;
+              }
+              const targetIndex = existingMedia.findIndex((m) => m && m.id === mediaId);
+              if (targetIndex === -1) {
+                const err = new Error('Media asset not found');
+                err.code = 'MEDIA_NOT_FOUND';
+                throw err;
+              }
+              const currentETag = computeMediaETag(existingMedia[targetIndex]);
+              if (currentETag !== ifMatch.etag) {
+                const err = new Error('If-Match ETag precondition failed');
+                err.code = 'PRECONDITION_FAILED';
+                throw err;
+              }
+            },
+          }
+        );
+      } catch (err) {
+        const code = err.code || err.originalError?.code;
+        const detailMessage = sanitizeErrorMessage(
+          err?.originalError?.message || err?.message || 'Media update failed'
+        );
+        if (code === 'MEDIA_NOT_FOUND') {
+          return sendNotFound(res, 'Media asset not found');
+        }
+        if (code === 'PRECONDITION_FAILED') {
+          return sendPreconditionFailed(res, 'Precondition failed: ETag mismatch');
+        }
+        if (code === 'SCHEMA_VALIDATION_FAILED') {
+          return sendBadRequest(res, detailMessage);
+        }
+        console.error('[CMS Server] Failed to update media metadata:', code || 'STORE_WRITE_ERROR');
+        return sendInternalError(res, 'Failed to update media metadata');
+      }
+
+      if (!savedMedia) {
+        return sendInternalError(res, 'Failed to update media metadata');
+      }
+
+      const sanitizedMedia = sanitizeMediaForResponse(savedMedia);
+      const newETag = computeMediaETag(savedMedia);
+
+      res.writeHead(200, {
+        'Content-Type': 'application/json; charset=utf-8',
+        'Cache-Control': 'no-store',
+        'X-Content-Type-Options': 'nosniff',
+        ETag: newETag,
+      });
+      return res.end(
+        JSON.stringify({
+          success: true,
+          media: sanitizedMedia,
+        })
+      );
+    }
+
+    // 9e. DELETE /api/cms/media/:id - Reference-safe atomic media deletion with rollback
+    if (req.method === 'DELETE' && rawRequestPath.startsWith(MEDIA_ROUTE_PREFIX)) {
+      const session = requireAuth(req, res);
+      if (!session) {
+        req.resume();
+        return;
+      }
+
+      if (!requireCsrf(req, res, session)) {
+        req.resume();
+        return;
+      }
+
+      const pathResult = parseMediaIdPath({ rawRequestPath, url: req.url });
+      if (!pathResult.matched) {
+        req.resume();
+        return sendNotFound(res);
+      }
+      if (!pathResult.valid || pathResult.invalid || !pathResult.id) {
+        req.resume();
+        return sendBadRequest(res, pathResult.error || 'Malformed or forbidden media id');
+      }
+
+      const mediaId = pathResult.id;
+
+      const bodyCheck = await readDeleteBody(req, res, MAX_AUTH_BODY);
+      if (!bodyCheck.ok) return;
+
+      const ifMatch = parseIfMatch(req);
+      if (ifMatch.status === 'missing') {
+        return sendPreconditionRequired(res, ifMatch.error || 'If-Match header is required');
+      }
+      if (ifMatch.status === 'invalid') {
+        return sendBadRequest(res, ifMatch.error || 'Invalid If-Match header');
+      }
+
+      // Phase 1: Discover media filename & article slugs under short locked snapshot
+      let discoveredFilename = null;
+      let discoveredSlugs = [];
+      try {
+        await executeTransaction(
+          [
+            { type: 'readJson', fileName: 'media.json' },
+            { type: 'readJson', fileName: 'articles.json' },
+          ],
+          {
+            precondition: async (snapshotAccessor) => {
+              const mediaSnap = snapshotAccessor.get('media.json');
+              if (!mediaSnap || !mediaSnap.existed) {
+                const err = new Error('Media library store is missing or unavailable');
+                err.code = 'STORE_INTEGRITY_UNAVAILABLE';
+                throw err;
+              }
+              const mediaList = snapshotAccessor.getJson('media.json');
+              const mediaVal = validateMediaLibrary(mediaList, {
+                projectRoot: defaultStorageEngine.projectRoot,
+              });
+              if (!mediaVal.isValid) {
+                const err = new Error('Media library store failed schema validation');
+                err.code = 'STORE_INTEGRITY_UNAVAILABLE';
+                throw err;
+              }
+              const found = mediaList.find((m) => m && m.id === mediaId);
+              if (!found) {
+                const err = new Error('Media asset not found');
+                err.code = 'MEDIA_NOT_FOUND';
+                throw err;
+              }
+              const currentETag = computeMediaETag(found);
+              if (currentETag !== ifMatch.etag) {
+                const err = new Error('If-Match ETag precondition failed');
+                err.code = 'PRECONDITION_FAILED';
+                throw err;
+              }
+              discoveredFilename = found.filename;
+
+              const articlesSnap = snapshotAccessor.get('articles.json');
+              const articlesList =
+                articlesSnap && articlesSnap.existed ? snapshotAccessor.getJson('articles.json') : [];
+              discoveredSlugs = collectArticleMarkdownSlugsForMediaCheck(
+                defaultStorageEngine.projectRoot,
+                Array.isArray(articlesList) ? articlesList : []
+              );
+            },
+          }
+        );
+      } catch (err) {
+        const code = err.code || err.originalError?.code;
+        if (code === 'MEDIA_NOT_FOUND') {
+          return sendNotFound(res, 'Media asset not found');
+        }
+        if (code === 'PRECONDITION_FAILED') {
+          return sendPreconditionFailed(res, 'Precondition failed: ETag mismatch');
+        }
+        console.error('[CMS Server] Failed to inspect media for deletion:', code || 'STORE_READ_ERROR');
+        return sendInternalError(res, 'Failed to inspect media asset for deletion');
+      }
+
+      if (!discoveredFilename || !isValidMediaFilename(discoveredFilename)) {
+        return sendInternalError(res, 'Media record has an invalid storage filename');
+      }
+
+      // Phase 2: Atomic locked inspection across all stores + Markdown bodies + delete
+      const testFailureIndex = getTestFailureIndex(req);
+      const txOps = [
+        {
+          type: 'writeJson',
+          fileName: 'media.json',
+          data: (existingMedia) => {
+            if (!Array.isArray(existingMedia)) {
+              const err = new Error('Media library store is invalid');
+              err.code = 'STORE_INTEGRITY_UNAVAILABLE';
+              throw err;
+            }
+            const existingVal = validateMediaLibrary(existingMedia);
+            if (!existingVal.isValid) {
+              const err = new Error('Media library store failed schema validation');
+              err.code = 'STORE_INTEGRITY_UNAVAILABLE';
+              throw err;
+            }
+            const targetIndex = existingMedia.findIndex((m) => m && m.id === mediaId);
+            if (targetIndex === -1) {
+              const err = new Error('Media asset not found');
+              err.code = 'MEDIA_NOT_FOUND';
+              throw err;
+            }
+            const existingRecord = existingMedia[targetIndex];
+            if (existingRecord.filename !== discoveredFilename) {
+              const err = new Error('Media record changed concurrently; please retry');
+              err.code = 'MEDIA_CONFLICT';
+              throw err;
+            }
+            const currentETag = computeMediaETag(existingRecord);
+            if (currentETag !== ifMatch.etag) {
+              const err = new Error('If-Match ETag precondition failed');
+              err.code = 'PRECONDITION_FAILED';
+              throw err;
+            }
+            const nextMedia = existingMedia.filter((_, idx) => idx !== targetIndex);
+            const nextVal = validateMediaLibrary(nextMedia);
+            if (!nextVal.isValid) {
+              const detail = (nextVal.errors || []).map((e) => e.message).join('; ');
+              const err = new Error(detail || 'Media library validation failed');
+              err.code = 'STORE_INTEGRITY_UNAVAILABLE';
+              throw err;
+            }
+            return nextMedia;
+          },
+        },
+        {
+          type: 'deleteMedia',
+          fileName: discoveredFilename,
+        },
+        { type: 'readJson', fileName: 'articles.json' },
+        { type: 'readJson', fileName: 'categories.json' },
+        { type: 'readJson', fileName: 'tools.json' },
+        { type: 'readJson', fileName: 'seo.json' },
+        { type: 'readJson', fileName: 'settings.json' },
+        { type: 'readJson', fileName: 'ads.json' },
+      ];
+
+      // Include pages.json when present (readJson('pages.json') fails closed if file is absent)
+      try {
+        const pagesPath = resolveSecureJsonPath('pages.json', defaultStorageEngine.projectRoot);
+        if (fs.existsSync(pagesPath)) {
+          txOps.push({ type: 'readJson', fileName: 'pages.json' });
+        }
+      } catch (err) {
+        console.error('[CMS Server] Failed to inspect pages.json path:', err?.message || 'Path error');
+        return sendInternalError(res, 'Failed to verify content references before media deletion');
+      }
+
+      const maxMarkdownOps = Math.max(0, MAX_TRANSACTION_OPERATIONS - txOps.length);
+      const lockedSlugs = discoveredSlugs.slice(0, maxMarkdownOps);
+      const overflowSlugs = discoveredSlugs.slice(maxMarkdownOps);
+      for (const slug of lockedSlugs) {
+        txOps.push({ type: 'readMarkdown', slug });
+      }
+
+      try {
+        await executeTransaction(txOps, {
+          ...(testFailureIndex >= 0 ? { _simulateMutationFailureAtIndex: testFailureIndex } : {}),
+          precondition: async (snapshotAccessor) => {
+            const mediaSnap = snapshotAccessor.get('media.json');
+            if (!mediaSnap || !mediaSnap.existed) {
+              const err = new Error('Media library store is missing or unavailable');
+              err.code = 'STORE_INTEGRITY_UNAVAILABLE';
+              throw err;
+            }
+            const existingMedia = snapshotAccessor.getJson('media.json');
+            const existingVal = validateMediaLibrary(existingMedia);
+            if (!existingVal.isValid) {
+              const err = new Error('Media library store failed schema validation');
+              err.code = 'STORE_INTEGRITY_UNAVAILABLE';
+              throw err;
+            }
+
+            const targetRecord = existingMedia.find((m) => m && m.id === mediaId);
+            if (!targetRecord) {
+              const err = new Error('Media asset not found');
+              err.code = 'MEDIA_NOT_FOUND';
+              throw err;
+            }
+            if (targetRecord.filename !== discoveredFilename) {
+              const err = new Error('Media record changed concurrently; please retry');
+              err.code = 'MEDIA_CONFLICT';
+              throw err;
+            }
+            const currentETag = computeMediaETag(targetRecord);
+            if (currentETag !== ifMatch.etag) {
+              const err = new Error('If-Match ETag precondition failed');
+              err.code = 'PRECONDITION_FAILED';
+              throw err;
+            }
+
+            const safeGetJson = (fileName) => {
+              const snap = snapshotAccessor.get(fileName);
+              if (!snap || !snap.existed) return null;
+              return snapshotAccessor.getJson(fileName);
+            };
+
+            const articles = safeGetJson('articles.json');
+            const categories = safeGetJson('categories.json');
+            const tools = safeGetJson('tools.json');
+            const pages = safeGetJson('pages.json');
+            const seo = safeGetJson('seo.json');
+            const settings = safeGetJson('settings.json');
+            const ads = safeGetJson('ads.json');
+
+            const articleMarkdowns = new Map();
+            for (const slug of lockedSlugs) {
+              const mdText = snapshotAccessor.getText(slug);
+              if (typeof mdText === 'string') {
+                articleMarkdowns.set(slug, mdText);
+              }
+            }
+            for (const slug of overflowSlugs) {
+              try {
+                const mdText = await defaultStorageEngine.readArticleMarkdown(slug);
+                if (typeof mdText === 'string') {
+                  articleMarkdowns.set(slug, mdText);
+                }
+              } catch {}
+            }
+
+            const references = findMediaReferencesInContent(targetRecord, {
+              articles: Array.isArray(articles) ? articles : [],
+              articleMarkdowns,
+              categories: Array.isArray(categories) ? categories : [],
+              tools: Array.isArray(tools) ? tools : [],
+              pages: Array.isArray(pages) ? pages : [],
+              seo: isPlainJsonObject(seo) ? seo : null,
+              settings: isPlainJsonObject(settings) ? settings : null,
+              ads: isPlainJsonObject(ads) ? ads : null,
+            });
+
+            if (references.length > 0) {
+              const err = new Error(
+                'Media asset cannot be deleted because it is currently referenced by site content'
+              );
+              err.code = 'MEDIA_IN_USE';
+              err.references = references;
+              throw err;
+            }
+          },
+        });
+      } catch (err) {
+        const code = err.code || err.originalError?.code;
+        if (code === 'MEDIA_NOT_FOUND') {
+          return sendNotFound(res, 'Media asset not found');
+        }
+        if (code === 'PRECONDITION_FAILED') {
+          return sendPreconditionFailed(res, 'Precondition failed: ETag mismatch');
+        }
+        if (code === 'MEDIA_CONFLICT') {
+          return sendConflict(res, 'Media asset changed concurrently; please retry');
+        }
+        if (code === 'MEDIA_IN_USE') {
+          const references = Array.isArray(err?.originalError?.references)
+            ? err.originalError.references
+            : [];
+          res.writeHead(409, {
+            'Content-Type': 'application/json; charset=utf-8',
+            'Cache-Control': 'no-store',
+            'X-Content-Type-Options': 'nosniff',
+          });
+          return res.end(
+            JSON.stringify({
+              error: 'Conflict',
+              message:
+                'Media asset cannot be deleted because it is currently referenced by site content.',
+              references,
+            })
+          );
+        }
+        console.error('[CMS Server] Failed to delete media asset:', code || 'STORE_WRITE_ERROR');
+        return sendInternalError(res, 'Failed to delete media asset');
+      }
+
+      res.writeHead(200, {
+        'Content-Type': 'application/json; charset=utf-8',
+        'Cache-Control': 'no-store',
+        'X-Content-Type-Options': 'nosniff',
+      });
+      return res.end(
+        JSON.stringify({
+          success: true,
+          deleted: true,
+          id: mediaId,
+          message: 'Media asset deleted successfully.',
+        })
+      );
+    }
+
+    // 9f. GET/HEAD /images/media/:filename - Strict metadata-verified media serving on CMS origin
+    // Note: Vite serves /images/media/* from public/ on port 3000 in dev (without proxying it),
+    // and Netlify serves static assets from dist/images/media/* in production.
+    // This CMS-origin handler prevents arbitrary file reads and enforces validated Content-Type & nosniff.
+    if (rawRequestPath.startsWith(MEDIA_PUBLIC_PREFIX)) {
+      if (req.method !== 'GET' && req.method !== 'HEAD') {
+        res.writeHead(405, {
+          'Content-Type': 'application/json; charset=utf-8',
+          Allow: 'GET, HEAD',
+          'Cache-Control': 'no-store',
+          'X-Content-Type-Options': 'nosniff',
+        });
+        return res.end(
+          JSON.stringify({
+            error: 'Method Not Allowed',
+            message: 'GET or HEAD method required',
+          })
+        );
+      }
+
+      const pathResult = parsePublicMediaFilenamePath({ rawRequestPath, url: req.url });
+      if (!pathResult.matched) {
+        return sendNotFound(res);
+      }
+      if (!pathResult.valid || pathResult.invalid || !pathResult.filename) {
+        return sendBadRequest(res, pathResult.error || 'Malformed or forbidden media filename');
+      }
+
+      const filename = pathResult.filename;
+
+      try {
+        ensureSecureMediaDirectory(defaultStorageEngine.projectRoot, { createIfMissing: false });
+        const resolvedFilePath = resolveSecureMediaPath(filename, defaultStorageEngine.projectRoot);
+
+        let matchedRecord = null;
+        await executeTransaction(
+          [{ type: 'readJson', fileName: 'media.json' }],
+          {
+            precondition: async (snapshotAccessor) => {
+              const mediaSnap = snapshotAccessor.get('media.json');
+              if (!mediaSnap || !mediaSnap.existed) {
+                const err = new Error('Media library store is unavailable');
+                err.code = 'STORE_INTEGRITY_UNAVAILABLE';
+                throw err;
+              }
+              const mediaList = snapshotAccessor.getJson('media.json');
+              const val = validateMediaLibrary(mediaList, {
+                projectRoot: defaultStorageEngine.projectRoot,
+              });
+              if (!val.isValid) {
+                const err = new Error('Media library store failed schema validation');
+                err.code = 'STORE_INTEGRITY_UNAVAILABLE';
+                throw err;
+              }
+              const found = mediaList.find((m) => m && m.filename === filename);
+              if (!found) {
+                const err = new Error('Media asset not found');
+                err.code = 'MEDIA_NOT_FOUND';
+                throw err;
+              }
+              matchedRecord = found;
+            },
+          }
+        );
+
+        if (!matchedRecord || !ALLOWED_MEDIA_MIME_SET.has(matchedRecord.mimeType)) {
+          return sendNotFound(res, 'Media asset not found');
+        }
+
+        let fileLstat = null;
+        try {
+          fileLstat = await fs.promises.lstat(resolvedFilePath);
+        } catch (statErr) {
+          if (statErr && statErr.code === 'ENOENT') {
+            return sendNotFound(res, 'Media asset file not found');
+          }
+          throw statErr;
+        }
+
+        if (fileLstat.isSymbolicLink() || !fileLstat.isFile()) {
+          return sendForbidden(res, 'Access denied: non-regular or symlinked media file');
+        }
+
+        const fileBytes = await fs.promises.readFile(resolvedFilePath);
+        res.writeHead(200, {
+          'Content-Type': matchedRecord.mimeType,
+          'Content-Length': fileBytes.length,
+          'Cache-Control': 'public, max-age=2592000, stale-while-revalidate=86400',
+          'X-Content-Type-Options': 'nosniff',
+        });
+        return res.end(req.method === 'HEAD' ? undefined : fileBytes);
+      } catch (err) {
+        const code = err.code || err.originalError?.code;
+        if (code === 'MEDIA_NOT_FOUND') {
+          return sendNotFound(res, 'Media asset not found');
+        }
+        const msgLower = String(err?.message || '').toLowerCase();
+        if (msgLower.includes('symlink') || msgLower.includes('escapes')) {
+          return sendForbidden(res, 'Access denied: media path integrity check failed');
+        }
+        if (msgLower.includes('does not exist')) {
+          return sendNotFound(res, 'Media asset not found');
+        }
+        console.error('[CMS Server] Failed to serve media asset:', code || 'MEDIA_SERVE_ERROR');
+        return sendInternalError(res, 'Failed to serve media asset');
+      }
+    }
+
     // Return 404 for all other routes
     return sendNotFound(res);
   } catch (err) {
@@ -9972,6 +11930,16 @@ const startupOtp = generateOtp();
 
 // Explicitly bind to 127.0.0.1:3001 only (never 0.0.0.0 or unspecified)
 if (!server.listening && process.env.NODE_ENV !== 'test-no-listen' && !process.argv.includes('--test')) {
+  try {
+    ensureSecureMediaDirectory(defaultStorageEngine.projectRoot, { createIfMissing: true });
+  } catch (mediaDirErr) {
+    console.error(
+      '[CMS Server] Startup aborted: Media storage directory integrity verification failed:',
+      sanitizeErrorMessage(mediaDirErr?.message || 'Invalid media directory')
+    );
+    process.exit(1);
+  }
+
   server.listen(PORT, HOST, () => {
     console.log(`[CMS Server] AINOVEX local CMS running at http://${HOST}:${PORT}`);
     console.log(`[CMS Server] Bound exclusively to ${HOST}:${PORT} (loopback only)`);
@@ -27502,6 +29470,18 @@ export {
   computeCustomPageEtag,
   buildCreatedCustomPage,
   buildUpdatedCustomPage,
+  MEDIA_ROUTE_PREFIX,
+  MEDIA_PUBLIC_PREFIX,
+  MAX_MEDIA_MULTIPART_OVERHEAD,
+  MAX_MEDIA_MULTIPART_BODY,
+  parseMediaIdPath,
+  parsePublicMediaFilenamePath,
+  sanitizeMediaForResponse,
+  computeMediaETag,
+  computeMediaEtag,
+  generateServerMediaIdentity,
+  buildUpdatedMediaRecord,
+  extractMultipartBoundary,
   getTestFailureIndex,
   startServerForTesting,
   runTask95Tests,

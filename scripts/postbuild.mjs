@@ -89,6 +89,161 @@ function inferImageMimeType(urlStr) {
   return '';
 }
 
+/**
+ * Safely reads width/height of a local JPEG/PNG/WebP/GIF image inside <projectRoot>/public.
+ * Rejects symlinks, directory escapes, non-regular files, and corrupted/truncated headers.
+ */
+export function readSafeImageSize(imgPath, projectRoot = process.cwd()) {
+  if (!imgPath || typeof imgPath !== 'string' || /^https?:/i.test(imgPath)) return null;
+  if (!isSafeAssetOrUrl(imgPath) || !imgPath.startsWith('/')) return null;
+  const cleanAssetPath = imgPath.split(/[?#]/)[0];
+  if (!cleanAssetPath || cleanAssetPath.includes('\0') || cleanAssetPath.includes('\\')) return null;
+
+  try {
+    const publicDir = path.resolve(projectRoot, 'public');
+    let publicLstat;
+    try {
+      publicLstat = fs.lstatSync(publicDir);
+    } catch {
+      return null;
+    }
+    if (publicLstat.isSymbolicLink() || !publicLstat.isDirectory()) {
+      return null;
+    }
+    const canonicalPublicDir = fs.realpathSync(publicDir);
+
+    const relSegments = cleanAssetPath.slice(1).split('/').filter(Boolean);
+    if (relSegments.length === 0) return null;
+
+    let currentPath = canonicalPublicDir;
+    for (let i = 0; i < relSegments.length; i++) {
+      const seg = relSegments[i];
+      if (seg === '.' || seg === '..') return null;
+      currentPath = path.resolve(currentPath, seg);
+      if (!isInsideAuthorizedDirectory(canonicalPublicDir, currentPath)) {
+        return null;
+      }
+      const st = fs.lstatSync(currentPath);
+      if (st.isSymbolicLink()) {
+        return null;
+      }
+      if (i < relSegments.length - 1) {
+        if (!st.isDirectory()) return null;
+      } else {
+        if (!st.isFile()) return null;
+      }
+    }
+
+    const realCandidate = fs.realpathSync(currentPath);
+    if (!isInsideAuthorizedDirectory(canonicalPublicDir, realCandidate)) {
+      return null;
+    }
+
+    const fileStat = fs.statSync(realCandidate);
+    if (!fileStat.isFile() || fileStat.size <= 0 || fileStat.size > 20 * 1024 * 1024) {
+      return null;
+    }
+
+    const buf = fs.readFileSync(realCandidate);
+    let size = null;
+
+    // WebP (RIFF....WEBP)
+    if (
+      buf.length >= 25 &&
+      buf.toString('ascii', 0, 4) === 'RIFF' &&
+      buf.toString('ascii', 8, 12) === 'WEBP'
+    ) {
+      const kind = buf.toString('ascii', 12, 16);
+      if (kind === 'VP8X' && buf.length >= 30) {
+        size = { width: 1 + buf.readUIntLE(24, 3), height: 1 + buf.readUIntLE(27, 3) };
+      } else if (
+        kind === 'VP8 ' &&
+        buf.length >= 30 &&
+        buf[23] === 0x9d &&
+        buf[24] === 0x01 &&
+        buf[25] === 0x2a
+      ) {
+        size = { width: buf.readUInt16LE(26) & 0x3fff, height: buf.readUInt16LE(28) & 0x3fff };
+      } else if (kind === 'VP8L' && buf.length >= 25 && buf[20] === 0x2f) {
+        const b = buf.readUInt32LE(21);
+        size = { width: (b & 0x3fff) + 1, height: ((b >> 14) & 0x3fff) + 1 };
+      }
+    } else if (
+      // PNG
+      buf.length >= 24 &&
+      buf[0] === 0x89 &&
+      buf[1] === 0x50 &&
+      buf[2] === 0x4e &&
+      buf[3] === 0x47 &&
+      buf[4] === 0x0d &&
+      buf[5] === 0x0a &&
+      buf[6] === 0x1a &&
+      buf[7] === 0x0a &&
+      buf.toString('ascii', 12, 16) === 'IHDR'
+    ) {
+      size = { width: buf.readUInt32BE(16), height: buf.readUInt32BE(20) };
+    } else if (
+      // GIF87a / GIF89a
+      buf.length >= 10 &&
+      (buf.toString('ascii', 0, 6) === 'GIF87a' || buf.toString('ascii', 0, 6) === 'GIF89a')
+    ) {
+      size = { width: buf.readUInt16LE(6), height: buf.readUInt16LE(8) };
+    } else if (buf.length >= 4 && buf[0] === 0xff && buf[1] === 0xd8) {
+      // JPEG SOF marker scan
+      let pos = 2;
+      while (pos + 1 < buf.length) {
+        if (buf[pos] !== 0xff) {
+          size = null;
+          break;
+        }
+        while (pos < buf.length && buf[pos] === 0xff) {
+          pos++;
+        }
+        if (pos >= buf.length) break;
+        const marker = buf[pos++];
+        if (marker === 0x00 || marker === 0x01 || (marker >= 0xd0 && marker <= 0xd8)) {
+          continue;
+        }
+        if (marker === 0xd9 || marker === 0xda) {
+          break;
+        }
+        if (pos + 1 >= buf.length) break;
+        const segLen = buf.readUInt16BE(pos);
+        if (segLen < 2 || pos + segLen > buf.length) break;
+        if (
+          (marker >= 0xc0 && marker <= 0xc3) ||
+          (marker >= 0xc5 && marker <= 0xc7) ||
+          (marker >= 0xc9 && marker <= 0xcb) ||
+          (marker >= 0xcd && marker <= 0xcf)
+        ) {
+          if (segLen < 7 || pos + 7 > buf.length) break;
+          size = {
+            height: buf.readUInt16BE(pos + 3),
+            width: buf.readUInt16BE(pos + 5),
+          };
+          break;
+        }
+        pos += segLen;
+      }
+    }
+
+    if (
+      size &&
+      Number.isSafeInteger(size.width) &&
+      Number.isSafeInteger(size.height) &&
+      size.width > 0 &&
+      size.height > 0 &&
+      size.width <= 65535 &&
+      size.height <= 65535
+    ) {
+      return size;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 function getTagAttr(attrsStr, attrName) {
   const re = new RegExp(`(?:^|\\s)${attrName}\\s*=\\s*(?:"([^"]*)"|'([^']*)'|([^\\s"'=<>` + '`' + `]+))`, 'i');
   const m = attrsStr.match(re);
@@ -1001,35 +1156,14 @@ const renderResolvedBreadcrumb = (resolved) => {
 </nav>`;
 };
 
-/** Read width/height of a local .webp/.png in /public without extra dependencies (null if unknown). */
+/** Read width/height of a local JPEG/PNG/WebP/GIF in /public safely without extra dependencies (null if unknown). */
 const imageSizeCache = new Map();
 function getImageSize(imgPath) {
   if (!imgPath || typeof imgPath !== 'string' || /^https?:/i.test(imgPath)) return null;
   if (!isSafeAssetOrUrl(imgPath) || !imgPath.startsWith('/')) return null;
   const cleanAssetPath = imgPath.split(/[?#]/)[0];
   if (imageSizeCache.has(cleanAssetPath)) return imageSizeCache.get(cleanAssetPath);
-  let size = null;
-  try {
-    const publicDir = path.resolve(root, 'public');
-    const candidate = path.resolve(publicDir, cleanAssetPath.slice(1));
-    if (!isInsideAuthorizedDirectory(publicDir, candidate)) {
-      return null;
-    }
-    const buf = fs.readFileSync(candidate);
-    if (buf.toString('ascii', 0, 4) === 'RIFF' && buf.toString('ascii', 8, 12) === 'WEBP') {
-      const kind = buf.toString('ascii', 12, 16);
-      if (kind === 'VP8X') size = { width: 1 + buf.readUIntLE(24, 3), height: 1 + buf.readUIntLE(27, 3) };
-      else if (kind === 'VP8 ') size = { width: buf.readUInt16LE(26) & 0x3fff, height: buf.readUInt16LE(28) & 0x3fff };
-      else if (kind === 'VP8L') {
-        const b = buf.readUInt32LE(21);
-        size = { width: (b & 0x3fff) + 1, height: ((b >> 14) & 0x3fff) + 1 };
-      }
-    } else if (buf.readUInt32BE(0) === 0x89504e47) {
-      size = { width: buf.readUInt32BE(16), height: buf.readUInt32BE(20) };
-    }
-  } catch {
-    size = null;
-  }
+  const size = readSafeImageSize(cleanAssetPath, root);
   imageSizeCache.set(cleanAssetPath, size);
   return size;
 }

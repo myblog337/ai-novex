@@ -4,6 +4,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import {
+  MAX_MEDIA_FILE_SIZE_BYTES,
   isValidArticleSlug,
   isValidCategorySlug,
   isValidMediaFilename,
@@ -385,6 +386,61 @@ export function resolveSecureMediaPath(fileName, projectRoot = DEFAULT_PROJECT_R
   }
 
   return candidatePath;
+}
+
+/**
+ * Verifies the integrity of public/, public/images/, and public/images/media/.
+ * Rejects symlinks, non-directories, and paths escaping the project boundary.
+ * When createIfMissing is true, safely provisions missing directories after parent checks.
+ */
+export function ensureSecureMediaDirectory(
+  projectRoot = DEFAULT_PROJECT_ROOT,
+  { createIfMissing = false } = {}
+) {
+  const rootResolved = path.resolve(projectRoot);
+  if (!fs.existsSync(rootResolved)) {
+    throw new Error('Project root does not exist for CMS media storage');
+  }
+  const canonicalRoot = fs.realpathSync(rootResolved);
+  const publicDir = path.resolve(canonicalRoot, 'public');
+  const imagesDir = path.resolve(publicDir, 'images');
+  const mediaDir = path.resolve(imagesDir, 'media');
+
+  for (const [parentDir, dirPath, label] of [
+    [canonicalRoot, publicDir, 'public'],
+    [publicDir, imagesDir, 'public/images'],
+    [imagesDir, mediaDir, 'public/images/media'],
+  ]) {
+    let dirLstat = null;
+    try {
+      dirLstat = fs.lstatSync(dirPath);
+    } catch (err) {
+      if (!err || err.code !== 'ENOENT') {
+        throw err;
+      }
+    }
+
+    if (!dirLstat) {
+      if (!createIfMissing) {
+        throw new Error(`CMS media directory does not exist (${label})`);
+      }
+      fs.mkdirSync(dirPath, { recursive: false, mode: 0o755 });
+      dirLstat = fs.lstatSync(dirPath);
+    }
+
+    if (dirLstat.isSymbolicLink()) {
+      throw new Error(`Symlinks are forbidden for CMS media directory (${label})`);
+    }
+    if (!dirLstat.isDirectory()) {
+      throw new Error(`Media storage path is not a directory (${label})`);
+    }
+    const realDir = fs.realpathSync(dirPath);
+    if (!isInsideAuthorizedDirectory(parentDir, realDir)) {
+      throw new Error(`Media directory escapes authorized project boundary (${label})`);
+    }
+  }
+
+  return fs.realpathSync(mediaDir);
 }
 
 // ----------------------------------------------------------------------------
@@ -1590,6 +1646,22 @@ export class SecureStorageEngine {
       // 4. Snapshot state under lock: exact bytes, metadata, or record non-existence
       const snapshots = new Map();
       for (const op of normalizedOps) {
+        if (op.kind === 'media') {
+          try {
+            if (op.action === 'write') {
+              ensureSecureMediaDirectory(this.projectRoot, { createIfMissing: true });
+            }
+            const verifiedPath = resolveSecureMediaPath(op.mediaFileName, this.projectRoot);
+            if (verifiedPath !== op.targetPath) {
+              throw new Error(`Resolved path mismatch for "${op.sanitizedTarget}"`);
+            }
+          } catch (err) {
+            const isSymlink = err?.message && err.message.toLowerCase().includes('symlink');
+            throw new TransactionError(sanitizeErrorMessage(err?.message || 'Media path check failed'), {
+              code: isSymlink ? 'FORBIDDEN_SYMLINK' : 'PATH_VALIDATION_FAILED',
+            });
+          }
+        }
         let stat = null;
         try {
           stat = await fs.promises.lstat(op.targetPath);
@@ -2649,6 +2721,12 @@ function normalizeTransactionOperation(
         throw new TransactionError(
           `Media write operation requires non-empty Buffer data for ${mediaFileName}`,
           { code: 'INVALID_OPERATION' }
+        );
+      }
+      if (rawBytes.length > MAX_MEDIA_FILE_SIZE_BYTES) {
+        throw new TransactionError(
+          `Media write operation exceeds maximum allowed size of ${MAX_MEDIA_FILE_SIZE_BYTES} bytes for ${mediaFileName}`,
+          { code: 'PAYLOAD_TOO_LARGE' }
         );
       }
       content = Buffer.from(rawBytes);

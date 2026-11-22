@@ -4873,9 +4873,9 @@ function textReferencesMediaUrl(text, targetPath, filename) {
   if (!text.includes(filename)) return false;
 
   const escapedTargetPath = escapeRegExpLiteral(targetPath);
-  // Matches exact path or absolute HTTP/HTTPS URL containing /images/media/<filename>
+  // Matches exact root-relative path or absolute HTTP/HTTPS origin + /images/media/<filename>
   const pathRegex = new RegExp(
-    `(?:^|[\\s"'(\\[<,=])(?:https?:\\/\\/[^\\s"'>)]+)?${escapedTargetPath}(?:[?#][^"'\\s)>]*)?(?=$|[\\s"')\\]>,;])`
+    `(?:^|[\\s"'(\\[<,=])(?:[Hh][Tt][Tt][Pp][Ss]?:\\/\\/[^\\s"'>)\\/]+)?${escapedTargetPath}(?:[?#][^"'\\s)>,]*)?(?=$|[\\s"')\\]>,;])`
   );
   return pathRegex.test(text);
 }
@@ -4929,16 +4929,25 @@ export function findMediaReferencesInContent(mediaRecord, stores = {}) {
     for (const article of stores.articles) {
       if (!article || typeof article !== 'object') continue;
       const slug = article.slug || article.id || 'unknown';
-      if (textReferencesMediaUrl(article.featuredImage, targetPath, filename)) {
-        refs.push({ store: 'articles', target: slug, field: 'featuredImage' });
+      const articleFieldsToInspect = {};
+      for (const key of Object.getOwnPropertyNames(article)) {
+        if (SEO_PROTO_POLLUTION_KEYS.has(key) || key === 'contentPath') continue;
+        articleFieldsToInspect[key] = article[key];
       }
-      if (textReferencesMediaUrl(article.ogImage, targetPath, filename)) {
-        refs.push({ store: 'articles', target: slug, field: 'ogImage' });
+      const hits = valueReferencesMediaUrl(articleFieldsToInspect, targetPath, filename);
+      for (const field of hits) {
+        refs.push({ store: 'articles', target: slug, field });
       }
     }
   }
   if (stores.articleMarkdowns instanceof Map) {
     for (const [slug, mdText] of stores.articleMarkdowns.entries()) {
+      if (textReferencesMediaUrl(mdText, targetPath, filename)) {
+        refs.push({ store: 'articleMarkdown', target: slug, field: 'content' });
+      }
+    }
+  } else if (stores.articleMarkdowns && typeof stores.articleMarkdowns === 'object' && !Array.isArray(stores.articleMarkdowns)) {
+    for (const [slug, mdText] of Object.entries(stores.articleMarkdowns)) {
       if (textReferencesMediaUrl(mdText, targetPath, filename)) {
         refs.push({ store: 'articleMarkdown', target: slug, field: 'content' });
       }
@@ -5005,6 +5014,14 @@ export function findMediaReferencesInContent(mediaRecord, stores = {}) {
     const hits = valueReferencesMediaUrl(stores.settings, targetPath, filename);
     for (const field of hits) {
       refs.push({ store: 'settings', target: 'settings', field });
+    }
+  }
+
+  // 7. Ads configuration (content/ads.json)
+  if (stores.ads && typeof stores.ads === 'object') {
+    const hits = valueReferencesMediaUrl(stores.ads, targetPath, filename);
+    for (const field of hits) {
+      refs.push({ store: 'ads', target: 'ads', field });
     }
   }
 
