@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
 // ----------------------------------------------------------------------------
@@ -419,7 +420,16 @@ export function isValidEmail(emailStr) {
 }
 
 const ALLOWED_CONTENT_FILES = Object.freeze(
-  new Set(['articles.json', 'tools.json', 'categories.json', 'settings.json', 'ads.json', 'seo.json'])
+  new Set([
+    'articles.json',
+    'tools.json',
+    'categories.json',
+    'settings.json',
+    'ads.json',
+    'seo.json',
+    'pages.json',
+    'media.json',
+  ])
 );
 
 /**
@@ -3464,6 +3474,1541 @@ export function resolveEffectiveSeo(pageRecord, defaults, fallbackPath = '/') {
     hasPageOverride: Boolean(safePage),
     updatedAt: safePage?.updatedAt ?? safeDefaults.updatedAt ?? null,
   };
+}
+
+// ----------------------------------------------------------------------------
+// 6b. Custom Static Pages Validation (Task 114-H0)
+// ----------------------------------------------------------------------------
+
+export const MAX_CUSTOM_PAGES = 500;
+export const MAX_CUSTOM_PAGE_CONTENT_LENGTH = 500000;
+
+export const ALLOWED_CUSTOM_PAGE_FIELDS = Object.freeze([
+  'id',
+  'slug',
+  'title',
+  'content',
+  'isPublished',
+  'createdAt',
+  'updatedAt',
+]);
+
+const ALLOWED_CUSTOM_PAGE_SET = new Set(ALLOWED_CUSTOM_PAGE_FIELDS);
+
+export const FORBIDDEN_CUSTOM_PAGE_SEO_FIELDS = Object.freeze([
+  ...ALLOWED_SEO_PAGE_FIELDS.filter((f) => !ALLOWED_CUSTOM_PAGE_SET.has(f)),
+  'seo',
+  'meta',
+  'metaTitle',
+  'primaryKeyword',
+  'robots',
+  'keywords',
+]);
+
+const FORBIDDEN_CUSTOM_PAGE_SEO_SET = new Set(FORBIDDEN_CUSTOM_PAGE_SEO_FIELDS);
+
+/**
+ * Reserved routes and route prefixes that custom static pages must never shadow.
+ * Derived from src/App.tsx routes, netlify.toml redirects/headers, public/ static assets,
+ * and backend API/CMS endpoints.
+ */
+export const RESERVED_PAGE_SLUGS = Object.freeze([
+  'tools',
+  'blog',
+  'categories',
+  'category',
+  'author',
+  'authors',
+  'about',
+  'contact',
+  'privacy',
+  'terms',
+  'editorial-policy',
+  'affiliate-disclosure',
+  '404',
+  'api',
+  'assets',
+  'images',
+  'cms',
+  'admin',
+  'auth',
+  'home',
+  'index',
+  'search',
+  'rss',
+  'sitemap',
+  'robots',
+  'ads',
+  'llms',
+  'favicon',
+  'not-found',
+  'best-ai-tools-bulk-product-catalog-enrichment',
+  'rss.xml',
+  'sitemap.xml',
+  'robots.txt',
+  'ads.txt',
+  'llms.txt',
+  'index.html',
+  '404.html',
+  'favicon.ico',
+  'favicon.svg',
+  'apple-touch-icon.png',
+  'logo-512.png',
+  'c49a629b37c0411eb31a896d8e20791d.txt',
+]);
+
+const RESERVED_PAGE_SLUG_SET = new Set(RESERVED_PAGE_SLUGS);
+
+export const RESERVED_PAGE_ROUTES = Object.freeze([
+  '/',
+  '/tools',
+  '/blog',
+  '/categories',
+  '/category',
+  '/author',
+  '/about',
+  '/contact',
+  '/privacy',
+  '/terms',
+  '/editorial-policy',
+  '/affiliate-disclosure',
+  '/404',
+  '/api',
+  '/assets',
+  '/images',
+  '/best-ai-tools-bulk-product-catalog-enrichment',
+]);
+
+const CUSTOM_PAGE_ID_REGEX = /^[a-z0-9][a-z0-9_-]{0,127}$/;
+const CUSTOM_PAGE_SLUG_REGEX = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+const CUSTOM_PAGE_MULTILINE_CONTROL_REGEX = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/;
+const CUSTOM_PAGE_UNSAFE_HTML_TAG_REGEX =
+  /<\/?\s*(?:script|iframe|object|embed|applet|base|meta)\b/i;
+const CUSTOM_PAGE_UNSAFE_EVENT_ATTR_REGEX = /<[a-z][^>]*\bon[a-z]+\s*=/i;
+const CUSTOM_PAGE_UNSAFE_URI_REGEX = /(?:javascript|vbscript):|data\s*:\s*text\/html/i;
+
+/**
+ * Checks whether a slug or route path collides with a reserved site route or prefix.
+ */
+export function isReservedPageSlug(slugOrPath) {
+  if (typeof slugOrPath !== 'string') return true;
+  if (SEO_SINGLE_LINE_CONTROL_REGEX.test(slugOrPath) || /\s/.test(slugOrPath)) {
+    return true;
+  }
+  const normalized = slugOrPath.trim().replace(/^\/+|\/+$/g, '').toLowerCase();
+  if (!normalized) {
+    return true;
+  }
+  if (RESERVED_PAGE_SLUG_SET.has(normalized)) {
+    return true;
+  }
+  const firstSegment = normalized.split('/')[0];
+  return RESERVED_PAGE_SLUG_SET.has(firstSegment);
+}
+
+/**
+ * Validates a custom page ID:
+ * - string, 1..128 chars
+ * - lowercase alphanumeric start, then [a-z0-9_-]
+ * - never prototype pollution key
+ */
+export function isValidCustomPageId(id) {
+  if (typeof id !== 'string') return false;
+  if (SEO_PROTO_POLLUTION_KEYS.has(id)) return false;
+  return CUSTOM_PAGE_ID_REGEX.test(id);
+}
+
+/**
+ * Validates a custom static page slug:
+ * - strictly 2..80 chars lowercase [a-z0-9] with single hyphens
+ * - no slashes, backslashes, dots, "..", null bytes, percent encodings, underscores, or uppercase
+ * - must not collide with any reserved route or prefix
+ */
+export function isValidCustomPageSlug(slug) {
+  if (typeof slug !== 'string') return false;
+  if (slug.length < 2 || slug.length > 80) return false;
+  if (!CUSTOM_PAGE_SLUG_REGEX.test(slug)) return false;
+  if (isReservedPageSlug(slug)) return false;
+  return true;
+}
+
+/**
+ * Validates Markdown content for custom static pages:
+ * - non-empty string up to MAX_CUSTOM_PAGE_CONTENT_LENGTH chars
+ * - rejects null bytes and disallowed control characters
+ * - rejects raw unsafe HTML execution vectors (<script>, <iframe>, event attributes, javascript: URIs)
+ */
+export function inspectCustomPageContentSafety(content) {
+  if (typeof content !== 'string') {
+    return { ok: false, code: 'INVALID_TYPE', error: 'content must be a Markdown string' };
+  }
+  if (CUSTOM_PAGE_MULTILINE_CONTROL_REGEX.test(content)) {
+    return {
+      ok: false,
+      code: 'INVALID_CHARACTERS',
+      error: 'content contains disallowed control characters',
+    };
+  }
+  if (!content.trim()) {
+    return {
+      ok: false,
+      code: 'REQUIRED',
+      error: 'content cannot be empty or whitespace-only',
+    };
+  }
+  if (content.length > MAX_CUSTOM_PAGE_CONTENT_LENGTH) {
+    return {
+      ok: false,
+      code: 'INVALID_LENGTH',
+      error: `content cannot exceed ${MAX_CUSTOM_PAGE_CONTENT_LENGTH} characters`,
+    };
+  }
+  if (
+    CUSTOM_PAGE_UNSAFE_HTML_TAG_REGEX.test(content) ||
+    CUSTOM_PAGE_UNSAFE_EVENT_ATTR_REGEX.test(content) ||
+    CUSTOM_PAGE_UNSAFE_URI_REGEX.test(content)
+  ) {
+    return {
+      ok: false,
+      code: 'UNSAFE_CONTENT',
+      error: 'content contains disallowed active HTML tags, event handlers, or unsafe URI schemes',
+    };
+  }
+  return { ok: true, code: null, error: null };
+}
+
+/**
+ * Validates a single custom static page record against content/pages.json schema.
+ */
+export function validateCustomPage(page, options = {}) {
+  const errors = [];
+  const prefix = options.prefix || '';
+  const isCmsInput = Boolean(options.isCmsInput);
+  const isCreate = Boolean(options.isCreate);
+
+  const safety = findSeoProtoPollutionKey(page, 4);
+  if (!safety.ok) {
+    pushError(
+      errors,
+      `${prefix}page`,
+      safety.reason === 'prototype_pollution'
+        ? `Forbidden prototype pollution key: "${safety.key}"`
+        : 'Custom page payload exceeds maximum allowed nesting depth',
+      'INVALID_PAYLOAD'
+    );
+    return createResult(errors);
+  }
+
+  if (!isStrictPlainObject(page)) {
+    pushError(errors, `${prefix}page`, 'Custom page must be a plain JSON object', 'INVALID_TYPE');
+    return createResult(errors);
+  }
+
+  for (const key of Object.getOwnPropertyNames(page)) {
+    if (SEO_PROTO_POLLUTION_KEYS.has(key)) {
+      pushError(
+        errors,
+        `${prefix}${key}`,
+        `Forbidden prototype pollution key: "${key}"`,
+        'FORBIDDEN_FIELD'
+      );
+    } else if (FORBIDDEN_CUSTOM_PAGE_SEO_SET.has(key)) {
+      pushError(
+        errors,
+        `${prefix}${key}`,
+        `SEO field "${key}" is not allowed on custom page records; SEO is managed in content/seo.json`,
+        'FORBIDDEN_SEO_FIELD'
+      );
+    } else if (!ALLOWED_CUSTOM_PAGE_SET.has(key)) {
+      pushError(
+        errors,
+        `${prefix}${key}`,
+        `Unknown custom page field: "${key}"`,
+        'UNKNOWN_FIELD'
+      );
+    }
+  }
+
+  // id
+  if (isCmsInput && isCreate) {
+    if ('id' in page && page.id !== undefined) {
+      pushError(
+        errors,
+        `${prefix}id`,
+        'Client-supplied "id" is forbidden; id is server-generated',
+        'FORBIDDEN_FIELD'
+      );
+    }
+  } else {
+    if (typeof page.id !== 'string' || !page.id.trim()) {
+      pushError(errors, `${prefix}id`, 'Page id is required', 'REQUIRED');
+    } else if (!isValidCustomPageId(page.id)) {
+      pushError(
+        errors,
+        `${prefix}id`,
+        'Page id must be 1-128 lowercase alphanumeric characters, hyphens, or underscores starting with alphanumeric',
+        'INVALID_ID'
+      );
+    }
+  }
+
+  // slug
+  if (typeof page.slug !== 'string' || !page.slug) {
+    pushError(errors, `${prefix}slug`, 'Page slug is required', 'REQUIRED');
+  } else if (!CUSTOM_PAGE_SLUG_REGEX.test(page.slug) || page.slug.length < 2 || page.slug.length > 80) {
+    pushError(
+      errors,
+      `${prefix}slug`,
+      'Page slug must be 2-80 lowercase alphanumeric characters with single hyphens',
+      'INVALID_SLUG'
+    );
+  } else if (isReservedPageSlug(page.slug)) {
+    pushError(
+      errors,
+      `${prefix}slug`,
+      `Slug "${page.slug}" is reserved and cannot shadow an existing application route`,
+      'RESERVED_SLUG'
+    );
+  }
+
+  // title
+  if (typeof page.title !== 'string') {
+    pushError(errors, `${prefix}title`, 'Page title is required', 'REQUIRED');
+  } else if (SEO_SINGLE_LINE_CONTROL_REGEX.test(page.title)) {
+    pushError(
+      errors,
+      `${prefix}title`,
+      'Page title contains disallowed control characters',
+      'INVALID_CHARACTERS'
+    );
+  } else if (
+    CUSTOM_PAGE_UNSAFE_HTML_TAG_REGEX.test(page.title) ||
+    CUSTOM_PAGE_UNSAFE_EVENT_ATTR_REGEX.test(page.title)
+  ) {
+    pushError(
+      errors,
+      `${prefix}title`,
+      'Page title contains disallowed active HTML tags or event handlers',
+      'UNSAFE_CONTENT'
+    );
+  } else {
+    const trimmedTitle = page.title.trim();
+    if (!trimmedTitle) {
+      pushError(errors, `${prefix}title`, 'Page title cannot be empty or whitespace-only', 'REQUIRED');
+    } else if (trimmedTitle.length < 2 || trimmedTitle.length > 200) {
+      pushError(
+        errors,
+        `${prefix}title`,
+        'Page title must be between 2 and 200 characters',
+        'INVALID_LENGTH'
+      );
+    }
+  }
+
+  // content
+  const contentCheck = inspectCustomPageContentSafety(page.content);
+  if (!contentCheck.ok) {
+    pushError(errors, `${prefix}content`, contentCheck.error, contentCheck.code);
+  }
+
+  // isPublished
+  if (isCmsInput && isCreate) {
+    if ('isPublished' in page && page.isPublished !== undefined) {
+      if (typeof page.isPublished !== 'boolean') {
+        pushError(errors, `${prefix}isPublished`, 'isPublished must be a boolean', 'INVALID_TYPE');
+      } else if (page.isPublished !== false) {
+        pushError(
+          errors,
+          `${prefix}isPublished`,
+          'New custom pages must default to unpublished (isPublished: false)',
+          'INVALID_PUBLISH_STATE'
+        );
+      }
+    }
+  } else if (typeof page.isPublished !== 'boolean') {
+    pushError(errors, `${prefix}isPublished`, 'isPublished must be a boolean', 'INVALID_TYPE');
+  }
+
+  // Timestamps (createdAt, updatedAt)
+  if (isCmsInput) {
+    if ('createdAt' in page && page.createdAt !== undefined) {
+      pushError(
+        errors,
+        `${prefix}createdAt`,
+        'createdAt is server-generated and cannot be provided in CMS input',
+        'FORBIDDEN_FIELD'
+      );
+    }
+    if ('updatedAt' in page && page.updatedAt !== undefined) {
+      pushError(
+        errors,
+        `${prefix}updatedAt`,
+        'updatedAt is server-generated and cannot be provided in CMS input',
+        'FORBIDDEN_FIELD'
+      );
+    }
+  } else {
+    const hasValidCreated = typeof page.createdAt === 'string' && isValidIsoTimestamp(page.createdAt);
+    const hasValidUpdated = typeof page.updatedAt === 'string' && isValidIsoTimestamp(page.updatedAt);
+
+    if (!hasValidCreated) {
+      pushError(
+        errors,
+        `${prefix}createdAt`,
+        'createdAt must be a valid UTC ISO 8601 timestamp',
+        'INVALID_TIMESTAMP'
+      );
+    }
+    if (!hasValidUpdated) {
+      pushError(
+        errors,
+        `${prefix}updatedAt`,
+        'updatedAt must be a valid UTC ISO 8601 timestamp',
+        'INVALID_TIMESTAMP'
+      );
+    }
+    if (hasValidCreated && hasValidUpdated && Date.parse(page.updatedAt) < Date.parse(page.createdAt)) {
+      pushError(
+        errors,
+        `${prefix}updatedAt`,
+        'updatedAt cannot be earlier than createdAt',
+        'INVALID_TIMESTAMP_ORDER'
+      );
+    }
+  }
+
+  return createResult(errors);
+}
+
+/**
+ * Validates the complete content/pages.json store array.
+ */
+export function validatePages(pages, options = {}) {
+  const errors = [];
+
+  if (!Array.isArray(pages)) {
+    pushError(errors, 'pages', 'Pages store must be a JSON array', 'INVALID_TYPE');
+    return createResult(errors);
+  }
+
+  if (pages.length > MAX_CUSTOM_PAGES) {
+    pushError(
+      errors,
+      'pages',
+      `Pages store cannot exceed ${MAX_CUSTOM_PAGES} custom pages`,
+      'LENGTH_EXCEEDED'
+    );
+  }
+
+  const seenIds = new Map();
+  const seenSlugs = new Map();
+
+  for (let i = 0; i < pages.length; i++) {
+    const page = pages[i];
+    const prefix = `pages[${i}].`;
+
+    const itemRes = validateCustomPage(page, { ...options, isCmsInput: false, isCreate: false, prefix });
+    if (!itemRes.isValid) {
+      errors.push(...itemRes.errors);
+    }
+
+    if (page && typeof page === 'object' && !Array.isArray(page)) {
+      if (typeof page.id === 'string' && page.id) {
+        if (seenIds.has(page.id)) {
+          pushError(
+            errors,
+            `${prefix}id`,
+            `Duplicate page id "${page.id}" (first seen at index ${seenIds.get(page.id)})`,
+            'DUPLICATE_ID'
+          );
+        } else {
+          seenIds.set(page.id, i);
+        }
+      }
+      if (typeof page.slug === 'string' && page.slug) {
+        if (seenSlugs.has(page.slug)) {
+          pushError(
+            errors,
+            `${prefix}slug`,
+            `Duplicate page slug "${page.slug}" (first seen at index ${seenSlugs.get(page.slug)})`,
+            'DUPLICATE_SLUG'
+          );
+        } else {
+          seenSlugs.set(page.slug, i);
+        }
+      }
+    }
+  }
+
+  return createResult(errors);
+}
+
+// ----------------------------------------------------------------------------
+// 6b. Secure Media Library Validation & Binary Image Inspection (Task 115)
+// ----------------------------------------------------------------------------
+
+export const MAX_MEDIA_FILE_SIZE_BYTES = 5 * 1024 * 1024; // 5 MB
+export const MAX_MEDIA_IMAGE_DIMENSION = 16384;
+export const MAX_MEDIA_ITEMS = 5000;
+export const MAX_MEDIA_ALT_LENGTH = 300;
+export const MAX_MEDIA_ORIGINAL_NAME_LENGTH = 140;
+export const MEDIA_PUBLIC_URL_PREFIX = '/images/media/';
+
+export const ALLOWED_MEDIA_MIME_TYPES = Object.freeze([
+  'image/jpeg',
+  'image/png',
+  'image/webp',
+  'image/gif',
+]);
+
+const ALLOWED_MEDIA_MIME_SET = new Set(ALLOWED_MEDIA_MIME_TYPES);
+
+export const MEDIA_MIME_TO_EXT = Object.freeze({
+  'image/jpeg': 'jpg',
+  'image/png': 'png',
+  'image/webp': 'webp',
+  'image/gif': 'gif',
+});
+
+export const MEDIA_EXT_TO_MIME = Object.freeze({
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.png': 'image/png',
+  '.webp': 'image/webp',
+  '.gif': 'image/gif',
+});
+
+export const ALLOWED_MEDIA_FIELDS = Object.freeze([
+  'id',
+  'filename',
+  'originalName',
+  'url',
+  'mimeType',
+  'size',
+  'width',
+  'height',
+  'checksum',
+  'alt',
+  'createdAt',
+  'updatedAt',
+]);
+
+const ALLOWED_MEDIA_FIELD_SET = new Set(ALLOWED_MEDIA_FIELDS);
+const MEDIA_ID_REGEX = /^[a-z0-9][a-z0-9_-]{0,127}$/;
+const MEDIA_FILENAME_REGEX = /^[a-z0-9][a-z0-9_-]{7,127}\.(?:jpg|png|webp|gif)$/;
+const MEDIA_CHECKSUM_REGEX = /^[0-9a-f]{64}$/;
+const MEDIA_ALT_UNSAFE_HTML_REGEX = /<\/?\s*(?:script|iframe|object|embed|applet|svg|style)\b|<!--|-->/i;
+
+export function isValidMediaId(id) {
+  if (typeof id !== 'string') return false;
+  if (SEO_PROTO_POLLUTION_KEYS.has(id)) return false;
+  return MEDIA_ID_REGEX.test(id);
+}
+
+export function isValidMediaFilename(filename) {
+  if (typeof filename !== 'string') return false;
+  if (
+    filename.includes('..') ||
+    filename.includes('/') ||
+    filename.includes('\\') ||
+    filename.includes('\0')
+  ) {
+    return false;
+  }
+  return MEDIA_FILENAME_REGEX.test(filename);
+}
+
+export function isValidMediaPublicUrl(urlStr) {
+  if (typeof urlStr !== 'string') return false;
+  if (!urlStr.startsWith(MEDIA_PUBLIC_URL_PREFIX)) return false;
+  const filename = urlStr.slice(MEDIA_PUBLIC_URL_PREFIX.length);
+  return isValidMediaFilename(filename);
+}
+
+/**
+ * Validates and sanitizes a client-provided original filename.
+ * Rejects path traversal, directory separators, null bytes, control characters,
+ * and mismatched/dangerous file extensions.
+ */
+export function sanitizeMediaOriginalFilename(rawName, expectedMimeType = null) {
+  if (typeof rawName !== 'string') {
+    return { ok: false, code: 'INVALID_FILENAME', error: 'Original filename must be a string' };
+  }
+  if (
+    rawName.includes('\0') ||
+    SEO_SINGLE_LINE_CONTROL_REGEX.test(rawName) ||
+    rawName.includes('/') ||
+    rawName.includes('\\') ||
+    rawName.includes('..') ||
+    /%2e/i.test(rawName) ||
+    /%2f/i.test(rawName) ||
+    /%5c/i.test(rawName) ||
+    /%00/i.test(rawName)
+  ) {
+    return {
+      ok: false,
+      code: 'PATH_TRAVERSAL',
+      error: 'Filename contains disallowed path separators, traversal sequences, or control characters',
+    };
+  }
+
+  const trimmed = rawName.trim();
+  if (!trimmed) {
+    return { ok: false, code: 'INVALID_FILENAME', error: 'Original filename cannot be empty' };
+  }
+
+  const lastDot = trimmed.lastIndexOf('.');
+  let rawStem = trimmed;
+  let rawExt = '';
+  if (lastDot !== -1) {
+    if (lastDot === 0) {
+      return { ok: false, code: 'INVALID_FILENAME', error: 'Hidden filenames without a base name are not allowed' };
+    }
+    rawStem = trimmed.slice(0, lastDot);
+    rawExt = trimmed.slice(lastDot).toLowerCase();
+  }
+
+  if (rawExt) {
+    const extMime = MEDIA_EXT_TO_MIME[rawExt] || null;
+    if (!extMime) {
+      return {
+        ok: false,
+        code: 'UNSUPPORTED_EXTENSION',
+        error: `Unsupported or disallowed file extension "${rawExt}"`,
+      };
+    }
+    if (expectedMimeType && extMime !== expectedMimeType) {
+      return {
+        ok: false,
+        code: 'MIME_SPOOFING',
+        error: `File extension "${rawExt}" does not match declared or detected media type`,
+      };
+    }
+  }
+
+  // Strip HTML-like tags, quotes, angle brackets, and collapse unsafe punctuation
+  const strippedStem = rawStem
+    .replace(/<[^>]*>/g, '')
+    .replace(/[^a-zA-Z0-9._-]+/g, '-')
+    .replace(/\.{2,}/g, '-')
+    .replace(/-{2,}/g, '-')
+    .replace(/^[._-]+|[._-]+$/g, '');
+
+  const safeStem = strippedStem || 'media';
+  const finalExt = rawExt || (expectedMimeType && MEDIA_MIME_TO_EXT[expectedMimeType] ? `.${MEDIA_MIME_TO_EXT[expectedMimeType]}` : '');
+  const maxStemLen = Math.max(1, MAX_MEDIA_ORIGINAL_NAME_LENGTH - finalExt.length);
+  const boundedStem = safeStem.slice(0, maxStemLen).replace(/[._-]+$/g, '') || 'media';
+  const originalName = `${boundedStem}${finalExt}`;
+
+  if (originalName.length > MAX_MEDIA_ORIGINAL_NAME_LENGTH) {
+    return {
+      ok: false,
+      code: 'INVALID_FILENAME',
+      error: `Sanitized filename exceeds ${MAX_MEDIA_ORIGINAL_NAME_LENGTH} characters`,
+    };
+  }
+
+  return { ok: true, originalName, extension: finalExt };
+}
+
+/**
+ * Validates descriptive alt text for a media record.
+ */
+export function validateMediaAltText(alt) {
+  if (alt === undefined) {
+    return { ok: true, alt: '' };
+  }
+  if (typeof alt !== 'string') {
+    return { ok: false, error: 'alt must be a string' };
+  }
+  if (SEO_SINGLE_LINE_CONTROL_REGEX.test(alt)) {
+    return { ok: false, error: 'alt contains disallowed control characters' };
+  }
+  if (MEDIA_ALT_UNSAFE_HTML_REGEX.test(alt) || SEO_DANGEROUS_SCHEME_REGEX.test(alt)) {
+    return { ok: false, error: 'alt contains disallowed HTML or unsafe URI sequences' };
+  }
+  const trimmed = alt.trim();
+  if (trimmed.length > MAX_MEDIA_ALT_LENGTH) {
+    return { ok: false, error: `alt cannot exceed ${MAX_MEDIA_ALT_LENGTH} characters` };
+  }
+  return { ok: true, alt: trimmed };
+}
+
+function parsePngDimensionsStrict(buf) {
+  if (buf.length < 33) {
+    return { ok: false, error: 'PNG file is truncated' };
+  }
+  const sig = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+  for (let i = 0; i < sig.length; i++) {
+    if (buf[i] !== sig[i]) {
+      return { ok: false, error: 'Invalid PNG signature' };
+    }
+  }
+
+  let offset = 8;
+  let width = 0;
+  let height = 0;
+  let sawIHDR = false;
+  let sawIDAT = false;
+  let sawIEND = false;
+
+  while (offset < buf.length) {
+    if (offset + 12 > buf.length) {
+      return { ok: false, error: 'Malformed or truncated PNG chunk header' };
+    }
+    const chunkLen = buf.readUInt32BE(offset);
+    const chunkType = buf.toString('ascii', offset + 4, offset + 8);
+    if (!/^[A-Za-z]{4}$/.test(chunkType)) {
+      return { ok: false, error: 'Invalid PNG chunk type' };
+    }
+    if (chunkLen > buf.length - (offset + 12)) {
+      return { ok: false, error: 'PNG chunk length exceeds buffer bounds' };
+    }
+    const dataOffset = offset + 8;
+
+    if (!sawIHDR) {
+      if (chunkType !== 'IHDR' || chunkLen !== 13) {
+        return { ok: false, error: 'PNG must begin with a valid 13-byte IHDR chunk' };
+      }
+      width = buf.readUInt32BE(dataOffset);
+      height = buf.readUInt32BE(dataOffset + 4);
+      const bitDepth = buf[dataOffset + 8];
+      const colorType = buf[dataOffset + 9];
+      const compression = buf[dataOffset + 10];
+      const filter = buf[dataOffset + 11];
+      const interlace = buf[dataOffset + 12];
+      if (
+        ![1, 2, 4, 8, 16].includes(bitDepth) ||
+        ![0, 2, 3, 4, 6].includes(colorType) ||
+        compression !== 0 ||
+        filter !== 0 ||
+        (interlace !== 0 && interlace !== 1)
+      ) {
+        return { ok: false, error: 'Invalid PNG IHDR metadata' };
+      }
+      sawIHDR = true;
+    } else if (chunkType === 'IDAT') {
+      sawIDAT = true;
+    } else if (chunkType === 'IEND') {
+      if (chunkLen !== 0) {
+        return { ok: false, error: 'PNG IEND chunk must have zero length' };
+      }
+      sawIEND = true;
+      offset = dataOffset + chunkLen + 4;
+      break;
+    }
+
+    offset = dataOffset + chunkLen + 4;
+  }
+
+  if (!sawIHDR || !sawIDAT || !sawIEND || offset !== buf.length) {
+    return { ok: false, error: 'Incomplete PNG stream or trailing data after IEND' };
+  }
+
+  return { ok: true, width, height };
+}
+
+function parseWebpDimensionsStrict(buf) {
+  if (buf.length < 20) {
+    return { ok: false, error: 'WebP file is truncated' };
+  }
+  if (buf.toString('ascii', 0, 4) !== 'RIFF' || buf.toString('ascii', 8, 12) !== 'WEBP') {
+    return { ok: false, error: 'Invalid WebP RIFF container header' };
+  }
+  const riffSize = buf.readUInt32LE(4);
+  if (riffSize < 12) {
+    return { ok: false, error: 'Invalid WebP RIFF size' };
+  }
+  const paddedTotal = 8 + riffSize + (riffSize % 2);
+  if (8 + riffSize !== buf.length && paddedTotal !== buf.length) {
+    return { ok: false, error: 'WebP RIFF size does not match actual buffer length' };
+  }
+
+  let offset = 12;
+  let width = 0;
+  let height = 0;
+  let foundDimensions = false;
+
+  while (offset < buf.length) {
+    if (offset + 8 > buf.length) {
+      return { ok: false, error: 'Truncated WebP chunk header' };
+    }
+    const fourcc = buf.toString('ascii', offset, offset + 4);
+    const chunkSize = buf.readUInt32LE(offset + 4);
+    const dataOffset = offset + 8;
+    const paddedChunkSize = chunkSize + (chunkSize & 1);
+    if (chunkSize > buf.length - dataOffset || paddedChunkSize > buf.length - dataOffset) {
+      return { ok: false, error: 'WebP chunk extends past end of file' };
+    }
+
+    if (!foundDimensions) {
+      if (fourcc === 'VP8 ') {
+        if (chunkSize < 10) {
+          return { ok: false, error: 'Truncated WebP VP8 chunk' };
+        }
+        if (
+          buf[dataOffset + 3] !== 0x9d ||
+          buf[dataOffset + 4] !== 0x01 ||
+          buf[dataOffset + 5] !== 0x2a
+        ) {
+          return { ok: false, error: 'Invalid WebP VP8 keyframe sync code' };
+        }
+        width = buf.readUInt16LE(dataOffset + 6) & 0x3fff;
+        height = buf.readUInt16LE(dataOffset + 8) & 0x3fff;
+        foundDimensions = true;
+      } else if (fourcc === 'VP8L') {
+        if (chunkSize < 5 || buf[dataOffset] !== 0x2f) {
+          return { ok: false, error: 'Invalid WebP VP8L header' };
+        }
+        const b = buf.readUInt32LE(dataOffset + 1);
+        width = (b & 0x3fff) + 1;
+        height = ((b >> 14) & 0x3fff) + 1;
+        foundDimensions = true;
+      } else if (fourcc === 'VP8X') {
+        if (chunkSize < 10) {
+          return { ok: false, error: 'Invalid WebP VP8X header' };
+        }
+        width = 1 + buf.readUIntLE(dataOffset + 4, 3);
+        height = 1 + buf.readUIntLE(dataOffset + 7, 3);
+        foundDimensions = true;
+      } else {
+        return { ok: false, error: 'Unsupported or missing WebP primary image chunk' };
+      }
+    }
+
+    offset = dataOffset + paddedChunkSize;
+  }
+
+  if (!foundDimensions || offset !== buf.length) {
+    return { ok: false, error: 'Malformed WebP chunk structure' };
+  }
+
+  return { ok: true, width, height };
+}
+
+function parseJpegDimensionsStrict(buf) {
+  if (buf.length < 16) {
+    return { ok: false, error: 'JPEG file is truncated' };
+  }
+  if (buf[0] !== 0xff || buf[1] !== 0xd8 || buf[2] !== 0xff) {
+    return { ok: false, error: 'Invalid JPEG SOI header' };
+  }
+
+  let pos = 2;
+  let width = 0;
+  let height = 0;
+  let sawSOF = false;
+  let sawSOS = false;
+  let sawEOI = false;
+
+  while (pos < buf.length) {
+    if (buf[pos] !== 0xff) {
+      return { ok: false, error: 'Invalid JPEG marker alignment' };
+    }
+    while (pos < buf.length && buf[pos] === 0xff) {
+      pos++;
+    }
+    if (pos >= buf.length) {
+      return { ok: false, error: 'Unexpected end of JPEG marker stream' };
+    }
+    const marker = buf[pos++];
+
+    if (marker === 0x00 || marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) {
+      continue;
+    }
+
+    if (marker === 0xd9) {
+      sawEOI = true;
+      break;
+    }
+
+    if (pos + 2 > buf.length) {
+      return { ok: false, error: 'Truncated JPEG marker segment length' };
+    }
+    const segLen = buf.readUInt16BE(pos);
+    if (segLen < 2 || pos + segLen > buf.length) {
+      return { ok: false, error: 'Invalid JPEG segment length' };
+    }
+
+    const isSof =
+      (marker >= 0xc0 && marker <= 0xc3) ||
+      (marker >= 0xc5 && marker <= 0xc7) ||
+      (marker >= 0xc9 && marker <= 0xcb) ||
+      (marker >= 0xcd && marker <= 0xcf);
+
+    if (isSof) {
+      if (segLen < 8) {
+        return { ok: false, error: 'Truncated JPEG SOF frame header' };
+      }
+      const precision = buf[pos + 2];
+      const sofHeight = buf.readUInt16BE(pos + 3);
+      const sofWidth = buf.readUInt16BE(pos + 5);
+      const components = buf[pos + 7];
+      if (![8, 12, 16].includes(precision) || components < 1 || components > 4) {
+        return { ok: false, error: 'Invalid JPEG SOF frame parameters' };
+      }
+      width = sofWidth;
+      height = sofHeight;
+      sawSOF = true;
+      pos += segLen;
+      continue;
+    }
+
+    if (marker === 0xda) {
+      if (segLen < 6) {
+        return { ok: false, error: 'Truncated JPEG SOS header' };
+      }
+      sawSOS = true;
+      pos += segLen;
+
+      // Scan entropy-coded scan payload until next unstuffed marker
+      while (pos < buf.length) {
+        if (buf[pos] !== 0xff) {
+          pos++;
+          continue;
+        }
+        let nextPos = pos + 1;
+        while (nextPos < buf.length && buf[nextPos] === 0xff) {
+          nextPos++;
+        }
+        if (nextPos >= buf.length) {
+          return { ok: false, error: 'Truncated JPEG scan data' };
+        }
+        const scanMarker = buf[nextPos];
+        if (scanMarker === 0x00 || (scanMarker >= 0xd0 && scanMarker <= 0xd7)) {
+          pos = nextPos + 1;
+          continue;
+        }
+        if (scanMarker === 0xd9) {
+          pos = nextPos + 1;
+          sawEOI = true;
+          break;
+        }
+        // Multi-scan progressive JPEG marker encountered; resume marker parsing at buf[pos]
+        pos = nextPos - 1;
+        break;
+      }
+
+      if (sawEOI) {
+        break;
+      }
+      continue;
+    }
+
+    pos += segLen;
+  }
+
+  if (!sawSOF || !sawSOS || !sawEOI) {
+    return { ok: false, error: 'Incomplete JPEG image stream (missing SOF, SOS, or EOI)' };
+  }
+
+  const trailingLen = buf.length - pos;
+  if (trailingLen > 16) {
+    return { ok: false, error: 'Unexpected trailing data after JPEG EOI marker' };
+  }
+  for (let i = pos; i < buf.length; i++) {
+    if (buf[i] !== 0x00 && buf[i] !== 0xff) {
+      return { ok: false, error: 'Unexpected non-padding bytes after JPEG EOI marker' };
+    }
+  }
+
+  return { ok: true, width, height };
+}
+
+function parseGifDimensionsStrict(buf) {
+  if (buf.length < 19) {
+    return { ok: false, error: 'GIF file is truncated' };
+  }
+  const header = buf.toString('ascii', 0, 6);
+  if (header !== 'GIF87a' && header !== 'GIF89a') {
+    return { ok: false, error: 'Invalid GIF header signature' };
+  }
+  const width = buf.readUInt16LE(6);
+  const height = buf.readUInt16LE(8);
+  const packed = buf[10];
+  let pos = 13;
+
+  if ((packed & 0x80) !== 0) {
+    const gctSize = 3 * (1 << ((packed & 0x07) + 1));
+    if (pos + gctSize > buf.length) {
+      return { ok: false, error: 'Truncated GIF global color table' };
+    }
+    pos += gctSize;
+  }
+
+  let sawImage = false;
+  let sawTrailer = false;
+
+  const skipSubBlocks = () => {
+    while (pos < buf.length) {
+      const subLen = buf[pos++];
+      if (subLen === 0) return true;
+      if (pos + subLen > buf.length) return false;
+      pos += subLen;
+    }
+    return false;
+  };
+
+  while (pos < buf.length) {
+    const intro = buf[pos++];
+    if (intro === 0x3b) {
+      sawTrailer = true;
+      break;
+    }
+    if (intro === 0x21) {
+      if (pos >= buf.length) {
+        return { ok: false, error: 'Truncated GIF extension block' };
+      }
+      pos++; // extension label
+      if (!skipSubBlocks()) {
+        return { ok: false, error: 'Malformed GIF extension sub-block' };
+      }
+      continue;
+    }
+    if (intro === 0x2c) {
+      if (pos + 9 >= buf.length) {
+        return { ok: false, error: 'Truncated GIF image descriptor' };
+      }
+      const imgPacked = buf[pos + 8];
+      pos += 9;
+      if ((imgPacked & 0x80) !== 0) {
+        const lctSize = 3 * (1 << ((imgPacked & 0x07) + 1));
+        if (pos + lctSize >= buf.length) {
+          return { ok: false, error: 'Truncated GIF local color table' };
+        }
+        pos += lctSize;
+      }
+      if (pos >= buf.length) {
+        return { ok: false, error: 'Missing GIF LZW minimum code size' };
+      }
+      const lzwMinCodeSize = buf[pos++];
+      if (lzwMinCodeSize < 2 || lzwMinCodeSize > 8) {
+        return { ok: false, error: 'Invalid GIF LZW minimum code size' };
+      }
+      if (!skipSubBlocks()) {
+        return { ok: false, error: 'Malformed GIF image data sub-block' };
+      }
+      sawImage = true;
+      continue;
+    }
+    return { ok: false, error: 'Invalid GIF block introducer byte' };
+  }
+
+  if (!sawImage || !sawTrailer || pos !== buf.length) {
+    return { ok: false, error: 'Incomplete GIF image stream or trailing data after trailer' };
+  }
+
+  return { ok: true, width, height };
+}
+
+/**
+ * Inspects actual binary buffer content to verify format, reject disguised/malformed/active files,
+ * parse exact image dimensions, compute SHA-256 checksum, and detect MIME spoofing.
+ */
+export function inspectImageBuffer(buf, options = {}) {
+  if (!Buffer.isBuffer(buf) || buf.length === 0) {
+    return { ok: false, code: 'EMPTY_FILE', error: 'Uploaded file cannot be empty' };
+  }
+  const maxBytes =
+    typeof options.maxBytes === 'number' && options.maxBytes > 0
+      ? options.maxBytes
+      : MAX_MEDIA_FILE_SIZE_BYTES;
+  if (buf.length > maxBytes) {
+    return {
+      ok: false,
+      code: 'FILE_TOO_LARGE',
+      error: `Uploaded file exceeds maximum allowed size of ${maxBytes} bytes`,
+    };
+  }
+
+  // Explicitly reject active/executable/markup signatures before container inspection
+  const headText = buf.subarray(0, Math.min(buf.length, 512)).toString('utf8').trimStart().toLowerCase();
+  if (
+    headText.startsWith('<svg') ||
+    headText.startsWith('<?xml') ||
+    headText.startsWith('<!doctype') ||
+    headText.startsWith('<html') ||
+    headText.startsWith('<script') ||
+    headText.startsWith('<?php') ||
+    headText.startsWith('%pdf-') ||
+    headText.startsWith('#!') ||
+    (buf.length >= 2 && buf[0] === 0x4d && buf[1] === 0x5a) || // PE/MZ
+    (buf.length >= 4 && buf[0] === 0x7f && buf[1] === 0x45 && buf[2] === 0x4c && buf[3] === 0x46) || // ELF
+    (buf.length >= 4 && buf[0] === 0x50 && buf[1] === 0x4b && buf[2] === 0x03 && buf[3] === 0x04) // ZIP
+  ) {
+    return {
+      ok: false,
+      code: 'DISALLOWED_CONTENT',
+      error: 'Disallowed file format: SVG, HTML, scripts, documents, and executables are forbidden',
+    };
+  }
+
+  let detectedMime = null;
+  let parsed = null;
+
+  if (buf.length >= 8 && buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) {
+    detectedMime = 'image/png';
+    parsed = parsePngDimensionsStrict(buf);
+  } else if (buf.length >= 3 && buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) {
+    detectedMime = 'image/jpeg';
+    parsed = parseJpegDimensionsStrict(buf);
+  } else if (
+    buf.length >= 12 &&
+    buf.toString('ascii', 0, 4) === 'RIFF' &&
+    buf.toString('ascii', 8, 12) === 'WEBP'
+  ) {
+    detectedMime = 'image/webp';
+    parsed = parseWebpDimensionsStrict(buf);
+  } else if (
+    buf.length >= 6 &&
+    (buf.toString('ascii', 0, 6) === 'GIF87a' || buf.toString('ascii', 0, 6) === 'GIF89a')
+  ) {
+    detectedMime = 'image/gif';
+    parsed = parseGifDimensionsStrict(buf);
+  } else {
+    return {
+      ok: false,
+      code: 'UNSUPPORTED_OR_INVALID_IMAGE',
+      error: 'File content is not a valid supported image (JPEG, PNG, WebP, or GIF)',
+    };
+  }
+
+  if (!parsed || !parsed.ok) {
+    return {
+      ok: false,
+      code: 'MALFORMED_IMAGE',
+      error: parsed?.error || 'Malformed or corrupted image payload',
+    };
+  }
+
+  if (
+    !Number.isSafeInteger(parsed.width) ||
+    !Number.isSafeInteger(parsed.height) ||
+    parsed.width < 1 ||
+    parsed.height < 1 ||
+    parsed.width > MAX_MEDIA_IMAGE_DIMENSION ||
+    parsed.height > MAX_MEDIA_IMAGE_DIMENSION
+  ) {
+    return {
+      ok: false,
+      code: 'INVALID_DIMENSIONS',
+      error: `Image dimensions must be between 1x1 and ${MAX_MEDIA_IMAGE_DIMENSION}x${MAX_MEDIA_IMAGE_DIMENSION}`,
+    };
+  }
+
+  if (options.declaredMimeType) {
+    const declared = String(options.declaredMimeType).split(';')[0].trim().toLowerCase();
+    const normalizedDeclared = declared === 'image/jpg' ? 'image/jpeg' : declared;
+    if (!ALLOWED_MEDIA_MIME_SET.has(normalizedDeclared)) {
+      return {
+        ok: false,
+        code: 'UNSUPPORTED_MIME_TYPE',
+        error: `Unsupported declared MIME type "${declared}"`,
+      };
+    }
+    if (normalizedDeclared !== detectedMime) {
+      return {
+        ok: false,
+        code: 'MIME_SPOOFING',
+        error: `Declared MIME type "${declared}" does not match actual image content (${detectedMime})`,
+      };
+    }
+  }
+
+  const checksum = crypto.createHash('sha256').update(buf).digest('hex');
+
+  return {
+    ok: true,
+    mimeType: detectedMime,
+    extension: MEDIA_MIME_TO_EXT[detectedMime],
+    size: buf.length,
+    width: parsed.width,
+    height: parsed.height,
+    checksum,
+  };
+}
+
+/**
+ * Validates a single Media Library record against the content/media.json schema.
+ */
+export function validateMediaRecord(record, options = {}) {
+  const errors = [];
+  const prefix = options.prefix || '';
+
+  const safety = findSeoProtoPollutionKey(record, 4);
+  if (!safety.ok) {
+    pushError(
+      errors,
+      `${prefix}media`,
+      safety.reason === 'prototype_pollution'
+        ? `Forbidden prototype pollution key: "${safety.key}"`
+        : 'Media record exceeds maximum allowed nesting depth',
+      'INVALID_PAYLOAD'
+    );
+    return createResult(errors);
+  }
+
+  if (!isStrictPlainObject(record)) {
+    pushError(errors, `${prefix}media`, 'Media record must be a plain JSON object', 'INVALID_TYPE');
+    return createResult(errors);
+  }
+
+  for (const key of Object.getOwnPropertyNames(record)) {
+    if (SEO_PROTO_POLLUTION_KEYS.has(key)) {
+      pushError(
+        errors,
+        `${prefix}${key}`,
+        `Forbidden prototype pollution key: "${key}"`,
+        'FORBIDDEN_FIELD'
+      );
+    } else if (!ALLOWED_MEDIA_FIELD_SET.has(key)) {
+      pushError(errors, `${prefix}${key}`, `Unknown media field: "${key}"`, 'UNKNOWN_FIELD');
+    }
+  }
+
+  if (typeof record.id !== 'string' || !isValidMediaId(record.id)) {
+    pushError(errors, `${prefix}id`, 'Media id must be a valid server-generated identifier', 'INVALID_ID');
+  }
+
+  if (typeof record.filename !== 'string' || !isValidMediaFilename(record.filename)) {
+    pushError(errors, `${prefix}filename`, 'Media filename must be a safe server-generated image filename', 'INVALID_FILENAME');
+  }
+
+  if (typeof record.originalName !== 'string' || !record.originalName.trim()) {
+    pushError(errors, `${prefix}originalName`, 'originalName is required', 'REQUIRED');
+  } else if (
+    SEO_SINGLE_LINE_CONTROL_REGEX.test(record.originalName) ||
+    record.originalName.includes('/') ||
+    record.originalName.includes('\\') ||
+    record.originalName.includes('..') ||
+    record.originalName.length > MAX_MEDIA_ORIGINAL_NAME_LENGTH
+  ) {
+    pushError(errors, `${prefix}originalName`, 'originalName contains unsafe characters or exceeds max length', 'INVALID_FILENAME');
+  }
+
+  if (typeof record.mimeType !== 'string' || !ALLOWED_MEDIA_MIME_SET.has(record.mimeType)) {
+    pushError(
+      errors,
+      `${prefix}mimeType`,
+      `mimeType must be one of: ${ALLOWED_MEDIA_MIME_TYPES.join(', ')}`,
+      'INVALID_MIME_TYPE'
+    );
+  } else if (typeof record.filename === 'string' && isValidMediaFilename(record.filename)) {
+    const expectedExt = `.${MEDIA_MIME_TO_EXT[record.mimeType]}`;
+    if (!record.filename.endsWith(expectedExt)) {
+      pushError(
+        errors,
+        `${prefix}filename`,
+        `filename extension must match verified mimeType (${expectedExt})`,
+        'EXTENSION_MISMATCH'
+      );
+    }
+  }
+
+  if (typeof record.url !== 'string' || !isValidMediaPublicUrl(record.url)) {
+    pushError(
+      errors,
+      `${prefix}url`,
+      `url must start with "${MEDIA_PUBLIC_URL_PREFIX}" and reference a safe filename`,
+      'INVALID_URL'
+    );
+  } else if (typeof record.filename === 'string' && record.url !== `${MEDIA_PUBLIC_URL_PREFIX}${record.filename}`) {
+    pushError(
+      errors,
+      `${prefix}url`,
+      'url must match canonical public path for filename',
+      'URL_FILENAME_MISMATCH'
+    );
+  }
+
+  if (
+    typeof record.size !== 'number' ||
+    !Number.isSafeInteger(record.size) ||
+    record.size < 1 ||
+    record.size > MAX_MEDIA_FILE_SIZE_BYTES
+  ) {
+    pushError(
+      errors,
+      `${prefix}size`,
+      `size must be a positive integer <= ${MAX_MEDIA_FILE_SIZE_BYTES}`,
+      'INVALID_SIZE'
+    );
+  }
+
+  if (
+    typeof record.width !== 'number' ||
+    !Number.isSafeInteger(record.width) ||
+    record.width < 1 ||
+    record.width > MAX_MEDIA_IMAGE_DIMENSION
+  ) {
+    pushError(
+      errors,
+      `${prefix}width`,
+      `width must be an integer between 1 and ${MAX_MEDIA_IMAGE_DIMENSION}`,
+      'INVALID_DIMENSIONS'
+    );
+  }
+
+  if (
+    typeof record.height !== 'number' ||
+    !Number.isSafeInteger(record.height) ||
+    record.height < 1 ||
+    record.height > MAX_MEDIA_IMAGE_DIMENSION
+  ) {
+    pushError(
+      errors,
+      `${prefix}height`,
+      `height must be an integer between 1 and ${MAX_MEDIA_IMAGE_DIMENSION}`,
+      'INVALID_DIMENSIONS'
+    );
+  }
+
+  if (typeof record.checksum !== 'string' || !MEDIA_CHECKSUM_REGEX.test(record.checksum)) {
+    pushError(errors, `${prefix}checksum`, 'checksum must be a 64-character lowercase SHA-256 hex digest', 'INVALID_CHECKSUM');
+  }
+
+  const altCheck = validateMediaAltText(record.alt);
+  if (typeof record.alt !== 'string' || !altCheck.ok) {
+    pushError(errors, `${prefix}alt`, altCheck.error || 'alt must be a valid string', 'INVALID_ALT');
+  }
+
+  const hasValidCreated = typeof record.createdAt === 'string' && isValidIsoTimestamp(record.createdAt);
+  const hasValidUpdated = typeof record.updatedAt === 'string' && isValidIsoTimestamp(record.updatedAt);
+
+  if (!hasValidCreated) {
+    pushError(errors, `${prefix}createdAt`, 'createdAt must be a valid UTC ISO 8601 timestamp', 'INVALID_TIMESTAMP');
+  }
+  if (!hasValidUpdated) {
+    pushError(errors, `${prefix}updatedAt`, 'updatedAt must be a valid UTC ISO 8601 timestamp', 'INVALID_TIMESTAMP');
+  }
+  if (hasValidCreated && hasValidUpdated && Date.parse(record.updatedAt) < Date.parse(record.createdAt)) {
+    pushError(errors, `${prefix}updatedAt`, 'updatedAt cannot be earlier than createdAt', 'INVALID_TIMESTAMP_ORDER');
+  }
+
+  return createResult(errors);
+}
+
+/**
+ * Validates the complete content/media.json store array.
+ */
+export function validateMediaLibrary(mediaList, options = {}) {
+  const errors = [];
+
+  if (!Array.isArray(mediaList)) {
+    pushError(errors, 'media', 'Media store must be a JSON array', 'INVALID_TYPE');
+    return createResult(errors);
+  }
+
+  if (mediaList.length > MAX_MEDIA_ITEMS) {
+    pushError(
+      errors,
+      'media',
+      `Media store cannot exceed ${MAX_MEDIA_ITEMS} records`,
+      'LENGTH_EXCEEDED'
+    );
+  }
+
+  const seenIds = new Map();
+  const seenFilenames = new Map();
+  const seenUrls = new Map();
+
+  for (let i = 0; i < mediaList.length; i++) {
+    const item = mediaList[i];
+    const prefix = `media[${i}].`;
+
+    const itemRes = validateMediaRecord(item, { ...options, prefix });
+    if (!itemRes.isValid) {
+      errors.push(...itemRes.errors);
+    }
+
+    if (item && typeof item === 'object' && !Array.isArray(item)) {
+      if (typeof item.id === 'string' && item.id) {
+        if (seenIds.has(item.id)) {
+          pushError(
+            errors,
+            `${prefix}id`,
+            `Duplicate media id "${item.id}" (first seen at index ${seenIds.get(item.id)})`,
+            'DUPLICATE_ID'
+          );
+        } else {
+          seenIds.set(item.id, i);
+        }
+      }
+      if (typeof item.filename === 'string' && item.filename) {
+        if (seenFilenames.has(item.filename)) {
+          pushError(
+            errors,
+            `${prefix}filename`,
+            `Duplicate media filename "${item.filename}" (first seen at index ${seenFilenames.get(item.filename)})`,
+            'DUPLICATE_FILENAME'
+          );
+        } else {
+          seenFilenames.set(item.filename, i);
+        }
+      }
+      if (typeof item.url === 'string' && item.url) {
+        if (seenUrls.has(item.url)) {
+          pushError(
+            errors,
+            `${prefix}url`,
+            `Duplicate media url "${item.url}" (first seen at index ${seenUrls.get(item.url)})`,
+            'DUPLICATE_URL'
+          );
+        } else {
+          seenUrls.set(item.url, i);
+        }
+      }
+    }
+  }
+
+  return createResult(errors);
+}
+
+function escapeRegExpLiteral(str) {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function textReferencesMediaUrl(text, targetPath, filename) {
+  if (typeof text !== 'string' || !text) return false;
+  if (!text.includes(filename)) return false;
+
+  const escapedTargetPath = escapeRegExpLiteral(targetPath);
+  // Matches exact path or absolute HTTP/HTTPS URL containing /images/media/<filename>
+  const pathRegex = new RegExp(
+    `(?:^|[\\s"'(\\[<,=])(?:https?:\\/\\/[^\\s"'>)]+)?${escapedTargetPath}(?:[?#][^"'\\s)>]*)?(?=$|[\\s"')\\]>,;])`
+  );
+  return pathRegex.test(text);
+}
+
+function valueReferencesMediaUrl(val, targetPath, filename, fieldPath = '', visited = new WeakSet()) {
+  const hits = [];
+  const stack = [{ node: val, path: fieldPath }];
+  while (stack.length > 0) {
+    const { node, path: curPath } = stack.pop();
+    if (typeof node === 'string') {
+      if (textReferencesMediaUrl(node, targetPath, filename)) {
+        hits.push(curPath || 'value');
+      }
+      continue;
+    }
+    if (!node || typeof node !== 'object') continue;
+    if (visited.has(node)) continue;
+    visited.add(node);
+
+    if (Array.isArray(node)) {
+      for (let i = 0; i < node.length; i++) {
+        stack.push({ node: node[i], path: `${curPath}[${i}]` });
+      }
+    } else {
+      for (const k of Object.getOwnPropertyNames(node)) {
+        if (SEO_PROTO_POLLUTION_KEYS.has(k)) continue;
+        if (textReferencesMediaUrl(k, targetPath, filename)) {
+          hits.push(curPath ? `${curPath}.${k}` : k);
+        }
+        stack.push({ node: node[k], path: curPath ? `${curPath}.${k}` : k });
+      }
+    }
+  }
+  return hits;
+}
+
+/**
+ * Inspects all content stores and markdown bodies to determine whether a media asset is referenced.
+ * Returns a list of safe reference descriptors (without exposing filesystem paths).
+ */
+export function findMediaReferencesInContent(mediaRecord, stores = {}) {
+  const refs = [];
+  if (!mediaRecord || typeof mediaRecord.filename !== 'string' || typeof mediaRecord.url !== 'string') {
+    return refs;
+  }
+  const filename = mediaRecord.filename;
+  const targetPath = `${MEDIA_PUBLIC_URL_PREFIX}${filename}`;
+
+  // 1. Articles metadata + Markdown bodies
+  if (Array.isArray(stores.articles)) {
+    for (const article of stores.articles) {
+      if (!article || typeof article !== 'object') continue;
+      const slug = article.slug || article.id || 'unknown';
+      if (textReferencesMediaUrl(article.featuredImage, targetPath, filename)) {
+        refs.push({ store: 'articles', target: slug, field: 'featuredImage' });
+      }
+      if (textReferencesMediaUrl(article.ogImage, targetPath, filename)) {
+        refs.push({ store: 'articles', target: slug, field: 'ogImage' });
+      }
+    }
+  }
+  if (stores.articleMarkdowns instanceof Map) {
+    for (const [slug, mdText] of stores.articleMarkdowns.entries()) {
+      if (textReferencesMediaUrl(mdText, targetPath, filename)) {
+        refs.push({ store: 'articleMarkdown', target: slug, field: 'content' });
+      }
+    }
+  }
+
+  // 2. Categories
+  if (Array.isArray(stores.categories)) {
+    for (const cat of stores.categories) {
+      if (!cat || typeof cat !== 'object') continue;
+      const slug = cat.slug || cat.id || 'unknown';
+      const hits = valueReferencesMediaUrl(cat, targetPath, filename);
+      for (const field of hits) {
+        refs.push({ store: 'categories', target: slug, field });
+      }
+    }
+  }
+
+  // 3. Tools
+  if (Array.isArray(stores.tools)) {
+    for (const tool of stores.tools) {
+      if (!tool || typeof tool !== 'object') continue;
+      const slug = tool.slug || tool.id || 'unknown';
+      const hits = valueReferencesMediaUrl(tool, targetPath, filename);
+      for (const field of hits) {
+        refs.push({ store: 'tools', target: slug, field });
+      }
+    }
+  }
+
+  // 4. Custom Pages
+  if (Array.isArray(stores.pages)) {
+    for (const page of stores.pages) {
+      if (!page || typeof page !== 'object') continue;
+      const target = page.slug || page.id || 'unknown';
+      const hits = valueReferencesMediaUrl(page, targetPath, filename);
+      for (const field of hits) {
+        refs.push({ store: 'pages', target, field });
+      }
+    }
+  }
+
+  // 5. SEO (defaults + page-level OG/Twitter/structured data/customImageAlts)
+  if (stores.seo && typeof stores.seo === 'object') {
+    if (stores.seo.defaults && typeof stores.seo.defaults === 'object') {
+      const hits = valueReferencesMediaUrl(stores.seo.defaults, targetPath, filename);
+      for (const field of hits) {
+        refs.push({ store: 'seo.defaults', target: 'defaults', field });
+      }
+    }
+    if (stores.seo.pages && typeof stores.seo.pages === 'object') {
+      for (const [pageId, pageSeo] of Object.entries(stores.seo.pages)) {
+        if (!pageSeo || typeof pageSeo !== 'object') continue;
+        const hits = valueReferencesMediaUrl(pageSeo, targetPath, filename);
+        for (const field of hits) {
+          refs.push({ store: 'seo.pages', target: pageId, field });
+        }
+      }
+    }
+  }
+
+  // 6. Site Settings
+  if (stores.settings && typeof stores.settings === 'object') {
+    const hits = valueReferencesMediaUrl(stores.settings, targetPath, filename);
+    for (const field of hits) {
+      refs.push({ store: 'settings', target: 'settings', field });
+    }
+  }
+
+  return refs;
 }
 
 // ----------------------------------------------------------------------------

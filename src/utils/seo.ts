@@ -26,6 +26,7 @@ export interface BreadcrumbItem {
 
 export interface ResolvedPageSeo {
   notFound: boolean;
+  pageId?: string | null;
   routeKind: string;
   path: string;
   pageUrl: string;
@@ -33,6 +34,8 @@ export interface ResolvedPageSeo {
   siteName: string;
   title: string;
   description: string;
+  focusKeyword?: string;
+  secondaryKeywords?: string[];
   canonicalUrl: string | null;
   ogUrl: string | null;
   ogTitle: string;
@@ -68,6 +71,7 @@ export interface ApplyRouteSeoInput {
   articles?: any[];
   categories?: any[];
   tools?: any[];
+  pages?: any[];
 }
 
 const CONTROL_CHAR_REGEX = /[\u0000-\u001F\u007F-\u009F]/g;
@@ -382,6 +386,7 @@ export function resolveRouteSeo(input: ApplyRouteSeoInput): ResolvedPageSeo {
       articles: Array.isArray(input.articles) ? input.articles : [],
       categories: Array.isArray(input.categories) ? input.categories : [],
       tools: Array.isArray(input.tools) ? input.tools : [],
+      pages: Array.isArray(input.pages) ? input.pages : [],
     }) as ResolvedPageSeo;
   } catch {
     return resolvePageSeo({
@@ -391,6 +396,7 @@ export function resolveRouteSeo(input: ApplyRouteSeoInput): ResolvedPageSeo {
       articles: [],
       categories: [],
       tools: [],
+      pages: [],
     }) as ResolvedPageSeo;
   }
 }

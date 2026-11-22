@@ -5,6 +5,7 @@ import { Footer } from './components/Footer';
 import { ToolModal } from './components/ToolModal';
 import { HomeView } from './views/HomeView';
 import { ToolsView } from './views/ToolsView';
+import { ToolDetailView } from './views/ToolDetailView';
 import { BlogView } from './views/BlogView';
 import { CategoriesView } from './views/CategoriesView';
 import { CategoryDetailView } from './views/CategoryDetailView';
@@ -13,8 +14,14 @@ import { AboutView } from './views/AboutView';
 import { ContactView } from './views/ContactView';
 import { LegalView } from './views/LegalView';
 import { AuthorView } from './views/AuthorView';
-import { Tool, Category, Article } from './types';
+import { CustomPageView } from './views/CustomPageView';
+import { Tool, Category, Article, CustomPage } from './types';
 import { resolveRouteSeo, applyResolvedSeo, loadAnalytics } from './utils/seo';
+import { isPublishedTool } from './config/indexing.js';
+import {
+  findPublishedCustomPageBySlug,
+  getRenderablePublishedCustomPages,
+} from './utils/customPages.js';
 
 // Only the search dialog is code-split: it is opened on demand. Every route view is bundled
 // eagerly so the first client render matches the pre-rendered HTML (no blank flash).
@@ -23,14 +30,16 @@ const SearchModal = lazy(() => import('./components/SearchModal').then((m) => ({
 import defaultCategories from '../content/categories.json';
 import defaultTools from '../content/tools.json';
 import defaultArticles from '../content/articles.json';
+import defaultPages from '../content/pages.json';
 import defaultSettings from '../content/settings.json';
 import defaultSeoConfig from '../content/seo.json';
 import { findAuthorBySlug } from './utils/authors.js';
 
 // Content is bundled at build time (read-only site): no runtime API requests are needed.
 const CATEGORIES = defaultCategories as Category[];
-const TOOLS = defaultTools as Tool[];
+const TOOLS = (defaultTools as Tool[]).filter(isPublishedTool);
 const ARTICLES = (defaultArticles as Article[]).filter((a) => a.isPublished);
+const CUSTOM_PAGES = getRenderablePublishedCustomPages(defaultPages as CustomPage[]) as CustomPage[];
 
 /** Canonical in-app path: always with a trailing slash (before any ?query / #hash). */
 function canonicalize(path: string): string {
@@ -54,6 +63,7 @@ function AppContent() {
   const categories = CATEGORIES;
   const tools = TOOLS;
   const articles = ARTICLES;
+  const customPages = CUSTOM_PAGES;
   const siteSettings = defaultSettings;
 
   useEffect(() => {
@@ -101,10 +111,10 @@ function AppContent() {
       settings: siteSettings,
       articles,
       categories,
-      // Tool detail routes (/tools/:slug/) are not active in the client router.
-      tools: [],
+      tools,
+      pages: customPages,
     });
-  }, [normPath, articles, categories, siteSettings]);
+  }, [normPath, articles, categories, tools, customPages, siteSettings]);
 
   // Keep <title>, description, canonical, robots, Open Graph, Twitter tags, and JSON-LD in sync with the route
   useEffect(() => {
@@ -138,6 +148,19 @@ function AppContent() {
         initialQuery={q}
         onNavigate={navigate}
         onSelectTool={setSelectedToolModal}
+        breadcrumbs={routeBreadcrumbs}
+        breadcrumbEnabled={routeBreadcrumbEnabled}
+      />
+    );
+  } else if (normPath.startsWith('/tools/')) {
+    const slug = normPath.slice('/tools/'.length);
+    viewContent = (
+      <ToolDetailView
+        key={slug}
+        slug={slug}
+        tools={tools}
+        categories={categories}
+        onNavigate={navigate}
         breadcrumbs={routeBreadcrumbs}
         breadcrumbEnabled={routeBreadcrumbEnabled}
       />
@@ -272,21 +295,43 @@ function AppContent() {
       );
     }
   } else {
-    // 404 Not Found fallback
-    viewContent = (
-      <div className="max-w-2xl mx-auto px-4 py-24 text-center">
-        <h1 className="text-4xl font-extrabold text-slate-900 dark:text-white mb-3">404 - Page Not Found</h1>
-        <p className="text-sm text-slate-500 dark:text-slate-400 mb-6">
-          The page you are looking for does not exist or has been moved.
-        </p>
-        <button
-          onClick={() => navigate('/')}
-          className="px-6 py-2.5 rounded-full bg-blue-600 hover:bg-blue-500 text-white font-semibold text-xs shadow-md shadow-blue-600/30"
-        >
-          Return Home
-        </button>
-      </div>
-    );
+    const candidateSlug =
+      normPath.startsWith('/') && normPath.length > 1 && !normPath.slice(1).includes('/')
+        ? normPath.slice(1)
+        : '';
+    const foundCustomPage = candidateSlug
+      ? findPublishedCustomPageBySlug(candidateSlug, customPages)
+      : null;
+
+    if (foundCustomPage) {
+      viewContent = (
+        <CustomPageView
+          key={foundCustomPage.slug}
+          slug={foundCustomPage.slug}
+          page={foundCustomPage}
+          pages={customPages}
+          onNavigate={navigate}
+          breadcrumbs={routeBreadcrumbs}
+          breadcrumbEnabled={routeBreadcrumbEnabled}
+        />
+      );
+    } else {
+      // 404 Not Found fallback
+      viewContent = (
+        <div className="max-w-2xl mx-auto px-4 py-24 text-center">
+          <h1 className="text-4xl font-extrabold text-slate-900 dark:text-white mb-3">404 - Page Not Found</h1>
+          <p className="text-sm text-slate-500 dark:text-slate-400 mb-6">
+            The page you are looking for does not exist or has been moved.
+          </p>
+          <button
+            onClick={() => navigate('/')}
+            className="px-6 py-2.5 rounded-full bg-blue-600 hover:bg-blue-500 text-white font-semibold text-xs shadow-md shadow-blue-600/30"
+          >
+            Return Home
+          </button>
+        </div>
+      );
+    }
   }
 
   return (

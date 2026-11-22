@@ -1,10 +1,21 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { isIndexable, categoryHasContent } from '../src/config/indexing.js';
+import {
+  isIndexable,
+  categoryHasContent,
+  isPublishedTool,
+  isValidToolSlug,
+} from '../src/config/indexing.js';
 import { collectAuthors } from '../src/utils/authors.js';
 import { STATIC_SEO_DEFAULTS, normalizeRoutePath, resolvePageSeo } from '../src/utils/pageSeo.js';
-import { isValidHttpOriginUrl, isValidHttpUrl } from './lib/validators.mjs';
+import { getRenderablePublishedCustomPages } from '../src/utils/customPages.js';
+import {
+  isValidCustomPageSlug,
+  isReservedPageSlug,
+  isValidHttpOriginUrl,
+  isValidHttpUrl,
+} from './lib/validators.mjs';
 
 const escapeXml = (value) =>
   String(value)
@@ -38,7 +49,10 @@ function readOptionalSeoConfig(contentDir) {
   }
 }
 
-export function resolveRouteSeoSafe(routePath, { seoConfig, seoSettings, articles, categories }) {
+export function resolveRouteSeoSafe(
+  routePath,
+  { seoConfig, seoSettings, articles, categories, tools = [], pages = [] }
+) {
   try {
     return resolvePageSeo({
       path: routePath,
@@ -46,7 +60,8 @@ export function resolveRouteSeoSafe(routePath, { seoConfig, seoSettings, article
       settings: seoSettings,
       articles,
       categories,
-      tools: [],
+      tools,
+      pages,
     });
   } catch (err) {
     console.warn(`[finalize-sitemap] SEO resolution failed for "${routePath}", falling back safely: ${err.message}`);
@@ -57,7 +72,8 @@ export function resolveRouteSeoSafe(routePath, { seoConfig, seoSettings, article
         settings: seoSettings,
         articles,
         categories,
-        tools: [],
+        tools,
+        pages,
       });
     } catch {
       return null;
@@ -151,21 +167,59 @@ export function runFinalizeSitemap(root = process.cwd()) {
   const articles = Array.isArray(rawArticles) ? rawArticles.filter((article) => Boolean(article && article.isPublished)) : [];
   const rawCategories = readJson('categories.json');
   const categories = Array.isArray(rawCategories) ? rawCategories : [];
+  let rawTools = [];
+  try {
+    rawTools = fs.existsSync(path.join(contentDir, 'tools.json')) ? readJson('tools.json') : [];
+  } catch (err) {
+    console.warn(`[finalize-sitemap] Failed to read or parse content/tools.json — skipping tool URLs: ${err.message}`);
+    rawTools = [];
+  }
+  const tools = Array.isArray(rawTools) ? rawTools.filter(isPublishedTool) : [];
+
+  const pagesFilePath = path.join(contentDir, 'pages.json');
+  let rawPages = [];
+  if (fs.existsSync(pagesFilePath)) {
+    let pagesLstat;
+    try {
+      pagesLstat = fs.lstatSync(pagesFilePath);
+    } catch (err) {
+      console.error(`[finalize-sitemap] Failed to inspect content/pages.json: ${err.message}`);
+      process.exit(1);
+    }
+    if (pagesLstat.isSymbolicLink() || !pagesLstat.isFile()) {
+      console.error('[finalize-sitemap] Security check failed: content/pages.json must be a regular file');
+      process.exit(1);
+    }
+    try {
+      rawPages = JSON.parse(fs.readFileSync(pagesFilePath, 'utf-8'));
+    } catch (err) {
+      console.error(`[finalize-sitemap] Failed to parse content/pages.json: ${err.message}`);
+      process.exit(1);
+    }
+    if (!Array.isArray(rawPages)) {
+      console.error('[finalize-sitemap] Invalid content/pages.json: expected a JSON array');
+      process.exit(1);
+    }
+  }
+  const pages = getRenderablePublishedCustomPages(rawPages);
+
   const seoConfig = readOptionalSeoConfig(contentDir);
 
-  const context = { articles, categories };
+  const context = { articles, categories, tools, pages };
   const baseUrl = settings.productionUrl.trim().replace(/\/+$/, '');
   const expectedOrigin = new URL(baseUrl).origin;
   const seoSettings = { ...settings, productionUrl: baseUrl };
 
   const entries = new Map();
+  const seenRoutes = new Set();
   const dateOf = (article) => article.updatedAt || article.publishedAt;
   const newest = (items) => items.map(dateOf).filter(Boolean).sort().pop();
 
   // 1. Static routes defined in STATIC_SEO_DEFAULTS (indexable by default or via valid page-level override)
   for (const staticKey of Object.keys(STATIC_SEO_DEFAULTS)) {
     const route = normalizeRoutePath(staticKey);
-    const resolved = resolveRouteSeoSafe(route, { seoConfig, seoSettings, articles, categories });
+    seenRoutes.add(route);
+    const resolved = resolveRouteSeoSafe(route, { seoConfig, seoSettings, articles, categories, tools, pages });
     if (!isResolvedIndexable(resolved)) continue;
     const loc = resolveSitemapCanonicalUrl(resolved, expectedOrigin, route);
     const lastmod = ['/', '/blog'].includes(staticKey) ? newest(articles) : undefined;
@@ -176,8 +230,9 @@ export function runFinalizeSitemap(root = process.cwd()) {
   for (const author of collectAuthors(articles)) {
     if (!author?.slug || author.slug.includes('/')) continue;
     const route = `/author/${author.slug}/`;
+    seenRoutes.add(route);
     if (!isIndexable(route, context)) continue;
-    const resolved = resolveRouteSeoSafe(route, { seoConfig, seoSettings, articles, categories });
+    const resolved = resolveRouteSeoSafe(route, { seoConfig, seoSettings, articles, categories, tools, pages });
     if (!isResolvedIndexable(resolved)) continue;
     const loc = resolveSitemapCanonicalUrl(resolved, expectedOrigin, route);
     upsertSitemapEntry(entries, loc, newest(author.articles));
@@ -187,8 +242,9 @@ export function runFinalizeSitemap(root = process.cwd()) {
   for (const article of articles) {
     if (!article?.slug || typeof article.slug !== 'string' || article.slug.includes('/')) continue;
     const route = `/blog/${article.slug}/`;
+    seenRoutes.add(route);
     if (!isIndexable(route, context)) continue;
-    const resolved = resolveRouteSeoSafe(route, { seoConfig, seoSettings, articles, categories });
+    const resolved = resolveRouteSeoSafe(route, { seoConfig, seoSettings, articles, categories, tools, pages });
     if (!isResolvedIndexable(resolved)) continue;
     const loc = resolveSitemapCanonicalUrl(resolved, expectedOrigin, route);
     upsertSitemapEntry(entries, loc, dateOf(article));
@@ -199,11 +255,42 @@ export function runFinalizeSitemap(root = process.cwd()) {
     if (!category?.slug || typeof category.slug !== 'string' || category.slug.includes('/')) continue;
     if (!categoryHasContent(category.slug, categories, articles)) continue;
     const route = `/category/${category.slug}/`;
+    seenRoutes.add(route);
     if (!isIndexable(route, context)) continue;
-    const resolved = resolveRouteSeoSafe(route, { seoConfig, seoSettings, articles, categories });
+    const resolved = resolveRouteSeoSafe(route, { seoConfig, seoSettings, articles, categories, tools, pages });
     if (!isResolvedIndexable(resolved)) continue;
     const loc = resolveSitemapCanonicalUrl(resolved, expectedOrigin, route);
     upsertSitemapEntry(entries, loc, newest(articles.filter((article) => article.category === category.slug)));
+  }
+
+  // 5. Published Tool detail routes (respecting noindex overrides, defaultIndex, and custom canonicals)
+  for (const tool of tools) {
+    if (!isValidToolSlug(tool.slug)) continue;
+    const route = `/tools/${tool.slug}/`;
+    seenRoutes.add(route);
+    if (!isIndexable(route, context)) continue;
+    const resolved = resolveRouteSeoSafe(route, { seoConfig, seoSettings, articles, categories, tools, pages });
+    if (!isResolvedIndexable(resolved)) continue;
+    const loc = resolveSitemapCanonicalUrl(resolved, expectedOrigin, route);
+    upsertSitemapEntry(entries, loc);
+  }
+
+  // 6. Published Custom Static Pages (/[slug]/), excluding unpublished, invalid/duplicate/reserved slugs, and noindex
+  for (const page of pages) {
+    if (!page?.slug || !isValidCustomPageSlug(page.slug) || isReservedPageSlug(page.slug)) continue;
+    const route = `/${page.slug}/`;
+    if (seenRoutes.has(route)) continue;
+    seenRoutes.add(route);
+    if (!isIndexable(route, context)) continue;
+    const resolved = resolveRouteSeoSafe(route, { seoConfig, seoSettings, articles, categories, tools, pages });
+    if (!isResolvedIndexable(resolved)) continue;
+    const loc = resolveSitemapCanonicalUrl(resolved, expectedOrigin, route);
+    if (!loc) continue;
+    const lastmod =
+      typeof page.updatedAt === 'string' && /^\d{4}-\d{2}-\d{2}/.test(page.updatedAt)
+        ? page.updatedAt.slice(0, 10)
+        : undefined;
+    upsertSitemapEntry(entries, loc, lastmod);
   }
 
   let sitemap = '<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n';

@@ -11,11 +11,21 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { renderMarkdown } from '../src/utils/markdown.js';
-import { INDEXABLE_STATIC_PATHS, isIndexable, categoryHasContent, categoryTitle } from '../src/config/indexing.js';
+import {
+  INDEXABLE_STATIC_PATHS,
+  isIndexable,
+  categoryHasContent,
+  categoryTitle,
+  isPublishedTool,
+  isValidToolSlug,
+} from '../src/config/indexing.js';
 import { LEGAL_TITLES, LEGAL_BREADCRUMBS, formatLegalDate, getLegalContent } from '../src/config/legal.js';
 import {
   isValidArticleSlug,
-  isValidHttpOriginUrl
+  isValidHttpOriginUrl,
+  validatePages,
+  isValidCustomPageSlug,
+  isReservedPageSlug,
 } from './lib/validators.mjs';
 import { isInsideAuthorizedDirectory } from './lib/storage.mjs';
 import { collectAuthors, getArticleAuthorProfile, DEFAULT_EDITORIAL_TEAM_NAME } from '../src/utils/authors.js';
@@ -601,9 +611,41 @@ if (
 }
 
 const categories = readJson('categories.json', { optional: false, fallback: [] });
-const tools = readJson('tools.json', { optional: false, fallback: [] });
+const rawTools = readJson('tools.json', { optional: false, fallback: [] });
+const tools = Array.isArray(rawTools) ? rawTools.filter(isPublishedTool) : [];
 const ads = readJson('ads.json', { optional: true, fallback: {} });
 const seoConfig = readJson('seo.json', { optional: true, fallback: null });
+
+const pagesFilePath = path.join(contentSrc, 'pages.json');
+let rawPages = [];
+if (fs.existsSync(pagesFilePath)) {
+  let pagesLstat;
+  try {
+    pagesLstat = fs.lstatSync(pagesFilePath);
+  } catch (err) {
+    console.error(`[postbuild] Failed to inspect content/pages.json: ${err.message}`);
+    process.exit(1);
+  }
+  if (pagesLstat.isSymbolicLink() || !pagesLstat.isFile()) {
+    console.error('[postbuild] Security check failed: content/pages.json must be a regular file (symlinks forbidden)');
+    process.exit(1);
+  }
+  try {
+    rawPages = JSON.parse(fs.readFileSync(pagesFilePath, 'utf-8'));
+  } catch (err) {
+    console.error(`[postbuild] Failed to parse content/pages.json: ${err.message}`);
+    process.exit(1);
+  }
+  const pagesValidation = validatePages(rawPages);
+  if (!pagesValidation.isValid) {
+    console.error('[postbuild] Validation failed for content/pages.json:');
+    for (const err of pagesValidation.errors) {
+      console.error(`  - ${err.field}: ${err.message} (${err.code})`);
+    }
+    process.exit(1);
+  }
+}
+const customPages = rawPages.filter((p) => p && p.isPublished === true);
 
 const allowedArticlesDir = path.resolve(root, 'content', 'articles');
 const canonicalAllowedArticlesDir = fs.existsSync(allowedArticlesDir)
@@ -723,7 +765,7 @@ if (articles.length === 0) {
 }
 const baseUrl = (settings.productionUrl || 'https://ai-novex.netlify.app').replace(/\/+$/, '');
 const defaultOgImage = settings.defaultOgImage || '/images/og-default.png';
-const ctx = { articles, categories };
+const ctx = { articles, categories, tools, pages: customPages };
 const indexable = (p) => isIndexable(p, ctx);
 const today = new Date().toISOString().slice(0, 10);
 
@@ -745,6 +787,11 @@ for (const a of articles) sitemapEntries.push({ loc: `/blog/${a.slug}/`, lastmod
 for (const c of categories) {
   if (!categoryHasContent(c.slug, categories, articles)) continue;
   sitemapEntries.push({ loc: `/category/${c.slug}/`, lastmod: newest(articles.filter((a) => a.category === c.slug)) });
+}
+for (const t of tools) sitemapEntries.push({ loc: `/tools/${t.slug}/` });
+for (const p of customPages) {
+  const lastmod = typeof p.updatedAt === 'string' && /^\d{4}-\d{2}-\d{2}/.test(p.updatedAt) ? p.updatedAt.slice(0, 10) : undefined;
+  sitemapEntries.push({ loc: `/${p.slug}/`, lastmod });
 }
 let sm = `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n`;
 for (const e of sitemapEntries) {
@@ -1001,7 +1048,8 @@ const resolveStaticRouteSeo = (routePath, { wordCount = null, imageSize = null }
       settings: seoSettings,
       articles,
       categories,
-      tools: [],
+      tools,
+      pages: customPages,
       wordCount,
       imageSize,
     });
@@ -1014,7 +1062,8 @@ const resolveStaticRouteSeo = (routePath, { wordCount = null, imageSize = null }
         settings: seoSettings,
         articles,
         categories,
-        tools: [],
+        tools,
+        pages: customPages,
         wordCount,
         imageSize,
       });
@@ -1026,12 +1075,15 @@ const resolveStaticRouteSeo = (routePath, { wordCount = null, imageSize = null }
         articles: [],
         categories: [],
         tools: [],
+        pages: [],
       });
     }
   }
 };
 
+const canonicalDistDir = fs.existsSync(dist) ? fs.realpathSync(dist) : path.resolve(dist);
 const overriddenCanonicalFiles = new Set();
+const writtenOutputPaths = new Set();
 
 function createPageHtml({ seo, path: pagePath, contentHtml, preloadImage = null }) {
   const resolved = seo || resolveStaticRouteSeo(pagePath || '/');
@@ -1062,11 +1114,26 @@ function createPageHtml({ seo, path: pagePath, contentHtml, preloadImage = null 
 }
 
 const writePage = (relPath, pageOutput) => {
+  const normRelPath = String(relPath || '').replace(/\\/g, '/').replace(/^\/+/, '');
+  if (!normRelPath) {
+    console.error('[postbuild] Refusing to write empty output path');
+    process.exit(1);
+  }
+  const full = path.resolve(canonicalDistDir, normRelPath);
+  if (!isInsideAuthorizedDirectory(canonicalDistDir, full)) {
+    console.error(`[postbuild] Security check rejected output path outside dist/: "${normRelPath}"`);
+    process.exit(1);
+  }
+  if (writtenOutputPaths.has(normRelPath)) {
+    console.error(`[postbuild] Duplicate output path detected: "${normRelPath}"`);
+    process.exit(1);
+  }
+  writtenOutputPaths.add(normRelPath);
+
   const html = typeof pageOutput === 'string' ? pageOutput : pageOutput.html;
   if (pageOutput && typeof pageOutput === 'object' && pageOutput.hasCustomCanonical) {
-    overriddenCanonicalFiles.add(relPath);
+    overriddenCanonicalFiles.add(normRelPath);
   }
-  const full = path.join(dist, relPath);
   fs.mkdirSync(path.dirname(full), { recursive: true });
   fs.writeFileSync(full, html);
 };
@@ -1193,6 +1260,87 @@ const toolsPageHtml = createPageHtml({
   contentHtml: toolsContent,
 });
 writePage('tools/index.html', toolsPageHtml);
+
+// ----------------------------------------------------------------------------
+// 2b. Individual Tool Pages (/tools/[slug]/)
+// ----------------------------------------------------------------------------
+for (const t of tools) {
+  if (!isValidToolSlug(t.slug)) continue;
+  const targetRelPath = `tools/${t.slug}/index.html`;
+  const targetAbsPath = path.resolve(canonicalDistDir, targetRelPath);
+  if (!isInsideAuthorizedDirectory(canonicalDistDir, targetAbsPath)) {
+    console.error(`[postbuild] Security check rejected unsafe tool output path: "${t.slug}"`);
+    continue;
+  }
+
+  const toolRoute = `/tools/${t.slug}/`;
+  const toolSeo = resolveStaticRouteSeo(toolRoute);
+  const safeIcon = isSafeAssetOrUrl(t.icon) ? t.icon.trim() : '';
+  const safeUrl = isSafeHttpUrl(t.url) ? t.url.trim() : '';
+  const hasValidRating =
+    typeof t.rating === 'number' && Number.isFinite(t.rating) && t.rating >= 0 && t.rating <= 5;
+  const matchedCat = categories.find((c) => c.slug === t.category) || null;
+  const catLabel =
+    typeof t.categoryName === 'string' && t.categoryName.trim()
+      ? t.categoryName.trim()
+      : matchedCat?.name || '';
+  const pricingLabel = typeof t.pricing === 'string' && t.pricing.trim() ? t.pricing.trim() : '';
+  const osLabel =
+    typeof t.operatingSystem === 'string' && t.operatingSystem.trim()
+      ? t.operatingSystem.trim()
+      : '';
+  const shortDesc = typeof t.description === 'string' ? t.description.trim() : '';
+  const longDesc = typeof t.longDescription === 'string' ? t.longDescription.trim() : '';
+  const primaryOverview = longDesc || shortDesc;
+  const showSubtitle = Boolean(shortDesc && longDesc && shortDesc !== longDesc);
+  const safeFeatures = Array.isArray(t.features)
+    ? t.features.map((f) => (typeof f === 'string' ? f.trim() : '')).filter(Boolean)
+    : [];
+  const safeTags = Array.isArray(t.tags)
+    ? t.tags.map((tag) => (typeof tag === 'string' ? tag.trim() : '')).filter(Boolean)
+    : [];
+  const relatedTools = tools
+    .filter((other) => other.slug !== t.slug && other.category === t.category)
+    .slice(0, 3);
+
+  const toolContent = `
+<div class="max-w-4xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+  ${renderResolvedBreadcrumb(toolSeo)}
+  <div class="mb-4">
+    <a href="/tools/" class="inline-flex items-center gap-1.5 text-xs font-semibold text-blue-600 dark:text-blue-400 hover:underline">&larr; Back to AI Tools Directory</a>
+  </div>
+  <article class="bg-white dark:bg-slate-900/70 border border-slate-200 dark:border-slate-800 rounded-3xl p-6 sm:p-10 shadow-sm mb-10">
+    <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-6 pb-8 border-b border-slate-200 dark:border-slate-800">
+      <div class="flex items-start sm:items-center gap-5">
+        <div class="w-16 h-16 sm:w-20 sm:h-20 rounded-2xl bg-slate-50 dark:bg-slate-800/80 overflow-hidden flex items-center justify-center shrink-0 shadow-sm p-2 border border-slate-200/70 dark:border-slate-700/70">
+          ${safeIcon ? `<img src="${esc(safeIcon)}" alt="${esc(t.name)} Logo" class="w-full h-full object-contain rounded-xl" />` : `<span class="text-2xl font-extrabold text-blue-600 dark:text-blue-400">${esc(t.name.charAt(0).toUpperCase())}</span>`}
+        </div>
+        <div>
+          <div class="flex flex-wrap items-center gap-2 mb-2">
+            ${matchedCat ? `<a href="/category/${esc(matchedCat.slug)}/" class="px-2.5 py-0.5 rounded-full text-xs font-semibold bg-blue-50 text-blue-600 border border-blue-200 dark:bg-blue-950/60 dark:text-blue-400 dark:border-blue-500/30 hover:bg-blue-100 transition-colors">${esc(catLabel || matchedCat.name)}</a>` : catLabel ? `<span class="px-2.5 py-0.5 rounded-full text-xs font-semibold bg-blue-50 text-blue-600 border border-blue-200 dark:bg-blue-950/60 dark:text-blue-400 dark:border-blue-500/30">${esc(catLabel)}</span>` : ''}
+            ${pricingLabel ? `<span class="px-2.5 py-0.5 rounded-full text-xs font-semibold bg-emerald-50 text-emerald-700 border border-emerald-200 dark:bg-emerald-950/50 dark:text-emerald-400 dark:border-emerald-500/30">${esc(pricingLabel)}</span>` : ''}
+            ${hasValidRating ? `<span class="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-semibold bg-amber-50 text-amber-700 border border-amber-200 dark:bg-amber-950/40 dark:text-amber-400 dark:border-amber-500/30">&#9733; ${esc(t.rating)}</span>` : ''}
+            ${osLabel ? `<span class="px-2.5 py-0.5 rounded-full text-xs font-medium bg-slate-100 text-slate-700 border border-slate-200 dark:bg-slate-800 dark:text-slate-300 dark:border-slate-700">${esc(osLabel)}</span>` : ''}
+          </div>
+          <h1 class="text-2xl sm:text-4xl font-extrabold text-slate-900 dark:text-white tracking-tight">${esc(t.name)}</h1>
+          ${showSubtitle ? `<p class="text-sm sm:text-base text-slate-600 dark:text-slate-300 mt-2 leading-relaxed">${esc(shortDesc)}</p>` : ''}
+        </div>
+      </div>
+      ${safeUrl ? `<div class="shrink-0"><a href="${esc(safeUrl)}" target="_blank" rel="nofollow noopener noreferrer" class="w-full sm:w-auto inline-flex items-center justify-center gap-2 px-6 py-3 rounded-xl text-sm font-semibold text-white bg-blue-600 hover:bg-blue-500 shadow-md shadow-blue-600/30 transition-all">Visit Official Website &rarr;</a></div>` : ''}
+    </div>
+    ${primaryOverview ? `<section class="py-6 border-b border-slate-200 dark:border-slate-800/80"><h2 class="text-lg font-bold text-slate-900 dark:text-white mb-2">Overview</h2><p class="text-sm sm:text-base text-slate-700 dark:text-slate-300 leading-relaxed">${esc(primaryOverview)}</p></section>` : ''}
+    ${safeFeatures.length ? `<section class="py-6 border-b border-slate-200 dark:border-slate-800/80"><h2 class="text-lg font-bold text-slate-900 dark:text-white mb-3">Key Features</h2><ul class="grid grid-cols-1 sm:grid-cols-2 gap-2.5">${safeFeatures.map((f) => `<li class="text-sm text-slate-700 dark:text-slate-300">${esc(f)}</li>`).join('')}</ul></section>` : ''}
+    ${safeTags.length ? `<section class="pt-6 flex items-center flex-wrap gap-2">${safeTags.map((tag) => `<span class="px-3 py-1 rounded-full text-xs font-medium bg-slate-100 text-slate-700 border border-slate-200 dark:bg-slate-800/80 dark:text-slate-300 dark:border-slate-700/50">${esc(tag)}</span>`).join('')}</section>` : ''}
+  </article>
+  ${relatedTools.length ? `<section class="pt-2"><div class="flex items-center justify-between mb-5"><h2 class="text-xl font-bold text-slate-900 dark:text-white">Related Tools${catLabel ? ` in ${esc(catLabel)}` : ''}</h2><a href="/tools/" class="text-xs sm:text-sm font-semibold text-blue-600 dark:text-blue-400 hover:underline">All Tools &rarr;</a></div><div class="grid grid-cols-1 sm:grid-cols-3 gap-5">${relatedTools.map((rel) => `<a href="/tools/${esc(rel.slug)}/" class="p-5 rounded-2xl bg-white dark:bg-slate-900/60 border border-slate-200 dark:border-slate-800 hover:border-blue-500/40 shadow-sm block"><h3 class="text-base font-bold text-slate-900 dark:text-white mb-1">${esc(rel.name)}</h3>${rel.description ? `<p class="text-xs text-slate-600 dark:text-slate-400 line-clamp-2 mb-3">${esc(rel.description)}</p>` : ''}<span class="text-xs font-semibold text-blue-600 dark:text-blue-400">View Profile &rarr;</span></a>`).join('')}</div></section>` : ''}
+</div>`;
+
+  writePage(targetRelPath, createPageHtml({
+    seo: toolSeo,
+    path: toolRoute,
+    contentHtml: toolContent,
+  }));
+}
 
 // ----------------------------------------------------------------------------
 // 3. Blog Archive (/blog/)
@@ -1736,6 +1884,42 @@ writePage('affiliate-disclosure/index.html', createPageHtml({
 }));
 
 // ----------------------------------------------------------------------------
+// 7b. Custom Static Pages (/[slug]/)
+// ----------------------------------------------------------------------------
+for (const page of customPages) {
+  if (!isValidCustomPageSlug(page.slug) || isReservedPageSlug(page.slug)) {
+    console.error(`[postbuild] Security check rejected custom page slug: "${page.slug}"`);
+    process.exit(1);
+  }
+  const targetRelPath = `${page.slug}/index.html`;
+  const targetAbsPath = path.resolve(canonicalDistDir, targetRelPath);
+  if (!isInsideAuthorizedDirectory(canonicalDistDir, targetAbsPath)) {
+    console.error(`[postbuild] Security check rejected unsafe custom page output path: "${page.slug}"`);
+    process.exit(1);
+  }
+
+  const pageRoute = `/${page.slug}/`;
+  const pageSeo = resolveStaticRouteSeo(pageRoute);
+  const bodyHtml = renderMarkdown(page.content);
+  const pageContent = `
+<article class="max-w-4xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+  ${renderResolvedBreadcrumb(pageSeo)}
+  <header class="py-6 border-b border-slate-200 dark:border-slate-800/80 mb-8">
+    <h1 class="text-3xl sm:text-4xl font-extrabold text-slate-900 dark:text-white tracking-tight">${esc(page.title)}</h1>
+  </header>
+  <div id="custom-page-content-body" class="article-content mb-12">
+    ${bodyHtml}
+  </div>
+</article>`;
+
+  writePage(targetRelPath, createPageHtml({
+    seo: pageSeo,
+    path: pageRoute,
+    contentHtml: pageContent,
+  }));
+}
+
+// ----------------------------------------------------------------------------
 // 8. 404 Error Page
 // ----------------------------------------------------------------------------
 const notFoundContent = `
@@ -1759,7 +1943,7 @@ const notFoundHtml = createPageHtml({
 writePage('404.html', notFoundHtml);
 
 console.log(`[postbuild] Pre-rendered all 22+ static HTML routes with rich semantic markup, headings, links, and schema!`);
-console.log(`[postbuild] ${articles.length} articles, ${categories.length} categories, ${tools.length} tools exported.`);
+console.log(`[postbuild] ${articles.length} articles, ${categories.length} categories, ${tools.length} tools, ${customPages.length} custom pages exported.`);
 
 // ----------------------------------------------------------------------------
 // URL Consistency Guard: Validate dist/**/*.html and sitemap.xml

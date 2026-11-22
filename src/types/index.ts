@@ -40,6 +40,12 @@ export interface Tool {
   icon: string;
   iconBg?: string;
   brandInitial?: string;
+  /** Optional publication status; omitted implies published, false marks unpublished. */
+  isPublished?: boolean;
+  /** Optional feature list if provided in tool data. */
+  features?: string[];
+  /** Optional operating system / platform list if provided in tool data. */
+  operatingSystem?: string;
   /** Optional finite rating between 0 and 5. */
   rating?: number;
 }
@@ -73,3 +79,14 @@ export interface SiteSettings {
   monetizationNotice: string;
   footerCopyright: string;
 }
+
+export interface CustomPage {
+  id: string;
+  slug: string;
+  title: string;
+  content: string;
+  isPublished: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+

@@ -52,6 +52,13 @@ import {
   validateSeoPageRecord,
   validateSeoConfig,
   resolveEffectiveSeo,
+  ALLOWED_CUSTOM_PAGE_FIELDS,
+  FORBIDDEN_CUSTOM_PAGE_SEO_FIELDS,
+  isReservedPageSlug,
+  isValidCustomPageId,
+  isValidCustomPageSlug,
+  validateCustomPage,
+  validatePages,
 } from './lib/validators.mjs';
 
 const HOST = '127.0.0.1';
@@ -2899,6 +2906,187 @@ function buildUpdatedSeoPage(existingPage, rawPage, serverNow = new Date().toISO
   updated.createdAt = safeExisting.createdAt;
   updated.updatedAt = ensureMonotonicIsoTimestamp(safeExisting.createdAt, serverNow);
   return updated;
+}
+
+// ----------------------------------------------------------------------------
+// Custom Static Pages Helpers (Task 114-H0)
+// ----------------------------------------------------------------------------
+
+const CUSTOM_PAGE_ROUTE_PREFIX = '/api/cms/pages/';
+const ALLOWED_CUSTOM_PAGE_FIELD_SET = new Set(ALLOWED_CUSTOM_PAGE_FIELDS);
+const FORBIDDEN_CUSTOM_PAGE_SEO_SET = new Set(FORBIDDEN_CUSTOM_PAGE_SEO_FIELDS);
+const CUSTOM_PAGE_UPDATABLE_FIELDS = ['slug', 'title', 'content', 'isPublished'];
+
+/**
+ * Safe id-aware path parser for Custom Static Page CMS routes (/api/cms/pages/:id).
+ * Mirrors parseSeoPagePath() and parseToolPath() strict raw-path validation.
+ */
+function parseCustomPagePath(input, options = {}) {
+  const prefix =
+    options && typeof options.prefix === 'string' && options.prefix.startsWith('/')
+      ? options.prefix
+      : CUSTOM_PAGE_ROUTE_PREFIX;
+
+  const makeNotFound = (rawPath = '/', rawId = null, error = 'Route not found') => ({
+    matched: false,
+    valid: false,
+    invalid: false,
+    status: 'not_found',
+    statusCode: 404,
+    id: null,
+    rawId,
+    rawPath,
+    error,
+  });
+
+  const makeInvalid = (rawPath, rawId, error) => ({
+    matched: true,
+    valid: false,
+    invalid: true,
+    status: 'invalid',
+    statusCode: 400,
+    id: null,
+    rawId,
+    rawPath,
+    error,
+  });
+
+  try {
+    let rawUrl = null;
+    if (typeof input === 'string') {
+      rawUrl = input;
+    } else if (input && typeof input === 'object' && !Array.isArray(input)) {
+      if (typeof input.rawRequestPath === 'string') {
+        rawUrl = input.rawRequestPath;
+      } else if (typeof input.url === 'string') {
+        rawUrl = input.url;
+      }
+    }
+
+    if (!rawUrl || typeof rawUrl !== 'string') {
+      return makeNotFound('/');
+    }
+
+    const rawPath = extractRawRequestPath(rawUrl);
+
+    if (!rawPath.startsWith(prefix)) {
+      return makeNotFound(rawPath);
+    }
+
+    const rawIdPart = rawPath.slice(prefix.length);
+
+    if (!rawIdPart || rawIdPart.includes('/')) {
+      return makeNotFound(rawPath, rawIdPart || null);
+    }
+
+    if (
+      /%2f/i.test(rawIdPart) ||
+      /%5c/i.test(rawIdPart) ||
+      rawIdPart.includes('\\') ||
+      rawIdPart.includes('..') ||
+      /%2e/i.test(rawIdPart) ||
+      rawIdPart.includes('\0') ||
+      /%00/i.test(rawIdPart) ||
+      /%25/i.test(rawIdPart) ||
+      /%(?![0-9a-fA-F]{2})/.test(rawIdPart)
+    ) {
+      return makeInvalid(rawPath, rawIdPart, 'Malformed or forbidden custom page id');
+    }
+
+    let decodedId;
+    try {
+      decodedId = decodeURIComponent(rawIdPart);
+    } catch {
+      return makeInvalid(rawPath, rawIdPart, 'Malformed percent encoding in custom page id');
+    }
+
+    if (
+      decodedId.includes('/') ||
+      decodedId.includes('\\') ||
+      decodedId.includes('..') ||
+      decodedId.includes('\0') ||
+      decodedId.includes('%') ||
+      !isValidCustomPageId(decodedId)
+    ) {
+      return makeInvalid(
+        rawPath,
+        rawIdPart,
+        'Invalid custom page id: must be 1-128 lowercase alphanumeric characters, hyphens, or underscores starting with alphanumeric'
+      );
+    }
+
+    return {
+      matched: true,
+      valid: true,
+      invalid: false,
+      status: 'valid',
+      statusCode: 200,
+      id: decodedId,
+      rawId: rawIdPart,
+      rawPath,
+      error: null,
+    };
+  } catch {
+    return makeNotFound('/');
+  }
+}
+
+function sanitizeCustomPageForResponse(page) {
+  if (!isPlainJsonObject(page)) {
+    return {};
+  }
+  const clean = {};
+  for (const field of ALLOWED_CUSTOM_PAGE_FIELDS) {
+    if (Object.prototype.hasOwnProperty.call(page, field) && page[field] !== undefined) {
+      clean[field] = clonePlainJsonData(page[field]);
+    }
+  }
+  return clean;
+}
+
+function computeCustomPageETag(page) {
+  if (!isPlainJsonObject(page)) {
+    throw new TypeError('Custom page record must be a non-null object');
+  }
+  const clean = canonicalizeMetadata(sanitizeCustomPageForResponse(page));
+  return generateETag(JSON.stringify({ kind: 'custom-page-v1', page: clean }));
+}
+
+const computeCustomPageEtag = computeCustomPageETag;
+
+function buildCreatedCustomPage(generatedId, rawPage, serverNow = new Date().toISOString()) {
+  const safeRaw = isPlainJsonObject(rawPage) ? rawPage : {};
+  const ts = ensureMonotonicIsoTimestamp(null, serverNow);
+  return {
+    id: generatedId,
+    slug: safeRaw.slug,
+    title: typeof safeRaw.title === 'string' ? safeRaw.title.trim() : safeRaw.title,
+    content: safeRaw.content,
+    isPublished: false,
+    createdAt: ts,
+    updatedAt: ts,
+  };
+}
+
+function buildUpdatedCustomPage(existingPage, rawPage, serverNow = new Date().toISOString()) {
+  const safeExisting = isPlainJsonObject(existingPage) ? existingPage : {};
+  const safeRaw = isPlainJsonObject(rawPage) ? rawPage : {};
+  const hasSupplied = (field) =>
+    Object.prototype.hasOwnProperty.call(safeRaw, field) && safeRaw[field] !== undefined;
+
+  return {
+    id: safeExisting.id,
+    slug: hasSupplied('slug') ? safeRaw.slug : safeExisting.slug,
+    title: hasSupplied('title')
+      ? typeof safeRaw.title === 'string'
+        ? safeRaw.title.trim()
+        : safeRaw.title
+      : safeExisting.title,
+    content: hasSupplied('content') ? safeRaw.content : safeExisting.content,
+    isPublished: hasSupplied('isPublished') ? safeRaw.isPublished : safeExisting.isPublished,
+    createdAt: safeExisting.createdAt,
+    updatedAt: ensureMonotonicIsoTimestamp(safeExisting.createdAt, serverNow),
+  };
 }
 
 const server = http.createServer(async (req, res) => {
@@ -8894,6 +9082,859 @@ const server = http.createServer(async (req, res) => {
       );
     }
 
+    // ------------------------------------------------------------------------
+    // 8. Custom Static Pages CRUD API (Task 114-H0)
+    // ------------------------------------------------------------------------
+
+    // 8a. GET /api/cms/pages - List custom static page records
+    if (req.method === 'GET' && pathname === '/api/cms/pages') {
+      const session = requireAuth(req, res);
+      if (!session) return;
+
+      for (const qKey of url.searchParams.keys()) {
+        return sendBadRequest(res, `Unsupported query parameter: "${qKey}"`);
+      }
+
+      try {
+        let lockedPages = null;
+
+        await executeTransaction(
+          [{ type: 'readJson', fileName: 'pages.json' }],
+          {
+            precondition: async (snapshotAccessor) => {
+              const pagesSnap = snapshotAccessor.get('pages.json');
+              if (!pagesSnap || !pagesSnap.existed) {
+                const err = new Error('Custom pages store is missing or unavailable');
+                err.code = 'STORE_INTEGRITY_UNAVAILABLE';
+                throw err;
+              }
+              const pages = snapshotAccessor.getJson('pages.json');
+              const valResult = validatePages(pages);
+              if (!valResult.isValid) {
+                const err = new Error('Custom pages store failed schema validation');
+                err.code = 'STORE_INTEGRITY_UNAVAILABLE';
+                throw err;
+              }
+              lockedPages = pages.map((p) => sanitizeCustomPageForResponse(p));
+            },
+          }
+        );
+
+        if (!Array.isArray(lockedPages)) {
+          return sendInternalError(res, 'Custom pages store is unavailable');
+        }
+
+        res.writeHead(200, {
+          'Content-Type': 'application/json; charset=utf-8',
+          'Cache-Control': 'no-store',
+          'X-Content-Type-Options': 'nosniff',
+        });
+        return res.end(
+          JSON.stringify({
+            success: true,
+            pages: lockedPages,
+            total: lockedPages.length,
+          })
+        );
+      } catch (err) {
+        console.error('[CMS Server] Failed to list custom pages:', err?.code || 'STORE_READ_ERROR');
+        return sendInternalError(res, 'Custom pages store is unavailable');
+      }
+    }
+
+    // 8b. POST /api/cms/pages - Create a new unpublished custom static page
+    if (req.method === 'POST' && rawRequestPath === '/api/cms/pages') {
+      const session = requireAuth(req, res);
+      if (!session) {
+        req.resume();
+        return;
+      }
+
+      if (!requireCsrf(req, res, session)) {
+        req.resume();
+        return;
+      }
+
+      const contentType = req.headers['content-type'];
+      const mediaType =
+        typeof contentType === 'string' ? contentType.split(';')[0].trim().toLowerCase() : '';
+      if (mediaType !== 'application/json') {
+        req.resume();
+        res.writeHead(415, {
+          'Content-Type': 'application/json; charset=utf-8',
+          'Cache-Control': 'no-store',
+          'X-Content-Type-Options': 'nosniff',
+        });
+        return res.end(
+          JSON.stringify({
+            error: 'Unsupported Media Type',
+            message: 'Content-Type must be application/json',
+          })
+        );
+      }
+
+      const bodyResult = await parseJsonBody(req, res, MAX_CONTENT_BODY);
+      if (!bodyResult.ok) return;
+
+      const body = bodyResult.data;
+
+      const protoKey = findPrototypePollutionKey(body);
+      if (protoKey) {
+        return sendBadRequest(res, `Forbidden prototype pollution key: "${protoKey}"`);
+      }
+
+      if (!isPlainJsonObject(body)) {
+        return sendBadRequest(res, 'Request body must be a JSON object');
+      }
+
+      for (const key of Object.getOwnPropertyNames(body)) {
+        if (key !== 'page') {
+          return sendBadRequest(res, `Unknown or forbidden field in request body: "${key}"`);
+        }
+      }
+
+      if (!Object.prototype.hasOwnProperty.call(body, 'page')) {
+        return sendBadRequest(res, 'Missing required field: "page"');
+      }
+
+      const rawPage = body.page;
+      const inputCheck = validateCustomPage(rawPage, { isCmsInput: true, isCreate: true });
+      if (!inputCheck.isValid) {
+        const detail = (inputCheck.errors || []).map((e) => e.message).join('; ');
+        return sendBadRequest(res, detail || 'Invalid custom page payload');
+      }
+
+      const generatedId = crypto.randomUUID();
+      let savedPage = null;
+      const testFailureIndex = getTestFailureIndex(req);
+
+      try {
+        await executeTransaction(
+          [
+            {
+              type: 'writeJson',
+              fileName: 'pages.json',
+              data: (existingPages) => {
+                if (!Array.isArray(existingPages)) {
+                  const err = new Error('Custom pages store is invalid');
+                  err.code = 'STORE_INTEGRITY_UNAVAILABLE';
+                  throw err;
+                }
+                const existingVal = validatePages(existingPages);
+                if (!existingVal.isValid) {
+                  const err = new Error('Custom pages store failed schema validation');
+                  err.code = 'STORE_INTEGRITY_UNAVAILABLE';
+                  throw err;
+                }
+
+                if (existingPages.some((p) => p && p.slug === rawPage.slug)) {
+                  const err = new Error(`Custom page with slug "${rawPage.slug}" already exists`);
+                  err.code = 'PAGE_CONFLICT';
+                  throw err;
+                }
+                if (existingPages.some((p) => p && p.id === generatedId)) {
+                  const err = new Error('Custom page identifier collision occurred; please retry');
+                  err.code = 'PAGE_CONFLICT';
+                  throw err;
+                }
+
+                const createdPage = buildCreatedCustomPage(
+                  generatedId,
+                  rawPage,
+                  new Date().toISOString()
+                );
+
+                const singleVal = validateCustomPage(createdPage, {
+                  isCmsInput: false,
+                  isCreate: false,
+                });
+                if (!singleVal.isValid) {
+                  const detail = (singleVal.errors || []).map((e) => e.message).join('; ');
+                  const err = new Error(detail || 'Custom page validation failed');
+                  err.code = 'SCHEMA_VALIDATION_FAILED';
+                  throw err;
+                }
+
+                const nextPages = [...existingPages, createdPage];
+                const arrayVal = validatePages(nextPages);
+                if (!arrayVal.isValid) {
+                  const detail = (arrayVal.errors || []).map((e) => e.message).join('; ');
+                  const err = new Error(detail || 'Custom pages validation failed');
+                  err.code = 'SCHEMA_VALIDATION_FAILED';
+                  throw err;
+                }
+
+                savedPage = createdPage;
+                return nextPages;
+              },
+            },
+          ],
+          {
+            ...(testFailureIndex >= 0 ? { _simulateMutationFailureAtIndex: testFailureIndex } : {}),
+            precondition: async (snapshotAccessor) => {
+              const pagesSnap = snapshotAccessor.get('pages.json');
+              if (!pagesSnap || !pagesSnap.existed) {
+                const err = new Error('Custom pages store is missing or unavailable');
+                err.code = 'STORE_INTEGRITY_UNAVAILABLE';
+                throw err;
+              }
+              const existingPages = snapshotAccessor.getJson('pages.json');
+              if (!Array.isArray(existingPages)) {
+                const err = new Error('Custom pages store is invalid');
+                err.code = 'STORE_INTEGRITY_UNAVAILABLE';
+                throw err;
+              }
+              const existingVal = validatePages(existingPages);
+              if (!existingVal.isValid) {
+                const err = new Error('Custom pages store failed schema validation');
+                err.code = 'STORE_INTEGRITY_UNAVAILABLE';
+                throw err;
+              }
+
+              if (existingPages.some((p) => p && p.slug === rawPage.slug)) {
+                const err = new Error(`Custom page with slug "${rawPage.slug}" already exists`);
+                err.code = 'PAGE_CONFLICT';
+                throw err;
+              }
+              if (existingPages.some((p) => p && p.id === generatedId)) {
+                const err = new Error('Custom page identifier collision occurred; please retry');
+                err.code = 'PAGE_CONFLICT';
+                throw err;
+              }
+
+              const candidatePage = buildCreatedCustomPage(
+                generatedId,
+                rawPage,
+                new Date().toISOString()
+              );
+              const singleVal = validateCustomPage(candidatePage, {
+                isCmsInput: false,
+                isCreate: false,
+              });
+              if (!singleVal.isValid) {
+                const detail = (singleVal.errors || []).map((e) => e.message).join('; ');
+                const err = new Error(detail || 'Custom page validation failed');
+                err.code = 'SCHEMA_VALIDATION_FAILED';
+                throw err;
+              }
+              const arrayVal = validatePages([...existingPages, candidatePage]);
+              if (!arrayVal.isValid) {
+                const detail = (arrayVal.errors || []).map((e) => e.message).join('; ');
+                const err = new Error(detail || 'Custom pages validation failed');
+                err.code = 'SCHEMA_VALIDATION_FAILED';
+                throw err;
+              }
+            },
+          }
+        );
+      } catch (err) {
+        const code = err.code || err.originalError?.code;
+        const detailMessage = sanitizeErrorMessage(
+          err?.originalError?.message || err?.message || 'Custom page validation failed'
+        );
+        if (code === 'PAGE_CONFLICT') {
+          return sendConflict(res, detailMessage);
+        }
+        if (code === 'SCHEMA_VALIDATION_FAILED' || code === 'PATH_VALIDATION_FAILED') {
+          return sendBadRequest(res, detailMessage);
+        }
+        console.error('[CMS Server] Failed to create custom page:', err?.code || 'STORE_WRITE_ERROR');
+        return sendInternalError(res, 'Failed to create custom page');
+      }
+
+      if (!savedPage) {
+        return sendInternalError(res, 'Failed to create custom page');
+      }
+
+      const sanitizedPage = sanitizeCustomPageForResponse(savedPage);
+      const newETag = computeCustomPageETag(savedPage);
+
+      res.writeHead(201, {
+        'Content-Type': 'application/json; charset=utf-8',
+        'Cache-Control': 'no-store',
+        'X-Content-Type-Options': 'nosniff',
+        Location: `/api/cms/pages/${savedPage.id}`,
+        ETag: newETag,
+      });
+      return res.end(
+        JSON.stringify({
+          success: true,
+          page: sanitizedPage,
+        })
+      );
+    }
+
+    // 8c. GET /api/cms/pages/:id - Retrieve a single custom static page with Strong ETag
+    if (req.method === 'GET' && rawRequestPath.startsWith(CUSTOM_PAGE_ROUTE_PREFIX)) {
+      const session = requireAuth(req, res);
+      if (!session) return;
+
+      const pathResult = parseCustomPagePath({ rawRequestPath, url: req.url });
+      if (!pathResult.matched) {
+        return sendNotFound(res);
+      }
+      if (!pathResult.valid || pathResult.invalid || !pathResult.id) {
+        return sendBadRequest(res, pathResult.error || 'Malformed or forbidden custom page id');
+      }
+
+      const pageId = pathResult.id;
+
+      try {
+        let targetPage = null;
+
+        await executeTransaction(
+          [{ type: 'readJson', fileName: 'pages.json' }],
+          {
+            precondition: async (snapshotAccessor) => {
+              const pagesSnap = snapshotAccessor.get('pages.json');
+              if (!pagesSnap || !pagesSnap.existed) {
+                const err = new Error('Custom pages store is missing or unavailable');
+                err.code = 'STORE_INTEGRITY_UNAVAILABLE';
+                throw err;
+              }
+              const pages = snapshotAccessor.getJson('pages.json');
+              const valResult = validatePages(pages);
+              if (!valResult.isValid) {
+                const err = new Error('Custom pages store failed schema validation');
+                err.code = 'STORE_INTEGRITY_UNAVAILABLE';
+                throw err;
+              }
+
+              const found = pages.find((p) => p && p.id === pageId);
+              if (!found) {
+                const err = new Error('Custom page not found');
+                err.code = 'PAGE_NOT_FOUND';
+                throw err;
+              }
+
+              targetPage = sanitizeCustomPageForResponse(found);
+            },
+          }
+        );
+
+        if (!targetPage) {
+          return sendInternalError(res, 'Custom pages store is unavailable');
+        }
+
+        const etag = computeCustomPageETag(targetPage);
+
+        res.writeHead(200, {
+          'Content-Type': 'application/json; charset=utf-8',
+          'Cache-Control': 'no-store',
+          'X-Content-Type-Options': 'nosniff',
+          ETag: etag,
+        });
+        return res.end(
+          JSON.stringify({
+            success: true,
+            page: targetPage,
+          })
+        );
+      } catch (err) {
+        const code = err?.code || err?.originalError?.code;
+        if (code === 'PAGE_NOT_FOUND') {
+          return sendNotFound(res, 'Custom page not found');
+        }
+        console.error('[CMS Server] Failed to read custom page:', err?.code || 'STORE_READ_ERROR');
+        return sendInternalError(res, 'Custom pages store is unavailable');
+      }
+    }
+
+    // 8d. PUT /api/cms/pages/:id - Update an existing custom static page with If-Match
+    if (req.method === 'PUT' && rawRequestPath.startsWith(CUSTOM_PAGE_ROUTE_PREFIX)) {
+      const session = requireAuth(req, res);
+      if (!session) {
+        req.resume();
+        return;
+      }
+
+      if (!requireCsrf(req, res, session)) {
+        req.resume();
+        return;
+      }
+
+      const pathResult = parseCustomPagePath({ rawRequestPath, url: req.url });
+      if (!pathResult.matched) {
+        req.resume();
+        return sendNotFound(res);
+      }
+      if (!pathResult.valid || pathResult.invalid || !pathResult.id) {
+        req.resume();
+        return sendBadRequest(res, pathResult.error || 'Malformed or forbidden custom page id');
+      }
+
+      const pageId = pathResult.id;
+
+      const contentType = req.headers['content-type'];
+      const mediaType =
+        typeof contentType === 'string' ? contentType.split(';')[0].trim().toLowerCase() : '';
+      if (mediaType !== 'application/json') {
+        req.resume();
+        res.writeHead(415, {
+          'Content-Type': 'application/json; charset=utf-8',
+          'Cache-Control': 'no-store',
+          'X-Content-Type-Options': 'nosniff',
+        });
+        return res.end(
+          JSON.stringify({
+            error: 'Unsupported Media Type',
+            message: 'Content-Type must be application/json',
+          })
+        );
+      }
+
+      const bodyResult = await parseJsonBody(req, res, MAX_CONTENT_BODY);
+      if (!bodyResult.ok) return;
+
+      const body = bodyResult.data;
+
+      const ifMatch = parseIfMatch(req);
+      if (ifMatch.status === 'missing') {
+        return sendPreconditionRequired(res, ifMatch.error || 'If-Match header is required');
+      }
+      if (ifMatch.status === 'invalid') {
+        return sendBadRequest(res, ifMatch.error || 'Invalid If-Match header');
+      }
+
+      const protoKey = findPrototypePollutionKey(body);
+      if (protoKey) {
+        return sendBadRequest(res, `Forbidden prototype pollution key: "${protoKey}"`);
+      }
+
+      if (!isPlainJsonObject(body)) {
+        return sendBadRequest(res, 'Request body must be a JSON object');
+      }
+
+      for (const key of Object.getOwnPropertyNames(body)) {
+        if (key !== 'page') {
+          return sendBadRequest(res, `Unknown or forbidden field in request body: "${key}"`);
+        }
+      }
+
+      if (!Object.prototype.hasOwnProperty.call(body, 'page')) {
+        return sendBadRequest(res, 'Missing required field: "page"');
+      }
+
+      const rawPage = body.page;
+      if (!isPlainJsonObject(rawPage)) {
+        return sendBadRequest(res, '"page" must be a JSON object');
+      }
+
+      const suppliedKeys = Object.getOwnPropertyNames(rawPage);
+      for (const key of suppliedKeys) {
+        if (PROTO_POLLUTION_KEYS.has(key)) {
+          return sendBadRequest(res, `Forbidden prototype pollution key: "${key}"`);
+        }
+        if (key === 'createdAt' || key === 'updatedAt') {
+          return sendBadRequest(
+            res,
+            `${key} is server-generated and immutable; it cannot be provided in CMS update input`
+          );
+        }
+        if (FORBIDDEN_CUSTOM_PAGE_SEO_SET.has(key)) {
+          return sendBadRequest(
+            res,
+            `SEO field "${key}" is not allowed on custom page records; SEO is managed in content/seo.json`
+          );
+        }
+        if (!ALLOWED_CUSTOM_PAGE_FIELD_SET.has(key)) {
+          return sendBadRequest(res, `Unknown custom page field: "${key}"`);
+        }
+      }
+
+      if (
+        Object.prototype.hasOwnProperty.call(rawPage, 'id') &&
+        rawPage.id !== undefined &&
+        rawPage.id !== pageId
+      ) {
+        return sendBadRequest(res, 'Page id is immutable and cannot be changed');
+      }
+
+      const hasUpdateField = CUSTOM_PAGE_UPDATABLE_FIELDS.some(
+        (field) => Object.prototype.hasOwnProperty.call(rawPage, field) && rawPage[field] !== undefined
+      );
+      if (!hasUpdateField) {
+        return sendBadRequest(
+          res,
+          'At least one updatable custom page field (slug, title, content, or isPublished) is required'
+        );
+      }
+
+      let savedPage = null;
+      const testFailureIndex = getTestFailureIndex(req);
+
+      try {
+        await executeTransaction(
+          [
+            {
+              type: 'writeJson',
+              fileName: 'pages.json',
+              data: (existingPages) => {
+                if (!Array.isArray(existingPages)) {
+                  const err = new Error('Custom pages store is invalid');
+                  err.code = 'STORE_INTEGRITY_UNAVAILABLE';
+                  throw err;
+                }
+                const existingVal = validatePages(existingPages);
+                if (!existingVal.isValid) {
+                  const err = new Error('Custom pages store failed schema validation');
+                  err.code = 'STORE_INTEGRITY_UNAVAILABLE';
+                  throw err;
+                }
+
+                const targetIndex = existingPages.findIndex((p) => p && p.id === pageId);
+                if (targetIndex === -1) {
+                  const err = new Error('Custom page not found');
+                  err.code = 'PAGE_NOT_FOUND';
+                  throw err;
+                }
+
+                const existingPage = existingPages[targetIndex];
+                if (
+                  Object.prototype.hasOwnProperty.call(rawPage, 'id') &&
+                  rawPage.id !== undefined &&
+                  rawPage.id !== existingPage.id
+                ) {
+                  const err = new Error('Page id is immutable and cannot be changed');
+                  err.code = 'IMMUTABLE_FIELD_MISMATCH';
+                  throw err;
+                }
+
+                const currentETag = computeCustomPageETag(existingPage);
+                if (currentETag !== ifMatch.etag) {
+                  const err = new Error('If-Match ETag precondition failed');
+                  err.code = 'PRECONDITION_FAILED';
+                  throw err;
+                }
+
+                const updatedPage = buildUpdatedCustomPage(
+                  existingPage,
+                  rawPage,
+                  new Date().toISOString()
+                );
+
+                const pageVal = validateCustomPage(updatedPage, {
+                  isCmsInput: false,
+                  isCreate: false,
+                });
+                if (!pageVal.isValid) {
+                  const detail = (pageVal.errors || []).map((e) => e.message).join('; ');
+                  const err = new Error(detail || 'Custom page validation failed');
+                  err.code = 'SCHEMA_VALIDATION_FAILED';
+                  throw err;
+                }
+
+                if (
+                  existingPages.some(
+                    (p, idx) => idx !== targetIndex && p && p.slug === updatedPage.slug
+                  )
+                ) {
+                  const err = new Error(
+                    `Custom page with slug "${updatedPage.slug}" already exists`
+                  );
+                  err.code = 'PAGE_CONFLICT';
+                  throw err;
+                }
+
+                const nextPages = [...existingPages];
+                nextPages[targetIndex] = updatedPage;
+
+                const arrayVal = validatePages(nextPages);
+                if (!arrayVal.isValid) {
+                  const detail = (arrayVal.errors || []).map((e) => e.message).join('; ');
+                  const err = new Error(detail || 'Custom pages validation failed');
+                  err.code = 'SCHEMA_VALIDATION_FAILED';
+                  throw err;
+                }
+
+                savedPage = updatedPage;
+                return nextPages;
+              },
+            },
+          ],
+          {
+            ...(testFailureIndex >= 0 ? { _simulateMutationFailureAtIndex: testFailureIndex } : {}),
+            precondition: async (snapshotAccessor) => {
+              const pagesSnap = snapshotAccessor.get('pages.json');
+              if (!pagesSnap || !pagesSnap.existed) {
+                const err = new Error('Custom pages store is missing or unavailable');
+                err.code = 'STORE_INTEGRITY_UNAVAILABLE';
+                throw err;
+              }
+              const existingPages = snapshotAccessor.getJson('pages.json');
+              if (!Array.isArray(existingPages)) {
+                const err = new Error('Custom pages store is invalid');
+                err.code = 'STORE_INTEGRITY_UNAVAILABLE';
+                throw err;
+              }
+              const existingVal = validatePages(existingPages);
+              if (!existingVal.isValid) {
+                const err = new Error('Custom pages store failed schema validation');
+                err.code = 'STORE_INTEGRITY_UNAVAILABLE';
+                throw err;
+              }
+
+              const targetIndex = existingPages.findIndex((p) => p && p.id === pageId);
+              if (targetIndex === -1) {
+                const err = new Error('Custom page not found');
+                err.code = 'PAGE_NOT_FOUND';
+                throw err;
+              }
+
+              const existingPage = existingPages[targetIndex];
+              if (
+                Object.prototype.hasOwnProperty.call(rawPage, 'id') &&
+                rawPage.id !== undefined &&
+                rawPage.id !== existingPage.id
+              ) {
+                const err = new Error('Page id is immutable and cannot be changed');
+                err.code = 'IMMUTABLE_FIELD_MISMATCH';
+                throw err;
+              }
+
+              const currentETag = computeCustomPageETag(existingPage);
+              if (currentETag !== ifMatch.etag) {
+                const err = new Error('If-Match ETag precondition failed');
+                err.code = 'PRECONDITION_FAILED';
+                throw err;
+              }
+
+              const candidatePage = buildUpdatedCustomPage(
+                existingPage,
+                rawPage,
+                new Date().toISOString()
+              );
+              const pageVal = validateCustomPage(candidatePage, {
+                isCmsInput: false,
+                isCreate: false,
+              });
+              if (!pageVal.isValid) {
+                const detail = (pageVal.errors || []).map((e) => e.message).join('; ');
+                const err = new Error(detail || 'Custom page validation failed');
+                err.code = 'SCHEMA_VALIDATION_FAILED';
+                throw err;
+              }
+
+              if (
+                existingPages.some(
+                  (p, idx) => idx !== targetIndex && p && p.slug === candidatePage.slug
+                )
+              ) {
+                const err = new Error(
+                  `Custom page with slug "${candidatePage.slug}" already exists`
+                );
+                err.code = 'PAGE_CONFLICT';
+                throw err;
+              }
+
+              const nextPages = [...existingPages];
+              nextPages[targetIndex] = candidatePage;
+              const arrayVal = validatePages(nextPages);
+              if (!arrayVal.isValid) {
+                const detail = (arrayVal.errors || []).map((e) => e.message).join('; ');
+                const err = new Error(detail || 'Custom pages validation failed');
+                err.code = 'SCHEMA_VALIDATION_FAILED';
+                throw err;
+              }
+            },
+          }
+        );
+      } catch (err) {
+        const code = err.code || err.originalError?.code;
+        const detailMessage = sanitizeErrorMessage(
+          err?.originalError?.message || err?.message || 'Custom page update failed'
+        );
+        if (code === 'PAGE_NOT_FOUND') {
+          return sendNotFound(res, 'Custom page not found');
+        }
+        if (code === 'PRECONDITION_FAILED') {
+          return sendPreconditionFailed(res, 'Precondition failed: ETag mismatch');
+        }
+        if (code === 'PAGE_CONFLICT') {
+          return sendConflict(res, detailMessage);
+        }
+        if (
+          code === 'IMMUTABLE_FIELD_MISMATCH' ||
+          code === 'SCHEMA_VALIDATION_FAILED' ||
+          code === 'PATH_VALIDATION_FAILED'
+        ) {
+          return sendBadRequest(res, detailMessage);
+        }
+        console.error('[CMS Server] Failed to update custom page:', err?.code || 'STORE_WRITE_ERROR');
+        return sendInternalError(res, 'Failed to update custom page');
+      }
+
+      if (!savedPage) {
+        return sendInternalError(res, 'Failed to update custom page');
+      }
+
+      const sanitizedPage = sanitizeCustomPageForResponse(savedPage);
+      const newETag = computeCustomPageETag(savedPage);
+
+      res.writeHead(200, {
+        'Content-Type': 'application/json; charset=utf-8',
+        'Cache-Control': 'no-store',
+        'X-Content-Type-Options': 'nosniff',
+        ETag: newETag,
+      });
+      return res.end(
+        JSON.stringify({
+          success: true,
+          page: sanitizedPage,
+        })
+      );
+    }
+
+    // 8e. DELETE /api/cms/pages/:id - Delete a custom static page with If-Match
+    if (req.method === 'DELETE' && rawRequestPath.startsWith(CUSTOM_PAGE_ROUTE_PREFIX)) {
+      const session = requireAuth(req, res);
+      if (!session) {
+        req.resume();
+        return;
+      }
+
+      if (!requireCsrf(req, res, session)) {
+        req.resume();
+        return;
+      }
+
+      const pathResult = parseCustomPagePath({ rawRequestPath, url: req.url });
+      if (!pathResult.matched) {
+        req.resume();
+        return sendNotFound(res);
+      }
+      if (!pathResult.valid || pathResult.invalid || !pathResult.id) {
+        req.resume();
+        return sendBadRequest(res, pathResult.error || 'Malformed or forbidden custom page id');
+      }
+
+      const pageId = pathResult.id;
+
+      const bodyCheck = await readDeleteBody(req, res, MAX_AUTH_BODY);
+      if (!bodyCheck.ok) return;
+
+      const ifMatch = parseIfMatch(req);
+      if (ifMatch.status === 'missing') {
+        return sendPreconditionRequired(res, ifMatch.error || 'If-Match header is required');
+      }
+      if (ifMatch.status === 'invalid') {
+        return sendBadRequest(res, ifMatch.error || 'Invalid If-Match header');
+      }
+
+      const testFailureIndex = getTestFailureIndex(req);
+
+      try {
+        await executeTransaction(
+          [
+            {
+              type: 'writeJson',
+              fileName: 'pages.json',
+              data: (existingPages) => {
+                if (!Array.isArray(existingPages)) {
+                  const err = new Error('Custom pages store is invalid');
+                  err.code = 'STORE_INTEGRITY_UNAVAILABLE';
+                  throw err;
+                }
+                const existingVal = validatePages(existingPages);
+                if (!existingVal.isValid) {
+                  const err = new Error('Custom pages store failed schema validation');
+                  err.code = 'STORE_INTEGRITY_UNAVAILABLE';
+                  throw err;
+                }
+
+                const targetIndex = existingPages.findIndex((p) => p && p.id === pageId);
+                if (targetIndex === -1) {
+                  const err = new Error('Custom page not found');
+                  err.code = 'PAGE_NOT_FOUND';
+                  throw err;
+                }
+
+                const existingPage = existingPages[targetIndex];
+                const currentETag = computeCustomPageETag(existingPage);
+                if (currentETag !== ifMatch.etag) {
+                  const err = new Error('If-Match ETag precondition failed');
+                  err.code = 'PRECONDITION_FAILED';
+                  throw err;
+                }
+
+                const nextPages = existingPages.filter((_, idx) => idx !== targetIndex);
+                const arrayVal = validatePages(nextPages);
+                if (!arrayVal.isValid) {
+                  const detail = (arrayVal.errors || []).map((e) => e.message).join('; ');
+                  const err = new Error(detail || 'Custom pages validation failed');
+                  err.code = 'STORE_INTEGRITY_UNAVAILABLE';
+                  throw err;
+                }
+
+                return nextPages;
+              },
+            },
+          ],
+          {
+            ...(testFailureIndex >= 0 ? { _simulateMutationFailureAtIndex: testFailureIndex } : {}),
+            precondition: async (snapshotAccessor) => {
+              const pagesSnap = snapshotAccessor.get('pages.json');
+              if (!pagesSnap || !pagesSnap.existed) {
+                const err = new Error('Custom pages store is missing or unavailable');
+                err.code = 'STORE_INTEGRITY_UNAVAILABLE';
+                throw err;
+              }
+              const existingPages = snapshotAccessor.getJson('pages.json');
+              if (!Array.isArray(existingPages)) {
+                const err = new Error('Custom pages store is invalid');
+                err.code = 'STORE_INTEGRITY_UNAVAILABLE';
+                throw err;
+              }
+              const existingVal = validatePages(existingPages);
+              if (!existingVal.isValid) {
+                const err = new Error('Custom pages store failed schema validation');
+                err.code = 'STORE_INTEGRITY_UNAVAILABLE';
+                throw err;
+              }
+
+              const targetIndex = existingPages.findIndex((p) => p && p.id === pageId);
+              if (targetIndex === -1) {
+                const err = new Error('Custom page not found');
+                err.code = 'PAGE_NOT_FOUND';
+                throw err;
+              }
+
+              const currentETag = computeCustomPageETag(existingPages[targetIndex]);
+              if (currentETag !== ifMatch.etag) {
+                const err = new Error('If-Match ETag precondition failed');
+                err.code = 'PRECONDITION_FAILED';
+                throw err;
+              }
+            },
+          }
+        );
+      } catch (err) {
+        const code = err.code || err.originalError?.code;
+        if (code === 'PAGE_NOT_FOUND') {
+          return sendNotFound(res, 'Custom page not found');
+        }
+        if (code === 'PRECONDITION_FAILED') {
+          return sendPreconditionFailed(res, 'Precondition failed: ETag mismatch');
+        }
+        console.error('[CMS Server] Failed to delete custom page:', err?.code || 'STORE_WRITE_ERROR');
+        return sendInternalError(res, 'Failed to delete custom page');
+      }
+
+      res.writeHead(200, {
+        'Content-Type': 'application/json; charset=utf-8',
+        'Cache-Control': 'no-store',
+        'X-Content-Type-Options': 'nosniff',
+      });
+      return res.end(
+        JSON.stringify({
+          success: true,
+          deleted: true,
+          id: pageId,
+          message: 'Custom page deleted successfully.',
+        })
+      );
+    }
+
     // Return 404 for all other routes
     return sendNotFound(res);
   } catch (err) {
@@ -9069,6 +10110,7 @@ async function captureRealContentSnapshot(realRoot) {
     resolveSecureJsonPath('settings.json', canonicalRoot),
     resolveSecureJsonPath('ads.json', canonicalRoot),
     resolveSecureJsonPath('seo.json', canonicalRoot),
+    resolveSecureJsonPath('pages.json', canonicalRoot),
   ];
 
   if (fs.existsSync(articlesDir)) {
@@ -9221,6 +10263,7 @@ async function createIsolatedTestProjectRoot(prefix = 'ainovex-cms-test-', sourc
       'settings.json',
       'ads.json',
       'seo.json',
+      'pages.json',
     ];
     for (const fileName of requiredJsonFixtures) {
       const srcPath = resolveSecureJsonPath(fileName, canonicalSourceRoot);
@@ -26452,6 +27495,13 @@ export {
   buildUpdatedSeoDefaults,
   buildCreatedSeoPage,
   buildUpdatedSeoPage,
+  CUSTOM_PAGE_ROUTE_PREFIX,
+  parseCustomPagePath,
+  sanitizeCustomPageForResponse,
+  computeCustomPageETag,
+  computeCustomPageEtag,
+  buildCreatedCustomPage,
+  buildUpdatedCustomPage,
   getTestFailureIndex,
   startServerForTesting,
   runTask95Tests,

@@ -4,6 +4,7 @@ import { CategoryGrid } from '../components/CategoryGrid';
 import { FeaturedTools } from '../components/FeaturedTools';
 import { BlogSection } from '../components/BlogSection';
 import { Tool, Category, Article } from '../types';
+import { isPublishedTool } from '../config/indexing.js';
 
 interface HomeViewProps {
   categories: Category[];
@@ -20,7 +21,8 @@ export const HomeView: React.FC<HomeViewProps> = ({
   onNavigate,
   onSelectTool,
 }) => {
-  const featuredTools = tools.filter((t) => t.isFeatured).slice(0, 5);
+  const publishedTools = tools.filter(isPublishedTool);
+  const featuredTools = publishedTools.filter((t) => t.isFeatured).slice(0, 5);
 
   return (
     <div>
@@ -39,9 +41,10 @@ export const HomeView: React.FC<HomeViewProps> = ({
 
       {/* Featured AI Tools */}
       <FeaturedTools
-        tools={featuredTools.length > 0 ? featuredTools : tools.slice(0, 5)}
+        tools={featuredTools.length > 0 ? featuredTools : publishedTools.slice(0, 5)}
         onViewAll={() => onNavigate('/tools/')}
         onSelectTool={onSelectTool}
+        onNavigate={onNavigate}
       />
 
       {/* Latest Blog & News */}

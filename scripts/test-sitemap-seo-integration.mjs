@@ -23,6 +23,9 @@ const realCategories = JSON.parse(
 const realArticles = JSON.parse(
   fs.readFileSync(path.join(REPO_ROOT, 'content', 'articles.json'), 'utf8')
 );
+const realTools = JSON.parse(
+  fs.readFileSync(path.join(REPO_ROOT, 'content', 'tools.json'), 'utf8')
+);
 const realSeoConfig = JSON.parse(
   fs.readFileSync(path.join(REPO_ROOT, 'content', 'seo.json'), 'utf8')
 );
@@ -31,6 +34,7 @@ function createIsolatedWorkspace({
   settings = realSettings,
   categories = realCategories,
   articles = realArticles,
+  tools = realTools,
   seoConfig = realSeoConfig,
   rawSeoText = null,
   omitSeoFile = false,
@@ -48,7 +52,7 @@ function createIsolatedWorkspace({
 
   fs.writeFileSync(path.join(contentDir, 'settings.json'), JSON.stringify(settings, null, 2));
   fs.writeFileSync(path.join(contentDir, 'categories.json'), JSON.stringify(categories, null, 2));
-  fs.copyFileSync(path.join(REPO_ROOT, 'content', 'tools.json'), path.join(contentDir, 'tools.json'));
+  fs.writeFileSync(path.join(contentDir, 'tools.json'), JSON.stringify(tools, null, 2));
   fs.copyFileSync(path.join(REPO_ROOT, 'content', 'ads.json'), path.join(contentDir, 'ads.json'));
   fs.writeFileSync(path.join(contentDir, 'articles.json'), JSON.stringify(articles, null, 2));
 
@@ -145,8 +149,13 @@ describe('Task 114-E — Page-Level SEO Integration with Sitemap and Indexing Ru
       // 7. Indexable author included
       assert.ok(locs.includes(`${base}/author/md-shamim/`), 'Author md-shamim must be included');
 
-      // Exact expected baseline count (7 static + 1 author + 4 articles + 4 categories = 16)
-      assert.equal(locs.length, 16);
+      // Published tool detail pages included
+      for (const tool of realTools) {
+        assert.ok(locs.includes(`${base}/tools/${tool.slug}/`), `Tool ${tool.slug} must be included`);
+      }
+
+      // Exact expected baseline count (7 static + 1 author + 4 articles + 4 categories + 8 tools = 24)
+      assert.equal(locs.length, 24);
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
@@ -199,7 +208,7 @@ describe('Task 114-E — Page-Level SEO Integration with Sitemap and Indexing Ru
       assert.ok(locs.includes(`${base}/contact/`));
       assert.ok(locs.includes(`${base}/blog/how-to-summarize-a-pdf-with-ai/`));
       assert.ok(locs.includes(`${base}/category/business/`));
-      assert.equal(locs.length, 11);
+      assert.equal(locs.length, 19);
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
@@ -219,8 +228,19 @@ describe('Task 114-E — Page-Level SEO Integration with Sitemap and Indexing Ru
       },
     ];
 
+    const toolsWithUnpublished = [
+      ...realTools,
+      {
+        ...realTools[0],
+        id: 'secret-draft-tool',
+        name: 'Secret Draft Tool',
+        slug: 'secret-draft-tool',
+        isPublished: false,
+      },
+    ];
+
     const seoConfig = structuredClone(realSeoConfig);
-    // Global defaultIndex = false, but explicitly enable /about/ and /privacy/
+    // Global defaultIndex = false, but explicitly enable /about/, /privacy/, and published tool:chatgpt
     seoConfig.defaults.defaultIndex = false;
     delete seoConfig.pages.contact.index;
     seoConfig.pages.about.index = true;
@@ -255,6 +275,13 @@ describe('Task 114-E — Page-Level SEO Integration with Sitemap and Indexing Ru
       slug: 'chatgpt',
       index: true,
     };
+    seoConfig.pages['tool:secret-draft-tool'] = {
+      pageId: 'tool:secret-draft-tool',
+      pageType: 'tool',
+      path: '/tools/secret-draft-tool/',
+      slug: 'secret-draft-tool',
+      index: true,
+    };
     seoConfig.pages['static:unrouted-custom'] = {
       pageId: 'static:unrouted-custom',
       pageType: 'static',
@@ -263,24 +290,30 @@ describe('Task 114-E — Page-Level SEO Integration with Sitemap and Indexing Ru
       index: true,
     };
 
-    const tmpDir = createIsolatedWorkspace({ articles: articlesWithDraft, seoConfig });
+    const tmpDir = createIsolatedWorkspace({
+      articles: articlesWithDraft,
+      tools: toolsWithUnpublished,
+      seoConfig,
+    });
     try {
       const xml = runFinalizeCli(tmpDir);
       const locs = extractSitemapUrls(xml).map((e) => e.loc);
       const base = 'https://ai-novex.netlify.app';
 
-      // Page-level index: true overrides work for valid static pages
+      // Page-level index: true overrides work for valid static pages and published tools
       assert.ok(locs.includes(`${base}/about/`));
       assert.ok(locs.includes(`${base}/privacy/`));
+      assert.ok(locs.includes(`${base}/tools/chatgpt/`));
 
-      // Contact lacks explicit page-level index: true so defaults.defaultIndex = false excludes it
+      // Contact and non-overridden published tools lack explicit page-level index: true so defaults.defaultIndex = false excludes them
       assert.equal(locs.includes(`${base}/contact/`), false);
+      assert.equal(locs.includes(`${base}/tools/midjourney/`), false);
 
-      // Empty category, unpublished article, draft author, /tools/:slug/, and unrouted paths remain strictly excluded
+      // Empty category, unpublished article, draft author, unpublished tool, and unrouted paths remain strictly excluded
       assert.equal(locs.includes(`${base}/category/ai-writing/`), false);
       assert.equal(locs.includes(`${base}/blog/draft-secret-guide/`), false);
       assert.equal(locs.includes(`${base}/author/draft-author/`), false);
-      assert.equal(locs.includes(`${base}/tools/chatgpt/`), false);
+      assert.equal(locs.includes(`${base}/tools/secret-draft-tool/`), false);
       assert.equal(locs.includes(`${base}/unrouted-custom/`), false);
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
@@ -409,7 +442,7 @@ describe('Task 114-E — Page-Level SEO Integration with Sitemap and Indexing Ru
         assert.ok(locs.includes(`${base}/about/`), `[${variant.label}] About must fall back to indexable`);
         assert.equal(locs.includes(`${base}/privacy/`), false, `[${variant.label}] Privacy must fall back to noindex`);
         assert.equal(locs.includes(`${base}/terms/`), false, `[${variant.label}] Terms must fall back to noindex`);
-        assert.equal(locs.length, 16, `[${variant.label}] Baseline URL count preserved`);
+        assert.equal(locs.length, 24, `[${variant.label}] Baseline URL count preserved`);
       } finally {
         fs.rmSync(tmpDir, { recursive: true, force: true });
       }
@@ -473,7 +506,7 @@ describe('Task 114-E — Page-Level SEO Integration with Sitemap and Indexing Ru
     const tmpDir = createIsolatedWorkspace();
     try {
       const result = runFinalizeSitemap(tmpDir);
-      assert.equal(result.entries.size, 16);
+      assert.equal(result.entries.size, 24);
       assert.ok(fs.existsSync(path.join(tmpDir, 'dist', 'sitemap.xml')));
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });

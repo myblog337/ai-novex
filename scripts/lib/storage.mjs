@@ -6,12 +6,15 @@ import { fileURLToPath } from 'node:url';
 import {
   isValidArticleSlug,
   isValidCategorySlug,
+  isValidMediaFilename,
   validateArticles,
   validateTools,
   validateCategories,
   validateSettings,
   validateAds,
   validateSeoConfig,
+  validatePages,
+  validateMediaLibrary,
 } from './validators.mjs';
 
 // ----------------------------------------------------------------------------
@@ -20,7 +23,7 @@ import {
 
 /**
  * Strict file allowlist for CMS JSON content stores.
- * Only these 6 files located directly in the /content directory may be accessed or updated.
+ * Only these 8 files located directly in the /content directory may be accessed or updated.
  */
 export const ALLOWED_JSON_FILES = Object.freeze([
   'articles.json',
@@ -29,6 +32,8 @@ export const ALLOWED_JSON_FILES = Object.freeze([
   'settings.json',
   'ads.json',
   'seo.json',
+  'pages.json',
+  'media.json',
 ]);
 
 const ALLOWED_JSON_SET = new Set(ALLOWED_JSON_FILES);
@@ -47,6 +52,8 @@ const SCHEMA_VALIDATORS = Object.freeze({
   'settings.json': validateSettings,
   'ads.json': validateAds,
   'seo.json': validateSeoConfig,
+  'pages.json': validatePages,
+  'media.json': validateMediaLibrary,
 });
 
 /**
@@ -287,6 +294,99 @@ export function resolveSecureMarkdownPath(slug, projectRoot = DEFAULT_PROJECT_RO
   return candidatePath;
 }
 
+/**
+ * Validates a server-generated media filename for storage inside public/images/media/.
+ */
+export function validateMediaFileName(fileName) {
+  if (typeof fileName !== 'string' || !fileName.trim()) {
+    throw new Error('Media filename must be a non-empty string');
+  }
+  if (fileName.includes('\0')) {
+    throw new Error('Media filename contains forbidden null bytes');
+  }
+  if (fileName.includes('/') || fileName.includes('\\') || fileName.includes('..')) {
+    throw new Error('Directory separators and path traversal sequences are forbidden');
+  }
+  if (path.basename(fileName) !== fileName) {
+    throw new Error('Arbitrary paths are forbidden for media files');
+  }
+  if (!isValidMediaFilename(fileName)) {
+    throw new Error('Invalid generated media filename format');
+  }
+  return fileName;
+}
+
+/**
+ * Resolves and validates the canonical target path for a stored media file inside public/images/media/.
+ * Verifies directory containment and rejects symlinks along the directory hierarchy and target file.
+ */
+export function resolveSecureMediaPath(fileName, projectRoot = DEFAULT_PROJECT_ROOT) {
+  validateMediaFileName(fileName);
+
+  const rootResolved = path.resolve(projectRoot);
+  const canonicalRoot = fs.existsSync(rootResolved) ? fs.realpathSync(rootResolved) : rootResolved;
+
+  const publicDir = path.resolve(canonicalRoot, 'public');
+  const imagesDir = path.resolve(publicDir, 'images');
+  const mediaDir = path.resolve(imagesDir, 'media');
+
+  for (const [parentDir, dirPath, label] of [
+    [canonicalRoot, publicDir, 'public'],
+    [publicDir, imagesDir, 'public/images'],
+    [imagesDir, mediaDir, 'public/images/media'],
+  ]) {
+    let dirLstat = null;
+    try {
+      dirLstat = fs.lstatSync(dirPath);
+    } catch {}
+    if (dirLstat) {
+      if (dirLstat.isSymbolicLink()) {
+        throw new Error(`Symlinks are forbidden for CMS media directory (${label})`);
+      }
+      if (!dirLstat.isDirectory()) {
+        throw new Error(`Media storage path is not a directory (${label})`);
+      }
+      const realDir = fs.realpathSync(dirPath);
+      if (!isInsideAuthorizedDirectory(parentDir, realDir)) {
+        throw new Error(`Media directory escapes authorized project boundary (${label})`);
+      }
+    }
+  }
+
+  const canonicalMediaDir = fs.existsSync(mediaDir) ? fs.realpathSync(mediaDir) : mediaDir;
+  const candidatePath = path.resolve(canonicalMediaDir, fileName);
+
+  if (!isInsideAuthorizedDirectory(canonicalMediaDir, candidatePath)) {
+    throw new Error('Resolved path escapes authorized media directory');
+  }
+  if (
+    path.dirname(candidatePath) !== canonicalMediaDir ||
+    path.basename(candidatePath) !== fileName
+  ) {
+    throw new Error('Resolved path does not match canonical media directory structure');
+  }
+
+  let candidateLstat = null;
+  try {
+    candidateLstat = fs.lstatSync(candidatePath);
+  } catch {}
+
+  if (candidateLstat) {
+    if (candidateLstat.isSymbolicLink()) {
+      throw new Error('Symlinks are forbidden for CMS media storage');
+    }
+    const realTarget = fs.realpathSync(candidatePath);
+    if (
+      !isInsideAuthorizedDirectory(canonicalMediaDir, realTarget) ||
+      path.basename(realTarget) !== fileName
+    ) {
+      throw new Error('Canonical target escapes authorized media directory via symlink or alias');
+    }
+  }
+
+  return candidatePath;
+}
+
 // ----------------------------------------------------------------------------
 // Per-file Asynchronous Mutex
 // ----------------------------------------------------------------------------
@@ -389,7 +489,11 @@ export async function atomicWriteFile(targetPath, content) {
   let handle = null;
   try {
     handle = await fs.promises.open(tempFilePath, 'w', 0o644);
-    await handle.writeFile(content, 'utf8');
+    if (Buffer.isBuffer(content)) {
+      await handle.writeFile(content);
+    } else {
+      await handle.writeFile(content, 'utf8');
+    }
     await handle.sync(); // Force flush data to physical disk
     await handle.close();
     handle = null;
@@ -577,6 +681,10 @@ export class TransactionSnapshotAccessor {
         this.#targetMap.set(op.slug, op.targetPath);
         this.#targetMap.set(`${op.slug}.md`, op.targetPath);
       }
+      if (op.mediaFileName) {
+        this.#targetMap.set(op.mediaFileName, op.targetPath);
+        this.#targetMap.set(`images/media/${op.mediaFileName}`, op.targetPath);
+      }
     }
   }
 
@@ -725,11 +833,35 @@ export class SecureStorageEngine {
 
   /**
    * Safely reads and parses an allowlisted JSON content file.
+   * For pages.json, enforces complete store schema validation on read (fail-closed).
    */
   async readJson(fileName) {
     const targetPath = resolveSecureJsonPath(fileName, this.projectRoot);
     const raw = await fs.promises.readFile(targetPath, 'utf8');
-    return JSON.parse(raw);
+    const parsed = JSON.parse(raw);
+    if (fileName === 'pages.json') {
+      const valResult = validatePages(parsed, { projectRoot: this.projectRoot });
+      if (!valResult.isValid) {
+        const detail = (valResult.errors || [])
+          .map((e) => `${e.field}: ${e.message}`)
+          .join(', ');
+        throw new TransactionError(`Schema validation failed for pages.json: ${detail}`, {
+          code: 'SCHEMA_VALIDATION_FAILED',
+        });
+      }
+    }
+    if (fileName === 'media.json') {
+      const valResult = validateMediaLibrary(parsed, { projectRoot: this.projectRoot });
+      if (!valResult.isValid) {
+        const detail = (valResult.errors || [])
+          .map((e) => `${e.field}: ${e.message}`)
+          .join(', ');
+        throw new TransactionError(`Schema validation failed for media.json: ${detail}`, {
+          code: 'SCHEMA_VALIDATION_FAILED',
+        });
+      }
+    }
+    return parsed;
   }
 
   /**
@@ -1517,7 +1649,63 @@ export class SecureStorageEngine {
         }
       }
 
-      // 4. Run optional precondition hook under locks with snapshot accessor
+      // 4. Validate locked pages.json read snapshots fail-closed before precondition/consumers
+      for (const op of normalizedOps) {
+        if (op.action === 'read' && op.fileName === 'pages.json') {
+          const snap = snapshots.get(op.targetPath);
+          if (!snap || !snap.existed || !snap.originalBytes) {
+            throw new TransactionError('Custom pages store (pages.json) is missing or unavailable', {
+              code: 'STORE_INTEGRITY_UNAVAILABLE',
+            });
+          }
+          let parsedPages;
+          try {
+            parsedPages = JSON.parse(snap.originalBytes.toString('utf8'));
+          } catch (parseErr) {
+            throw new TransactionError(
+              `Custom pages store contains malformed JSON: ${parseErr.message}`,
+              { code: 'INVALID_ORIGINAL_JSON' }
+            );
+          }
+          const pagesVal = validatePages(parsedPages, { projectRoot: this.projectRoot });
+          if (!pagesVal.isValid) {
+            const detail = (pagesVal.errors || [])
+              .map((e) => `${e.field}: ${e.message}`)
+              .join(', ');
+            throw new TransactionError(`Schema validation failed for pages.json: ${detail}`, {
+              code: 'SCHEMA_VALIDATION_FAILED',
+            });
+          }
+        }
+        if (op.action === 'read' && op.fileName === 'media.json') {
+          const snap = snapshots.get(op.targetPath);
+          if (!snap || !snap.existed || !snap.originalBytes) {
+            throw new TransactionError('Media library store (media.json) is missing or unavailable', {
+              code: 'STORE_INTEGRITY_UNAVAILABLE',
+            });
+          }
+          let parsedMedia;
+          try {
+            parsedMedia = JSON.parse(snap.originalBytes.toString('utf8'));
+          } catch (parseErr) {
+            throw new TransactionError(
+              `Media library store contains malformed JSON: ${parseErr.message}`,
+              { code: 'INVALID_ORIGINAL_JSON' }
+            );
+          }
+          const mediaVal = validateMediaLibrary(parsedMedia, { projectRoot: this.projectRoot });
+          if (!mediaVal.isValid) {
+            const detail = (mediaVal.errors || [])
+              .map((e) => `${e.field}: ${e.message}`)
+              .join(', ');
+            throw new TransactionError(`Schema validation failed for media.json: ${detail}`, {
+              code: 'SCHEMA_VALIDATION_FAILED',
+            });
+          }
+        }
+      }
+
+      // 5. Run optional precondition hook under locks with snapshot accessor
       if (options.precondition !== undefined) {
         const snapshotAccessor = new TransactionSnapshotAccessor(normalizedOps, snapshots);
         try {
@@ -1976,10 +2164,16 @@ export class SecureStorageEngine {
           target: op.sanitizedTarget,
           fileName: op.fileName || null,
           slug: op.slug || null,
+          mediaFileName: op.mediaFileName || null,
           action: op.action,
           backupCreated: Boolean(op.backupResult),
           backupFileName: op.backupResult?.backupFileName || null,
-          bytesWritten: op.action === 'write' ? Buffer.byteLength(op.content, 'utf8') : null,
+          bytesWritten:
+            op.action === 'write'
+              ? Buffer.isBuffer(op.content)
+                ? op.content.length
+                : Buffer.byteLength(op.content, 'utf8')
+              : null,
           deleted: op.action === 'delete',
         })),
       };
@@ -2113,10 +2307,11 @@ function normalizeTransactionOperation(
     }
   }
 
-  let kind = null; // 'json' | 'markdown'
+  let kind = null; // 'json' | 'markdown' | 'media'
   let action = null; // 'read' | 'write' | 'delete'
   let fileName = null;
   let slug = null;
+  let mediaFileName = null;
   let content = null;
   let targetPath = null;
   let backupKey = null;
@@ -2127,6 +2322,18 @@ function normalizeTransactionOperation(
     kind = 'json';
     action = 'read';
     fileName = op.fileName || op.file || op.target;
+  } else if (lowerType === 'readmedia' || lowerType === 'read_media') {
+    kind = 'media';
+    action = 'read';
+    mediaFileName = op.fileName || op.filename || op.file || op.target;
+  } else if (lowerType === 'writemedia' || lowerType === 'write_media') {
+    kind = 'media';
+    action = 'write';
+    mediaFileName = op.fileName || op.filename || op.file || op.target;
+  } else if (lowerType === 'deletemedia' || lowerType === 'delete_media') {
+    kind = 'media';
+    action = 'delete';
+    mediaFileName = op.fileName || op.filename || op.file || op.target;
   } else if (
     lowerType === 'readmarkdown' ||
     lowerType === 'read_markdown' ||
@@ -2418,16 +2625,52 @@ function normalizeTransactionOperation(
       }
       content = rawContent;
     }
+  } else if (kind === 'media') {
+    if (!mediaFileName || typeof mediaFileName !== 'string') {
+      throw new TransactionError('Media transaction operation requires string "fileName"', {
+        code: 'INVALID_OPERATION',
+      });
+    }
+    try {
+      validateMediaFileName(mediaFileName);
+      targetPath = resolveSecureMediaPath(mediaFileName, projectRoot);
+    } catch (err) {
+      const isSymlink = err?.message && err.message.toLowerCase().includes('symlink');
+      throw new TransactionError(sanitizeErrorMessage(err.message), {
+        code: isSymlink ? 'FORBIDDEN_SYMLINK' : 'PATH_VALIDATION_FAILED',
+      });
+    }
+    backupKey = `media_${mediaFileName}`;
+    sanitizedTarget = `images/media/${mediaFileName}`;
+
+    if (action === 'write') {
+      const rawBytes = op.data !== undefined ? op.data : op.content;
+      if (!Buffer.isBuffer(rawBytes) || rawBytes.length === 0) {
+        throw new TransactionError(
+          `Media write operation requires non-empty Buffer data for ${mediaFileName}`,
+          { code: 'INVALID_OPERATION' }
+        );
+      }
+      content = Buffer.from(rawBytes);
+    }
   }
+
+  const normalizedType =
+    kind === 'json'
+      ? `${action}Json`
+      : kind === 'media'
+        ? `${action}Media`
+        : `${action}Markdown`;
 
   return {
     rawOp: op,
     id: op.id || null,
-    type: `${action}${kind === 'json' ? 'Json' : 'Markdown'}`,
+    type: normalizedType,
     kind,
     action,
     fileName,
     slug,
+    mediaFileName,
     content,
     targetPath,
     backupKey,

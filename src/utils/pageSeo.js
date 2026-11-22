@@ -4,8 +4,18 @@
 // pre-rendered static HTML always stay 100% consistent.
 
 import { LEGAL_TITLES, LEGAL_BREADCRUMBS } from '../config/legal.js';
-import { categoryHasContent, categoryTitle } from '../config/indexing.js';
+import {
+  categoryHasContent,
+  categoryTitle,
+  findPublishedToolBySlug,
+  isValidToolSlug,
+} from '../config/indexing.js';
 import { findAuthorBySlug, getArticleAuthorProfile } from './authors.js';
+import {
+  extractCustomPageDescription,
+  findPublishedCustomPageBySlug,
+  isValidCustomPageSlug,
+} from './customPages.js';
 
 export const DEFAULT_SITE_URL = 'https://ai-novex.netlify.app';
 export const DEFAULT_SITE_NAME = 'AINOVEX';
@@ -520,12 +530,75 @@ export function extractSafeSeoDefaults(seoConfig) {
   };
 }
 
+function matchesCandidateScope(
+  rec,
+  candidatePageIds = [],
+  lookupKey = null,
+  { strictStaticScope = false } = {}
+) {
+  if (!isPlainObject(rec)) return false;
+
+  const targetToolId = candidatePageIds.find(
+    (id) => typeof id === 'string' && id.startsWith('tool:')
+  );
+  if (targetToolId) {
+    const targetToolSlug = targetToolId.slice('tool:'.length);
+    if (lookupKey && lookupKey.startsWith('tool:') && lookupKey !== targetToolId) {
+      return false;
+    }
+    const recPageId = cleanString(rec.pageId, 128);
+    if (recPageId && recPageId !== targetToolId) {
+      return false;
+    }
+    const recPageType = cleanString(rec.pageType, 32);
+    if (recPageType && recPageType !== 'tool') {
+      return false;
+    }
+    const recSlug = cleanString(rec.slug, 128);
+    if (recSlug && recSlug !== targetToolSlug) {
+      return false;
+    }
+    return true;
+  }
+
+  if (strictStaticScope) {
+    const targetStaticId = candidatePageIds.find(
+      (id) => typeof id === 'string' && id.startsWith('static:')
+    );
+    if (targetStaticId) {
+      const targetStaticSlug = targetStaticId.slice('static:'.length);
+      if (lookupKey && lookupKey.startsWith('static:') && lookupKey !== targetStaticId) {
+        return false;
+      }
+      const recPageId = cleanString(rec.pageId, 128);
+      if (recPageId && recPageId !== targetStaticId) {
+        return false;
+      }
+      const recPageType = cleanString(rec.pageType, 32);
+      if (recPageType && recPageType !== 'static') {
+        return false;
+      }
+      const recSlug = cleanString(rec.slug, 128);
+      if (recSlug && recSlug !== targetStaticSlug) {
+        return false;
+      }
+    }
+  }
+
+  return true;
+}
+
 /**
  * Finds the matching SEO page record in seoConfig.pages by canonical path first,
  * falling back to candidate pageIds when path matching isn't available.
  * Never mutates seoConfig and never throws on malformed data.
  */
-export function findSeoPageRecord(seoConfig, canonicalPath, candidatePageIds = []) {
+export function findSeoPageRecord(
+  seoConfig,
+  canonicalPath,
+  candidatePageIds = [],
+  options = {}
+) {
   if (!isPlainObject(seoConfig) || !isPlainObject(seoConfig.pages)) return null;
   const targetPath = normalizeRoutePath(canonicalPath);
   const pages = seoConfig.pages;
@@ -535,7 +608,10 @@ export function findSeoPageRecord(seoConfig, canonicalPath, candidatePageIds = [
     const rec = pages[key];
     if (!isPlainObject(rec)) continue;
     if (typeof rec.path === 'string' && rec.path.trim()) {
-      if (normalizeRoutePath(rec.path) === targetPath) {
+      if (
+        normalizeRoutePath(rec.path) === targetPath &&
+        matchesCandidateScope(rec, candidatePageIds, key, options)
+      ) {
         return rec;
       }
     }
@@ -544,7 +620,7 @@ export function findSeoPageRecord(seoConfig, canonicalPath, candidatePageIds = [
   for (const id of candidatePageIds) {
     if (!id || PROTO_POLLUTION_KEYS.has(id)) continue;
     const rec = pages[id];
-    if (isPlainObject(rec)) {
+    if (isPlainObject(rec) && matchesCandidateScope(rec, candidatePageIds, id, options)) {
       if (typeof rec.path === 'string' && rec.path.trim()) {
         if (normalizeRoutePath(rec.path) === targetPath) {
           return rec;
@@ -619,11 +695,29 @@ function extractSafePageOverrides(pageRecord) {
     }
   }
 
+  let safeSecondaryKeywords = null;
+  if (Array.isArray(pageRecord.secondaryKeywords)) {
+    const cleaned = [];
+    const seen = new Set();
+    for (const rawKw of pageRecord.secondaryKeywords) {
+      const kw = cleanString(rawKw, 100);
+      if (!kw) continue;
+      const lower = kw.toLowerCase();
+      if (seen.has(lower)) continue;
+      seen.add(lower);
+      cleaned.push(kw);
+      if (cleaned.length >= 20) break;
+    }
+    safeSecondaryKeywords = cleaned;
+  }
+
   return {
     pageId: cleanString(pageRecord.pageId, 128) || null,
     pageType: cleanString(pageRecord.pageType, 32) || null,
     seoTitle: cleanString(pageRecord.seoTitle, 160, 3) || null,
     metaDescription: cleanString(pageRecord.metaDescription, 320, 10) || null,
+    focusKeyword: cleanString(pageRecord.focusKeyword, 120) || null,
+    secondaryKeywords: safeSecondaryKeywords,
     canonicalUrl: isSafeHttpUrl(pageRecord.canonicalUrl) ? pageRecord.canonicalUrl.trim() : null,
     index: typeof pageRecord.index === 'boolean' ? pageRecord.index : null,
     follow: typeof pageRecord.follow === 'boolean' ? pageRecord.follow : null,
@@ -820,6 +914,15 @@ function isValidCustomFaqNode(node) {
   );
 }
 
+function toolSupportsSoftwareApplication(entity) {
+  if (!isPlainObject(entity)) return false;
+  const hasName = Boolean(cleanString(entity.name, 200));
+  const hasDesc = Boolean(
+    cleanString(entity.longDescription, 2000) || cleanString(entity.description, 1000)
+  );
+  return hasName && hasDesc;
+}
+
 function resolvePermittedSchemaType({
   routeKind,
   requestedSchemaType,
@@ -851,6 +954,19 @@ function resolvePermittedSchemaType({
       return requestedSchemaType;
     }
     return defaultType;
+  }
+
+  if (routeKind === 'tool') {
+    const permittedTool = ROUTE_PERMITTED_SCHEMA_TYPES.tool;
+    if (permittedTool.has(requestedSchemaType)) {
+      if (requestedSchemaType === 'SoftwareApplication' && !toolSupportsSoftwareApplication(entity)) {
+        return 'WebPage';
+      }
+      return requestedSchemaType;
+    }
+    return defaultType === 'SoftwareApplication' && !toolSupportsSoftwareApplication(entity)
+      ? 'WebPage'
+      : defaultType;
   }
 
   const permitted = ROUTE_PERMITTED_SCHEMA_TYPES[routeKind];
@@ -1017,29 +1133,60 @@ export function buildPageJsonLd({
       });
     }
   } else if (routeKind === 'tool' && entity) {
-    const toolNodeType = effectiveType || 'SoftwareApplication';
-    const toolImageUrl = toAbsoluteAssetUrl(entity.icon || imageUrl, cleanBase);
-    const toolNode = {
-      '@type': toolNodeType,
-      '@id': `${safePageUrl}#tool`,
-      name: entity.name,
-      description,
-      url: safePageUrl,
-      sameAs: entity.url,
-      image: toolImageUrl,
-      isPartOf: { '@id': `${cleanBase}/#website` },
-      inLanguage: 'en-US',
-    };
-    if (toolNodeType === 'SoftwareApplication' || toolNodeType === 'Product') {
-      toolNode.applicationCategory = entity.categoryName || entity.category;
-      toolNode.operatingSystem = 'Web';
-      toolNode.offers = {
-        '@type': 'Offer',
-        ...(entity.pricing === 'Free' ? { price: '0', priceCurrency: 'USD' } : {}),
-        category: entity.pricing,
+    if (!(resolvedType === 'Custom' && safeCustomData)) {
+      const supportsSoftwareApp = toolSupportsSoftwareApplication(entity);
+      const toolNodeType =
+        effectiveType === 'SoftwareApplication' && !supportsSoftwareApp
+          ? 'WebPage'
+          : effectiveType || (supportsSoftwareApp ? 'SoftwareApplication' : 'WebPage');
+      const safeName = cleanString(entity.name, 200) || title;
+      const safeSameAs = isSafeHttpUrl(entity.url) ? entity.url.trim() : '';
+      const safeRawImg = isSafeAssetOrUrl(entity.icon)
+        ? entity.icon.trim()
+        : isSafeAssetOrUrl(imageUrl)
+          ? String(imageUrl).trim()
+          : '';
+      const toolImageUrl = safeRawImg ? toAbsoluteAssetUrl(safeRawImg, cleanBase) : '';
+      const safeAppCategory = cleanString(entity.categoryName || entity.category, 120);
+      const safeOs = cleanString(entity.operatingSystem, 120);
+      const safeTags = Array.isArray(entity.tags)
+        ? entity.tags.map((t) => cleanString(t, 100)).filter(Boolean)
+        : [];
+      const safeFeatures = Array.isArray(entity.features)
+        ? entity.features.map((f) => cleanString(f, 200)).filter(Boolean)
+        : [];
+
+      const toolNode = {
+        '@type': toolNodeType,
+        '@id': `${safePageUrl}#tool`,
+        name: safeName,
+        description,
+        url: safePageUrl,
+        ...(safeSameAs ? { sameAs: safeSameAs } : {}),
+        ...(toolImageUrl && isSafeHttpUrl(toolImageUrl) ? { image: toolImageUrl } : {}),
+        isPartOf: { '@id': `${cleanBase}/#website` },
+        inLanguage: 'en-US',
       };
+      if (toolNodeType === 'SoftwareApplication') {
+        if (safeAppCategory) {
+          toolNode.applicationCategory = safeAppCategory;
+        }
+        if (safeOs) {
+          toolNode.operatingSystem = safeOs;
+        }
+        if (safeFeatures.length > 0) {
+          toolNode.featureList = safeFeatures;
+        }
+        if (safeTags.length > 0) {
+          toolNode.keywords = safeTags;
+        }
+      } else if (toolNodeType === 'Product') {
+        if (safeAppCategory) {
+          toolNode.category = safeAppCategory;
+        }
+      }
+      graph.push(toolNode);
     }
-    graph.push(toolNode);
   } else if (routeKind === 'author' && entity) {
     const profileType = effectiveType || 'ProfilePage';
     graph.push({
@@ -1162,6 +1309,7 @@ export function resolvePageSeo({
   articles = [],
   categories = [],
   tools = [],
+  pages = [],
   wordCount = null,
   imageSize = null,
 }) {
@@ -1215,12 +1363,9 @@ export function resolvePageSeo({
 
   const blogPageRec = findSeoPageRecord(seoConfig, '/blog/', ['static:blog']);
   const categoriesPageRec = findSeoPageRecord(seoConfig, '/categories/', ['static:categories']);
-  const toolsPageRec = findSeoPageRecord(seoConfig, '/tools/', ['static:tools']);
   const blogCrumbLabel = cleanString(blogPageRec?.breadcrumb?.label, 100) || 'Blog';
   const categoriesCrumbLabel =
     cleanString(categoriesPageRec?.breadcrumb?.label, 100) || 'Categories';
-  const toolsCrumbLabel =
-    cleanString(toolsPageRec?.breadcrumb?.label, 100) || 'AI Tools Directory';
 
   const publishedArticles = (articles || []).filter((a) => a && a.isPublished !== false);
 
@@ -1303,8 +1448,9 @@ export function resolvePageSeo({
   } else if (normPath.startsWith('/tools/')) {
     routeKind = 'tool';
     const slug = normPath.slice('/tools/'.length);
-    candidatePageIds = [`tool:${slug}`];
-    const found = !slug.includes('/') ? (tools || []).find((t) => t.slug === slug) : null;
+    const validSlug = isValidToolSlug(slug);
+    candidatePageIds = validSlug ? [`tool:${slug}`] : [];
+    const found = validSlug ? findPublishedToolBySlug(slug, tools) : null;
     if (found) {
       entity = found;
       baseIndexable = true;
@@ -1317,10 +1463,15 @@ export function resolvePageSeo({
         cleanString(found.longDescription, 320) ||
         cleanString(found.description, 320) ||
         globalDefaultDesc;
-      fallbackImageAlt = `${found.name} - ${found.categoryName || found.category} AI Tool`;
-      fallbackSchemaType = 'SoftwareApplication';
+      const catLabel = cleanString(found.categoryName || found.category, 100);
+      fallbackImageAlt = catLabel
+        ? `${found.name} - ${catLabel} AI Tool`
+        : `${found.name} AI Tool`;
+      fallbackSchemaType = toolSupportsSoftwareApplication(found)
+        ? 'SoftwareApplication'
+        : 'WebPage';
       fallbackBreadcrumbEnabled = true;
-      fallbackCrumbs = [{ label: toolsCrumbLabel, path: '/tools/' }, { label: found.name }];
+      fallbackCrumbs = [{ label: 'Tools', path: '/tools/' }, { label: found.name }];
     } else {
       notFound = true;
       fallbackTitle = 'Tool Not Found | AINOVEX';
@@ -1347,12 +1498,35 @@ export function resolvePageSeo({
       fallbackDesc =
         'The author profile you are looking for does not exist. Browse our AI tools directory, tutorials, and guides on AINOVEX.';
     }
+  } else if (normPath.startsWith('/') && normPath.length > 1 && !normPath.slice(1).includes('/')) {
+    const slug = normPath.slice(1);
+    const foundCustomPage = isValidCustomPageSlug(slug)
+      ? findPublishedCustomPageBySlug(slug, pages)
+      : null;
+    if (foundCustomPage) {
+      routeKind = 'static';
+      entity = foundCustomPage;
+      candidatePageIds = [`static:${slug}`];
+      baseIndexable = true;
+      const cleanPageTitle = cleanString(foundCustomPage.title, 200) || slug;
+      fallbackTitle = formatTitleWithTemplate(cleanPageTitle, titleTemplate, siteName);
+      fallbackDesc = extractCustomPageDescription(foundCustomPage.content) || globalDefaultDesc;
+      fallbackOgType = 'website';
+      fallbackSchemaType = 'WebPage';
+      fallbackBreadcrumbEnabled = true;
+      fallbackCrumbs = [{ label: cleanPageTitle }];
+    } else {
+      notFound = true;
+    }
   } else {
     notFound = true;
   }
 
+  const isCustomStaticPage = routeKind === 'static' && Boolean(entity);
   const rawPageRecord = !notFound
-    ? findSeoPageRecord(seoConfig, canonicalRoutePath, candidatePageIds)
+    ? findSeoPageRecord(seoConfig, canonicalRoutePath, candidatePageIds, {
+        strictStaticScope: isCustomStaticPage,
+      })
     : null;
   const pageOverrides = extractSafePageOverrides(rawPageRecord);
 
@@ -1553,8 +1727,30 @@ export function resolvePageSeo({
     notFound,
   });
 
+  const resolvedFocusKeyword = notFound
+    ? ''
+    : pageOverrides?.focusKeyword ||
+      cleanString(entity?.primaryKeyword, 120) ||
+      defaults.defaultFocusKeyword ||
+      '';
+  const entitySecondaryKeywords = Array.isArray(entity?.secondaryKeywords)
+    ? entity.secondaryKeywords.map((k) => cleanString(k, 100)).filter(Boolean)
+    : [];
+  const resolvedSecondaryKeywords = notFound
+    ? []
+    : Array.isArray(pageOverrides?.secondaryKeywords) && pageOverrides.secondaryKeywords.length > 0
+      ? pageOverrides.secondaryKeywords
+      : entitySecondaryKeywords.length > 0
+        ? entitySecondaryKeywords
+        : defaults.defaultSecondaryKeywords || [];
+
+  const resolvedPageId = notFound
+    ? null
+    : pageOverrides?.pageId || candidatePageIds[0] || null;
+
   return {
     notFound,
+    pageId: resolvedPageId,
     routeKind,
     path: canonicalRoutePath,
     pageUrl,
@@ -1562,6 +1758,8 @@ export function resolvePageSeo({
     siteName,
     title: seoTitle,
     description: metaDescription,
+    focusKeyword: resolvedFocusKeyword,
+    secondaryKeywords: resolvedSecondaryKeywords,
     canonicalUrl,
     ogUrl: notFound ? null : pageUrl,
     ogTitle,
